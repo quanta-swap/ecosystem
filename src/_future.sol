@@ -4,15 +4,7 @@ pragma solidity ^0.8.24;
 /*──────────────────────────────────────────────
 │  64-bit ZRC-20 interface (ERC-20 semantics)
 └──────────────────────────────────────────────*/
-interface IZRC20 {
-    function transfer(address to, uint64 val) external returns (bool);
-
-    function transferFrom(
-        address from,
-        address to,
-        uint64 val
-    ) external returns (bool);
-}
+import {IZRC20} from "./IZRC20.sol";   // adjust the relative path if needed
 
 /*──────────────────────────────────────────────
 │  Minimal ERC-165 / ERC-721 stack (stand-alone)
@@ -555,7 +547,7 @@ contract AmeriPeanFuturesDesk is ERC165, IERC721Metadata, ReentrancyGuard {
     function _accept(
         uint64 reqId,
         address maker
-    ) internal nonReentrant returns (uint64 futId) {
+    ) internal returns (uint64 futId) {
         Request storage r = _req[reqId];
         require(r.open, "closed");
 

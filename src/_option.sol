@@ -293,22 +293,24 @@ contract AmeriPeanOptionDesk is ERC165, IERC721Metadata, ReentrancyGuard {
         _transfer(f, t, id);
     }
 
+    /*──── ERC-721 safe transfer (no nested nonReentrant) ────*/
     function safeTransferFrom(
-        address f,
-        address t,
+        address from,
+        address to,
         uint256 id
-    ) external override nonReentrant {
-        safeTransferFrom(f, t, id, "");
+    ) external override {
+        safeTransferFrom(from, to, id, "");
     }
 
     function safeTransferFrom(
-        address f,
-        address t,
+        address from,
+        address to,
         uint256 id,
-        bytes memory d
+        bytes memory data
     ) public override nonReentrant {
-        transferFrom(f, t, id);
-        require(_checkOnERC721Received(f, t, id, d), "rcv");
+        require(_isApprovedOrOwner(msg.sender, id), "auth");
+        _transfer(from, to, id);                       // direct – avoids re-entering guard
+        require(_checkOnERC721Received(from, to, id, data), "rcv");
     }
 
     /*──── helpers ───*/
@@ -502,23 +504,27 @@ contract AmeriPeanOptionDesk is ERC165, IERC721Metadata, ReentrancyGuard {
         require(block.timestamp >= o.start && block.timestamp <= o.expiry, "window");
         require(qty > 0 && qty <= o.remainingAmt, "qty");
 
-        // strike to pay = qty × strikeAmt / reserveAmt
-        uint64 strikePay = uint64((uint256(o.strikeAmt) * qty) / uint256(o.reserveAmt));
+        // calculate strike
+        uint64 strikePay = uint64(
+            (uint256(o.strikeAmt) * qty) / uint256(o.reserveAmt)
+        );
 
+        // state-update
         o.remainingAmt -= qty;
 
-        bool emptied = (o.remainingAmt == 0);
-        if (emptied) {
-            o.flags |= F_EXERCISED;
-            _burn(id);
-            delete _opt[id];
-        }
-
+        // ─── move assets *immediately* ───
         o.tradeFor.safeTransferFrom(msg.sender, o.maker, strikePay);
         o.reserve.safeTransfer(to, qty);
 
         emit Exercised(id, to, qty);
-        if (emptied) emit CollateralReturned(id, to, 0);
+
+        // if fully exercised, burn & delete after transfers
+        if (o.remainingAmt == 0) {
+            o.flags |= F_EXERCISED;
+            _burn(id);
+            delete _opt[id];
+            emit CollateralReturned(id, to, 0);
+        }
     }
 
     /*── reclaim after expiry ──*/
