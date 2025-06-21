@@ -484,32 +484,29 @@ contract AmeriPeanOptionDesk is ERC165, IERC721Metadata, ReentrancyGuard {
         emit Pledged(id, lock_);
     }
 
-    /*── exercise (full) ──*/
-    /* exercise *exactly* `qty` collateral units to `msg.sender` */
+    /*── exercise ──*/
     function exercise(uint64 id, uint64 qty) external nonReentrant {
-        exerciseTo(id, msg.sender, qty);
+        _exercise(id, msg.sender, qty);
     }
 
-    /*─────────────────────  exerciseTo()  ───────────────────────*/
-    /* exercise *qty* collateral units to arbitrary recipient */
-    function exerciseTo(uint64 id, address to, uint64 qty) public nonReentrant {
+    /*── exercise to arbitrary recipient ──*/
+    function exerciseTo(uint64 id, address to, uint64 qty) external nonReentrant {
+        _exercise(id, to, qty);
+    }
+
+    /*────────────────── internal implementation ─────────────────*/
+    function _exercise(uint64 id, address to, uint64 qty) internal {
         Option storage o = _opt[id];
         require((o.flags & F_PLEDGED) == 0, "pledged");
         require(ownerOf(id) == msg.sender, "hold");
-        require(
-            block.timestamp >= o.start && block.timestamp <= o.expiry,
-            "window"
-        );
+        require(block.timestamp >= o.start && block.timestamp <= o.expiry, "window");
         require(qty > 0 && qty <= o.remainingAmt, "qty");
 
-        /* strike to pay = qty × strikeAmt / reserveAmt  (ratio fixed) */
-        uint64 strikePay = uint64(
-            (uint256(o.strikeAmt) * qty) / uint256(o.reserveAmt)
-        );
+        // strike to pay = qty × strikeAmt / reserveAmt
+        uint64 strikePay = uint64((uint256(o.strikeAmt) * qty) / uint256(o.reserveAmt));
 
         o.remainingAmt -= qty;
 
-        /* if everything is gone mark fully-exercised & burn */
         bool emptied = (o.remainingAmt == 0);
         if (emptied) {
             o.flags |= F_EXERCISED;
@@ -521,8 +518,6 @@ contract AmeriPeanOptionDesk is ERC165, IERC721Metadata, ReentrancyGuard {
         o.reserve.safeTransfer(to, qty);
 
         emit Exercised(id, to, qty);
-
-        /* emit CollateralReturned on full consumption for parity with expiry */
         if (emptied) emit CollateralReturned(id, to, 0);
     }
 
