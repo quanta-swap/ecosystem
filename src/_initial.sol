@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IZRC2, IZRC20} from "./IZRC2.sol";
+
 /*───────────────────────────────────────────────────────────────
 │  InitialLiquidityVault – pooled wQRL → QSD LP with           │
 │  single‑shot per‑user exits after a 365‑day lock.             │
@@ -31,22 +33,6 @@ abstract contract ReentrancyGuard {
     }
 }
 
-/*──────── Minimal uint64 ZRC‑20 interface ────────*/
-interface IZRC20 {
-    function balanceOf(address) external view returns (uint64);
-
-    function transfer(address, uint64) external returns (bool);
-
-    function transferFrom(address, address, uint64) external returns (bool);
-
-    function approve(address, uint64) external returns (bool);
-}
-
-/*──────── Reward token must expose a mint primitive ────────*/
-interface IRewardToken is IZRC20 {
-    function mint(address to, uint64 amount) external;
-}
-
 /*──────── QSD interface (partial) ────────*/
 interface IQSD {
     function liquidityLoanIn(
@@ -73,7 +59,7 @@ contract BISMARCK is ReentrancyGuard {
     /*──────── External contracts ────────*/
     IZRC20 public immutable wqrl;
     IQSD public immutable qsd;
-    IRewardToken public immutable reward;
+    IZRC2 public immutable reward;
 
     /*──────── Ownership (minimal) ────────*/
     address public owner;
@@ -122,7 +108,7 @@ contract BISMARCK is ReentrancyGuard {
         require(_cap > 0, "cap");
         wqrl = IZRC20(_w);
         qsd = IQSD(_q);
-        reward = IRewardToken(_r);
+        reward = IZRC2(_r);
         cap = _cap;
         owner = msg.sender;
         emit OwnershipTransferred(address(0), msg.sender);

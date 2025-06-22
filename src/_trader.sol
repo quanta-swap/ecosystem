@@ -10,45 +10,7 @@ pragma solidity ^0.8.24;
 │  • Fully deterministic, single‑entry re‑entrancy guard          │
 └───────────────────────────────────────────────────────────────*/
 
-/**
- * @dev Minimal 64‑bit ERC‑20 (ZRC‑20) interface.
- * All balances, supplies, allowances are `uint64`, scaled by the
- * token’s own `decimals()`.  Events therefore emit a `uint64` value.
- */
-interface IZRC20 {
-    /* events */
-    event Transfer(address indexed from, address indexed to, uint64 value);
-    event Approval(
-        address indexed owner,
-        address indexed spender,
-        uint64 value
-    );
-
-    /* metadata */
-    function name() external view returns (string memory);
-
-    function symbol() external view returns (string memory);
-
-    function decimals() external view returns (uint8);
-
-    /* token data */
-    function totalSupply() external view returns (uint64);
-
-    function balanceOf(address) external view returns (uint64);
-
-    function allowance(address, address) external view returns (uint64);
-
-    /* transfers */
-    function transfer(address to, uint64 value) external returns (bool);
-
-    function approve(address spender, uint64 value) external returns (bool);
-
-    function transferFrom(
-        address from,
-        address to,
-        uint64 value
-    ) external returns (bool);
-}
+import {IZRC20} from "./IZRC20.sol";
 
 /**
  * @dev FREE token must expose `lock()` so ReserveDEX can freeze a user’s
@@ -730,12 +692,12 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         /* hop-1: tokenFrom → RESERVE */
         Pool storage pA = pools[tokenFrom];
         require(pA.reserveR > 0 && pA.reserveT > 0, "empty A");
-        uint64 reserveGot = _outTtoR(amountIn, pA.reserveR, pA.reserveT, feeN);
+        uint64 reserveGot = _outTtoR(amountIn, pA.reserveR, pA.reserveT, feeN / 2);
 
         /* hop-2: RESERVE → tokenTo */
         Pool storage pB = pools[tokenTo];
         require(pB.reserveR > 0 && pB.reserveT > 0, "empty B");
-        out = _outRtoT(reserveGot, pB.reserveR, pB.reserveT, feeN);
+        out = _outRtoT(reserveGot, pB.reserveR, pB.reserveT, feeN / 2);
     }
 
     /*=====================================================================

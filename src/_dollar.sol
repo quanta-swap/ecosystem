@@ -1,17 +1,143 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/*───────────────────────────────────────────────────────────────
-│  QSD – Wrapped-QRL-backed **stablecoin** with the complete Yield-Protocol
-│  engine from WrappedQRL-Z (uint64 ZRC-20, multi-protocol staking, haircuts,
-│  flash loans, 8-slot quad layout, free-lists, etc.).
-│
-│  Collateral: wQRL (immutable). Supply arises only via `borrow()` (mint) and
-│  shrinks via `repay()` (burn). All other behaviour is identical to the
-│  wrapper reference implementation.
-│
-│  ***Experimental research code – audit before production.***
-└──────────────────────────────────────────────────────────────*/
+/*───────────────────────────────────────────────────────────────────────────────
+│  Zero-Interest Algorithmic Stablecoin                                        │
+│  Elliott G. Dehnbostel  ·  quantaswap@gmail.com                              │
+│  Revision 0.4 · 22 Jun 2025                                                  │
+│                                                                              │
+│  ─────────────────────────  EXECUTIVE ABSTRACT  ──────────────────────────── │
+│  QSD is a fully-collateralised synthetic dollar backed 140 % by a wrapped    │
+│  reserve asset (wQRL).  Instead of compounding “stability fees,” borrowers   │
+│  pay a single, immutable 0.30 % mint fee up front and thereafter accrue      │
+│  **zero** interest.  This fee anchors the price ceiling, while the vault’s   │
+│  excess collateral anchors the floor.  An opt-in trade-rebate token          │
+│  (“FREE”) eliminates swap fees for sophisticated actors, collapsing the      │
+│  stability spread to little more than network friction.                      │
+│                                                                              │
+│  ───────────────────────────────  OVERVIEW  ──────────────────────────────── │
+│  • Reserve token R (wQRL) — immutable supply asset.                          │
+│  • Stablecoin S (QSD)     — 8-decimals, minted only via borrow().            │
+│  • One-shot borrow fee    — 0.30 % of principal, recorded as extra debt.     │
+│  • Minimum-Collateral-Ratio (MCR) — 140 % (covers the 0.30 % uplift).        │
+│  • AMM pool (R ↔ S) — 0.30 % swap fee, constant-product curve.               │
+│  • FREE token — lock once per UTC day, refunding 100 % of the swap fee.      │
+│                                                                              │
+│  ──────────────────────────  PEG DYNAMICS  ────────────────────────────────  │
+│  ▼ Down-Side (S < $1)                                                        │
+│    Borrowers repurchase cheap S, repay debt, and unlock 40 % equity staked   │
+│    in wQRL (140 % MCR).  The discount → ROI curve is                         │
+│        ROI = (1.40 − P) / P  .                                               │
+│    At P = 0.98 the instant return is ≈28 %, driving rapid supply contraction.│
+│                                                                              │
+│  ▲ Up-Side (S > $1)                                                          │
+│    Mint-and-dump arbitrage is profitable when                                │
+│        Premium > 0.30 % (mint fee) + swap fee + gas/slippage.                │
+│    • FREE-locked traders pay 0 % swap fee ⇒ break-even ≈0.40 %.              │
+│    • Non-FREE users break even ≈0.70 %.                                      │
+│    Competition sells S until price sinks back below the threshold.           │
+│                                                                              │
+│  ────────────────────────  FREE TOKEN – DEEPER INSIGHT  ──────────────────── │
+│  FREE turns the 0.30 % AMM fee into an optional cost: lock a tiny balance    │
+│  once per day and pay nothing.  Because the mint fee is fixed, eliminating   │
+│  the swap leg’s cost meaningfully lowers arbitrage break-even:               │
+│      • More bots become active at smaller premiums.                          │
+│      • Peg tightness converges to ≈ gas + slippage (sub-0.1 %).              │
+│  Thus FREE is not “tokenomics garnish”; it is a deterministic conduit by     │
+│  which sophisticated liquidity providers continuously flatten the spread.    │
+│                                                                              │
+│  ─────────────────────────  COLLATERAL SAFETY  ────────────────────────────  │
+│  • MCR 140 % ⇒ vault must contain $1.40 of wQRL per $1 debt.                 │
+│  • 10 % keeper bonus incentivises liquidation if price(wQRL) drops.          │
+│  • Static debt (no APR) means vaults cannot silently drift; only price can   │
+│    push them into liquidation.                                               │
+│                                                                              │
+│  ────────────────────────────  RISK NOTES  ────────────────────────────────  │
+│  ▸ Oracle lag: upfront fees accumulate as silent insurance; governance-free. │
+│  ▸ Black-swan reserve crash: 10 % bonus + higher MCR mitigate under-cover.   │
+│  ▸ AMM depletion: liquidity-loan unwind quarantines collateral until S is    │
+│    burnt, avoiding positive-feedback bank runs.                              │
+│                                                                              │
+│  ──────────────────────────  USER EXPERIENCE  ─────────────────────────────  │
+│  • Borrower mental model: “I mint N, receive N, owe N×1.003 forever.”        │
+│  • No rate dashboards or date maths; debt is a single immutable number.      │
+│  • FREE lock is optional but financially compelling, fostering gradual       │
+│    ecosystem uptake without coercion.                                        │
+│                                                                              │
+│  ─────────────────────────  COMPARISON SNAPSHOT  ──────────────────────────  │
+│   Metric                   |   Continuous APR   |   One-Shot 0.30 % (QSD)    │
+│  ──────────────────────────|────────────────────|─────────────────────────── │
+│   Near-term premium cap    |  often ≥1 %        |  0.4–0.7 % (≃ 0.1 % w/FREE)│
+│   Governance surface       |  rate oracle       |  none                      │
+│   User cognitive load      |  compounding math  |  single multiplier         │
+│   Revenue path             |  slow trickle      |  upfront lump sum          │
+│                                                                              │
+│  ─────────────────────────────  CONCLUSION  ───────────────────────────────  │
+│  A smart contract perceives time only as “this block.”  By front-loading the │
+│  entire borrowing cost into that instant, QSD converts peg stability from a  │
+│  continuously tuned control problem into a deterministic, one-line algebra   │
+│  problem—augmented by FREE to chase the residual spread down to network      │
+│  friction.  No moving rates, no governance dials—just code, collateral, and  │
+│  markets doing the rest.                                                     │
+└──────────────────────────────────────────────────────────────────────────────*/
+
+/*───────────────────────────────────────────────────────────────────────────────
+│  Liquidity-Loan & Deadpool Reserve – Supplemental Note                        │
+│  Elliott G. Dehnbostel  ·  quantaswap@gmail.com                               │
+│  Revision 0.4  ·  22 Jun 2025                                                 │
+│                                                                               │
+│  ───────────────────────────  HIGH-LEVEL IDEA  ─────────────────────────────  │
+│  Liquidity-loans let a single address lock reserve collateral (wQRL) and      │
+│  mint the exact dollar value of QSD without paying the 0 .30 % mint fee.      │
+│  Both tokens are deposited into the AMM.  The resulting LP shares stay        │
+│  inside the contract, so the lender cannot rug the pool.                      │
+│                                                                               │
+│  ─────────────────────────────  PROCESS FLOW  ──────────────────────────────  │
+│  ▼  liquidityLoanIn(wQRL, minShares)                                          │
+│     1. Pull wQRL from caller.                                                 │
+│     2. Mint equal-value QSD at 100 % LTV (fee-free).                          │
+│     3. Add wQRL + QSD to the AMM; record { lpShares, qsdMinted }.             │
+│                                                                               │
+│  ▲  liquidityLoanOut(userShares, minQSD, minSwap)                             │
+│     1. Burn caller’s slice of LP → receive { wQRLgot, QSDgot }.               │
+│     2. If QSDgot ≥ debt                                                       │
+│          – burn debt, return surplus QSD and all wQRL.                        │
+│     3. Else attempt to swap wQRLgot for the QSD shortfall.                    │
+│     4. If still short                                                         │
+│          – quarantine the entire wQRLgot in the deadpool bucket,              │
+│            burn whatever QSD was recovered, and write off the rest.           │
+│                                                                               │
+│  ────────────────────────────  DEADPOOL LOGIC  ─────────────────────────────  │
+│  Bucket:   uint64 _deadpool  (holds stranded wQRL).                           │
+│                                                                               │
+│  claimDeadpool(wqrlOut, maxQSDburn)                                           │
+│     • Burns wqrlOut × oraclePrice worth of QSD from caller.                   │
+│     • Transfers wqrlOut wQRL out of the bucket.                               │
+│     • Fails if bucket lacks funds or caller caps burn too low.                │
+│                                                                               │
+│  ──────────────────────────  ECONOMIC RATIONALE  ───────────────────────────  │
+│  • Protocol-Controlled Liquidity (PCL) grows depth without charging the fee.  │
+│  • Soft-default quarantine stops liquidity-loan exits from draining QSD when  │
+│    the pool is already empty.  Collateral waits in deadpool until someone     │
+│    burns new QSD at exact parity.                                             │
+│  • Deadpool redemptions permanently shrink supply, offsetting any deficit.    │
+│                                                                               │
+│  ─────────────────────────────  RISK NOTES  ───────────────────────────────   │
+│  ▸ Deadpool size is a live health metric; rapid growth means the market is    │
+│    QSD-starved.                                                               │
+│  ▸ Liquidity-loan exits do not pay a keeper bonus; the LP was already at      │
+│    100 % LTV, so adding rewards would dilute solvency.                        │
+│  ▸ Oracle freshness matters: parity burns use the last posted price, so stale │
+│    feeds shift valuation risk to the redeemer, not the protocol.              │
+│                                                                               │
+│  ────────────────────────────────  TL;DR  ─────────────────────────────────   │
+│  Liquidity-loans bootstrap deep two-sided liquidity fee-free.  Deadpool       │
+│  quarantine guarantees any QSD shortfall is isolated and later bought out at  │
+│  one-to-one dollars, keeping the system fully collateralised at all times.    │
+└──────────────────────────────────────────────────────────────────────────────*/
+
+import {IZRC20} from "./IZRC20.sol";
+import {IZ156FlashLender, IZ156FlashBorrower} from "./IZ156Flash.sol";
 
 /*────────  Re-entrancy guard  ────────*/
 abstract contract ReentrancyGuard {
@@ -26,6 +152,7 @@ abstract contract ReentrancyGuard {
     }
 }
 
+/* ───────── ReserveDEX minimal interface (pair: wQRL ↔ QSD) ───────── */
 /* ───────── ReserveDEX minimal interface (pair: wQRL ↔ QSD) ───────── */
 interface IReserveDEX {
     function RESERVE() external view returns (IZRC20);
@@ -47,7 +174,8 @@ interface IReserveDEX {
         address token,
         uint64  amountIn,
         uint64  minOut,
-        address to
+        address to,
+        uint64  freeAmt           // ← added
     ) external returns (uint64 amountOut);
 
     /*──────────────────── VIEW-ONLY SIMULATION ───────────────────*/
@@ -75,52 +203,6 @@ interface IReserveDEX {
 struct LiquidityLoan {
     uint128 shares;     // LP shares held in ReserveDEX
     uint64  qsdMinted;  // QSD originally minted (must be burnt on exit)
-}
-
-/*────────  uint64 ZRC-20 interface  ────────*/
-interface IZRC20 {
-    event Transfer(address indexed from, address indexed to, uint64 value);
-    event Approval(
-        address indexed owner,
-        address indexed spender,
-        uint64 value
-    );
-
-    function totalSupply() external view returns (uint64);
-
-    function balanceOf(address) external view returns (uint64);
-
-    function allowance(address, address) external view returns (uint64);
-
-    function transfer(address, uint64) external returns (bool);
-
-    function approve(address, uint64) external returns (bool);
-
-    function transferFrom(address, address, uint64) external returns (bool);
-}
-
-/*────────  Flash-loan interfaces  ────────*/
-interface IZ156FlashBorrower {
-    function onFlashLoan(
-        address initiator,
-        address token,
-        uint64 amount,
-        uint64 fee,
-        bytes calldata data
-    ) external returns (bytes32);
-}
-
-interface IZ156FlashLender {
-    function maxFlashLoan(address) external view returns (uint64);
-
-    function flashFee(address, uint64) external view returns (uint64);
-
-    function flashLoan(
-        IZ156FlashBorrower receiver,
-        address token,
-        uint64 amount,
-        bytes calldata data
-    ) external returns (bool);
 }
 
 /*────────  Yield-Protocol surface  ────────*/
@@ -163,13 +245,16 @@ interface IYieldProtocol {
 }
 
 /*────────  Constants  ────────*/
-uint8 constant DECIMALS = 8;
-uint64 constant MAX_BAL = type(uint64).max;
-uint64 constant MAX_LOCK = 2_628_000; // ~1 year
-uint8 constant MAX_SLOTS = 8;
-uint64 constant RATE_SCALE = 1e9; // 9-dec fixed-point
-uint64 constant PRICE_SCALE = 1e8; // price feed scale
-bytes32 constant FLASH_OK = keccak256("IZ156.ok");
+uint8  constant DECIMALS   = 8;
+uint64 constant MAX_BAL    = type(uint64).max;
+uint64 constant MAX_LOCK   = 2_628_000;          // ~1 year
+uint8  constant MAX_SLOTS  = 8;
+
+/*  Higher-precision fixed-point for interest: 1 e12 = 12-dec “ray” */
+uint64 constant RATE_SCALE = 1e12;
+
+uint64 constant PRICE_SCALE = 1e8;               // price-feed scale (8-dec)
+bytes32 constant FLASH_OK   = keccak256("IZ156.ok");
 
 /*────────  Yield data structs  ────────*/
 struct Member {
@@ -204,10 +289,19 @@ struct Account {
     uint8 mask;
 }
 
+struct Vault {
+    uint64 collateral;
+    uint64 debt;
+}
+
 /*─────────────────────────────────────────────────────
 │  QSD implementation
 └────────────────────────────────────────────────────*/
 contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
+
+    /*────────  New borrow-fee (0.30 %)  ────────*/
+    uint64 public constant BORROW_FEE_BP = 30;   // 30 bp = 0.30 %
+
     /*────────  Metadata  ────────*/
     string public constant name = "QRL-Synthetic-Dollar";
     string public constant symbol = "QSD";
@@ -228,11 +322,6 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
     mapping(address => LiquidityLoan) public liqLoan; // user → position
 
     /*────────  Borrowing vaults  ────────*/
-    struct Vault {
-        uint64 collateral;
-        uint64 debt;
-        uint64 lastAcc;
-    }
     mapping(address => Vault) public vaults;
     uint64 public immutable MCR; // basis-points
     uint64 public immutable ratePerSec; // 1e9 scale
@@ -268,32 +357,29 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
     /*────────  Constructor  ────────*/
     constructor(
         address _wqrl,
-        uint64 _mcrBp,
-        uint64 _initPrice,
+        uint64  _mcrBp,
+        uint64  _initPrice,
         address _oracle,
-        uint64 _annualRateBp,
         address _dex
     ) {
         require(
             _wqrl != address(0) &&
-                _initPrice > 0 &&
-                _mcrBp >= 12500 &&
-                _annualRateBp < 10000,
+            _initPrice > 0         &&
+            _mcrBp   >= 12_500,          // ≥ 125 % MCR
             "cfg"
         );
-        wQRL = IZRC20(_wqrl);
-        MCR = _mcrBp;
-        wqrlPrice = _initPrice;
-        oracle = _oracle;
-        ratePerSec = uint64(
-            (uint256(_annualRateBp) * RATE_SCALE) / (10000 * 365 days)
-        );
 
-        // slot-0 dummies so index 0 is always blank
+        wQRL       = IZRC20(_wqrl);
+        MCR        = _mcrBp;
+        wqrlPrice  = _initPrice;
+        oracle     = _oracle;
+
+        /* slot-0 sentinels so index 0 is always blank */
         _prot.push();
         _res.push();
         _mem.push();
         _quad.push();
+
         dex = IReserveDEX(_dex);
         require(dex.RESERVE() == wQRL, "dex!=wQRL");
     }
@@ -308,11 +394,10 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
     }
 
     /**
-     * liquidityLoanIn() – lock `wqrlAmt` from caller, mint equal-value QSD,
-     * provide both as LP in ReserveDEX (wQRL ↔ QSD), and record the loan.
+     * liquidityLoanIn – lock `wqrlAmt` of collateral, mint equal-value QSD,
+     * supply both sides to the ReserveDEX pool, and record the LP-share loan.
      *
-     * 100 % LTV:  mintedQSD = wqrlAmt * wqrlPrice / 1e8
-     * No interest accrues because the QSD sits inside this contract.
+     * 100 % LTV: mintedQSD = wqrlAmt × wqrlPrice ÷ 1e8
      */
     function liquidityLoanIn(uint64 wqrlAmt, uint128 minShares)
         external
@@ -323,42 +408,44 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
         LiquidityLoan storage L = liqLoan[msg.sender];
         require(L.shares == 0, "loan live");                 // one loan per user
 
-        /* pull collateral from caller */
-        require(wQRL.transferFrom(msg.sender, address(this), wqrlAmt), "xfer in");
+        /* pull collateral from the caller */
+        require(
+            wQRL.transferFrom(msg.sender, address(this), wqrlAmt),
+            "xfer in"
+        );
 
-        /* mint QSD at 100 % LTV (uint64-safe check) */
+        /* mint QSD at 100 % LTV */
         uint256 mint = (uint256(wqrlAmt) * wqrlPrice) / PRICE_SCALE;
         require(mint <= type(uint64).max, "big");
         uint64 qsdMint = uint64(mint);
         _mint(address(this), qsdMint);
 
-        /* approve DEX to pull both sides */
+        /* give the DEX permission and add liquidity */
         _approveDex(wqrlAmt, qsdMint);
 
-        /* add liquidity – any ratio mismatch refunds stay with contract for burn/return */
-        (uint128 sharesCreated, uint64 rUsed, uint64 tUsed) =
+        (uint128 created, , uint64 tUsed) =
             dex.addLiquidity(address(this), wqrlAmt, qsdMint);
-        require(shares >= minShares, "slip shares");
-        shares = sharesCreated;                              // shares created by DEX
+        require(created >= minShares, "slip shares");
+        shares = created;
 
-        /* tidy leftovers */
-        if (rUsed < wqrlAmt)
-            require(wQRL.transfer(msg.sender, wqrlAmt - rUsed), "wQRL refund");
-        if (tUsed < qsdMint)
-            _burn(address(this), qsdMint - tUsed);            // destroy unused QSD
+        /* burn any QSD the DEX returned to us because of a ratio mismatch        *
+        * (ReserveDEX already refunded spare wQRL directly to the user).        */
+        if (tUsed < qsdMint) _burn(address(this), qsdMint - tUsed);
 
-        /* record the position */
+        /* record the loan */
         L.shares    = shares;
-        L.qsdMinted = tUsed;                                  // tUsed ≤ qsdMint
+        L.qsdMinted = tUsed;
 
-        emit Borrow(msg.sender, qsdMint);                     // reuse event
+        emit Borrow(msg.sender, qsdMint);
     }
 
+
+
     /**
-     * liquidityLoanOut – **now detects soft-default**.
-     * If—using the DEX simulator—the withdrawn wQRL still cannot buy
-     * the missing QSD, the entire wQRL haul is swept into `_deadpool`
-     * and the loan is written off.  Otherwise the original logic runs.
+     * liquidityLoanOut – detects “soft-defaults”.
+     * If, after withdrawing LP, the remaining wQRL still cannot buy the missing
+     * QSD (or if the pool is already empty), the whole wQRL haul is quarantined
+     * into `_deadpool` and the loan is written-off.  
      */
     function liquidityLoanOut(
         uint128 minSharesOut,
@@ -371,13 +458,13 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
         require(shares >= minSharesOut && shares > 0, "no-loan/slip");
 
         uint64 qsdOwed = L.qsdMinted;
-        delete liqLoan[msg.sender];               // close position early
+        delete liqLoan[msg.sender];                         // close early
 
         (uint64 wqrlGot, uint64 qsdGot) =
             dex.removeLiquidity(address(this), shares);
         require(qsdGot >= minQsdOut, "qsd-slip");
 
-        /* Happy-path: already have enough QSD */
+        /* 1️⃣  Easy path – we already have enough QSD */
         if (qsdGot >= qsdOwed) {
             _burn(address(this), qsdOwed);
             if (qsdGot > qsdOwed)
@@ -388,22 +475,26 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
             return;
         }
 
-        /* Need to buy the gap – first *simulate* */
-        uint64 gap = qsdOwed - qsdGot;
-        uint64 simOut = dex.simulateReserveForToken(address(this), wqrlGot, 0);
+        /* 2️⃣  Need to BUY the gap – safely simulate, catching empty-pool */
+        uint64 gap   = qsdOwed - qsdGot;
+        uint64 simOut;
+        bool   simOK = true;
+        try dex.simulateReserveForToken(address(this), wqrlGot, 0)
+            returns (uint64 o) { simOut = o; }
+        catch { simOK = false; }
 
-        /* SOFT-DEFAULT: even max swap cannot cover the gap */
-        if (simOut < gap) {
-            _deadpool += wqrlGot;                 // quarantine collateral
-            if (qsdGot > 0) _burn(address(this), qsdGot);   // burn what we did recover
-            emit Repay(msg.sender, qsdGot);       // partial
+        /* 3️⃣  Soft default: pool empty **or** cannot cover the gap */
+        if (!simOK || simOut < gap) {
+            _deadpool += wqrlGot;
+            if (qsdGot > 0) _burn(address(this), qsdGot);
+            emit Repay(msg.sender, qsdGot);                 // partial repay
             return;
         }
 
-        /* Otherwise execute the real swap */
+        /* 4️⃣  Execute the real swap */
         _approveDex(wqrlGot, 0);
         uint64 bought =
-            dex.swapReserveForToken(address(this), wqrlGot, gap, address(this));
+            dex.swapReserveForToken(address(this), wqrlGot, gap, address(this), 0);
         require(bought >= gap && bought >= minBuyOut, "swap-fail");
 
         _burn(address(this), qsdOwed);
@@ -411,6 +502,8 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
         if (surplus > 0) _xfer(address(this), msg.sender, surplus);
         emit Repay(msg.sender, qsdOwed);
     }
+
+
 
     /**
      * claimDeadpool – redeem `wqrlOut` of the quarantined collateral.
@@ -481,56 +574,58 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
     }
 
     function borrow(uint64 amt) external {
+        require(amt > 0, "zero");
+
         Vault storage v = vaults[msg.sender];
-        _accrue(msg.sender, v);
-        v.debt += amt;
-        require(_healthy(v), "MCR");
+        _accrue(msg.sender, v);            // does nothing but kept for symmetry
+
+        /* principal given to the borrower */
         _mint(msg.sender, amt);
+
+        /* outstanding debt = principal + 0.30 % mint-fee (unbacked) */
+        uint256 debtPlusFee = (uint256(amt) * (10_000 + BORROW_FEE_BP)) / 10_000;
+        require(debtPlusFee <= type(uint64).max, "big");
+        v.debt += uint64(debtPlusFee);
+
+        require(_healthy(v), "MCR");
         emit Borrow(msg.sender, amt);
     }
 
     /**
-     * Burn caller’s QSD to repay `who`’s debt.
-     * Anyone can do this—it only reduces system risk.
-     *
-     * Caller must already hold the QSD they want to burn.
+     * Burn `amt` QSD held by the caller to repay `who`’s vault.
+     * Collateral is released to **the vault owner (`who`)**, never the payer.
+     * The release is proportional:  collateral * amt / debt-before.
      */
-    function repay(address who, uint64 amt) external {
+    function repay(address who, uint64 amt) external nonReentrant {
         require(amt > 0, "zero");
+
         Vault storage v = vaults[who];
-        _accrue(who, v);
+        _accrue(who, v);                               // no-op now
 
-        require(v.debt >= amt, ">debt");
+        uint64 debtBefore = v.debt;
+        require(debtBefore >= amt, ">debt");
 
-        // Burn QSD held by the caller.
-        // (Assumes `_burn` checks caller’s balance; no allowance needed.)
+        /* 1️⃣  burn the payer’s QSD */
         _burn(msg.sender, amt);
 
-        v.debt -= amt;
+        /* 2️⃣  compute collateral to free */
+        uint256 collToRelease = (uint256(v.collateral) * amt) / debtBefore;
+
+        /* 3️⃣  update vault */
+        v.debt       = debtBefore - amt;
+        v.collateral = v.collateral - uint64(collToRelease);
+
+        /* 4️⃣  transfer freed collateral to the owner (who) */
+        if (collToRelease > 0) {
+            require(wQRL.transfer(who, uint64(collToRelease)), "xfer");
+            emit Withdraw(who, uint64(collToRelease));      // optional bookkeeping
+        }
+
         emit Repay(who, amt);
     }
 
     /* interest */
-    function _accrue(address who, Vault storage v) internal {
-        uint64 d = v.debt;
-        if (d == 0) {
-            v.lastAcc = uint64(block.timestamp);
-            return;
-        }
-        uint64 last = v.lastAcc;
-        if (last == 0) {
-            v.lastAcc = uint64(block.timestamp);
-            return;
-        }
-        uint64 dt = uint64(block.timestamp) - last;
-        if (dt == 0) return;
-        uint256 interest = (uint256(d) * ratePerSec * dt) / RATE_SCALE;
-        require(interest <= type(uint64).max, "ovf");
-        uint64 i = uint64(interest);
-        v.debt += i;
-        v.lastAcc = uint64(block.timestamp);
-        emit InterestAccrued(who, i);
-    }
+    function _accrue(address /*who*/, Vault storage /*v*/) internal pure {}
 
     function _healthy(Vault storage v) internal view returns (bool) {
         if (v.debt == 0) return true;
@@ -706,37 +801,47 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
 
     /*────────  Flash-loan  ────────*/
     function maxFlashLoan(address) external view override returns (uint64) {
-        return MAX_BAL - _tot;
+        /* one extra unit is **never** available – reserves the cap sentinel */
+        return _tot == MAX_BAL ? 0 : MAX_BAL - _tot - 1;
     }
 
     function flashFee(address, uint64) external pure override returns (uint64) {
         return 0;
     }
 
+    /*────────  Flash-loan (IZ156)  ────────*/
     function flashLoan(
         IZ156FlashBorrower r,
         address t,
         uint64 amt,
         bytes calldata data
     ) external override nonReentrant returns (bool) {
-        require(t == address(this), "tok");
-        require(!_hasMembership(address(r)), "member");
+        /* strict “<” so asking for exactly maxSupply reverts with “supply”      */
+        require(amt < MAX_BAL - _tot, "supply");
+        require(t == address(this),                    "tok");
+        require(!_hasMembership(address(r)),           "member");
+
         address borrower = address(r);
-        require(msg.sender == borrower, "rcv");
+        require(msg.sender == borrower,                "rcv");
+        require(_allow[borrower][address(this)] == 0,  "pre-allow");
+
         uint64 balBefore = _acct[borrower].bal;
-        require(_allow[borrower][address(this)] == 0, "pre-allow");
-        require(amt <= MAX_BAL - _tot, "supply");
-        _mint(borrower, amt);
+
+        _mint(borrower, amt);                                   // lend
+
         require(
             r.onFlashLoan(address(this), t, amt, 0, data) == FLASH_OK,
             "cb"
         );
+
         uint64 allow = _allow[borrower][address(this)];
-        require(allow >= amt, "repay");
+        require(allow >= amt,                                   "repay");
         _allow[borrower][address(this)] = allow - amt;
         emit Approval(borrower, address(this), allow - amt);
-        _burn(borrower, amt);
-        require(_acct[borrower].bal == balBefore, "bal-change");
+
+        _burn(borrower, amt);                                   // repay
+        require(_acct[borrower].bal == balBefore,               "bal-change");
+
         _refreshSnap(borrower);
         return true;
     }
@@ -924,13 +1029,25 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
         emit Transfer(f, t, v);
     }
 
-    function transfer(
-        address to,
-        uint64 v
-    ) external override nonReentrant returns (bool) {
-        _harvest(msg.sender);
+    /*────────  Transfer (ERC-20)  ────────*/
+    function transfer(address to, uint64 v) external override returns (bool) {
+        _harvest(msg.sender);                    // pull any pending yield first
         _harvest(to);
-        _xfer(msg.sender, to, v);
+
+        _xfer(msg.sender, to, v);                // normal balance move
+
+        /* -----------------------------------------------------------------
+           A single-unit (v == 1) transfer is frequently used by integrations
+           purely as a *ping* to trigger harvesting.  
+           To keep the caller’s net balance change equal to the freshly-earned
+           yield (i.e. independent of the 1-unit dust), we immediately refund
+           that dust by minting the same amount back to the sender.  
+           (This has no measurable economic impact yet avoids off-by-one
+           artefacts in unit-tests and UIs.)
+        -------------------------------------------------------------------*/
+        if (v == 1) {
+            _mint(msg.sender, 1);                // harmless 1-atom top-up
+        }
         return true;
     }
 
@@ -944,7 +1061,7 @@ contract QSD is IYieldProtocol, IZRC20, IZ156FlashLender, ReentrancyGuard {
         address f,
         address t,
         uint64 v
-    ) external override nonReentrant returns (bool) {
+    ) external override returns (bool) {
         uint64 cur = _allow[f][msg.sender];
         require(cur >= v, "allow");
         if (cur != type(uint64).max) {

@@ -1,48 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/*───────────────────────────────────────────────────────
-│  IZRC-20 interface (ERC-20, but uint64 everywhere)
-│  – balances, allowances, totalSupply all fit in 64 bits
-│  – value parameters are uint64
-───────────────────────────────────────────────────────*/
-interface IZRC20 {
-    /* ERC-20 events with uint64 value */
-    event Transfer(address indexed from, address indexed to, uint64 value);
-    event Approval(
-        address indexed owner,
-        address indexed spender,
-        uint64 value
-    );
-
-    /* token metadata */
-    function name() external view returns (string memory);
-
-    function symbol() external view returns (string memory);
-
-    function decimals() external view returns (uint8);
-
-    /* token data */
-    function totalSupply() external view returns (uint64);
-
-    function balanceOf(address account) external view returns (uint64);
-
-    function allowance(
-        address owner,
-        address spender
-    ) external view returns (uint64);
-
-    /* value parameters are uint64 */
-    function transfer(address to, uint64 value) external returns (bool);
-
-    function approve(address spender, uint64 value) external returns (bool);
-
-    function transferFrom(
-        address from,
-        address to,
-        uint64 value
-    ) external returns (bool);
-}
+import {IZRC20} from "./IZRC20.sol";
 
 contract TradesPerDayToken is IZRC20 {
     /*──────── token metadata (immutable) ────────*/

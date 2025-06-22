@@ -70,7 +70,7 @@ interface IPushNotificationHub {
 
     /*──────── Notifications ────────*/
     function pushNotification(
-        uint64 id,
+        uint64[] calldata ids,      // ← many feeds in one shot
         string calldata subject,
         string calldata body,
         string calldata link
@@ -229,14 +229,20 @@ contract PushNotificationHub is IPushNotificationHub {
         }
     }
 
-    /*════════ Notifications ════════*/
+    /*════════ Notifications (multi-feed) ════════*/
     function pushNotification(
-        uint64 id,
+        uint64[] calldata ids,
         string calldata subject,
         string calldata body,
         string calldata link
-    ) external validFeed(id) onlyAdmin(id) {
-        emit Notification(id, msg.sender, subject, body, link);
+    ) external {
+        uint256 len = ids.length;
+        for (uint256 i; i < len; ++i) {
+            uint64 id = ids[i];
+            require(id < feedCount, "feed");                // feed exists
+            require(_feeds[id].admins[msg.sender], "admin"); // caller is admin
+            emit Notification(id, msg.sender, subject, body, link);
+        }
     }
 
     /*════════ View helpers ════════*/

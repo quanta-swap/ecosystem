@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IZRC20} from "./IZRC20.sol";   // adjust the relative path if needed
+import {IZ156FlashBorrower, IZ156FlashLender} from "./IZ156Flash.sol"; // adjust the relative path if needed
 /*───────────────────────────────────────────────────────────────
 │  IZRC-20 + Z-Flash + Yield-Protocol (64-bit token amounts)
 │  Wrapped QRL – revision “Z-ae”
@@ -18,65 +20,6 @@ abstract contract ReentrancyGuard {
         _;
         _stat = _NOT;
     }
-}
-
-/*─────────────────────────────────────────────────────
-│  IZRC-20 core (ERC-20, but uint64 everywhere)
-└────────────────────────────────────────────────────*/
-interface IZRC20 {
-    event Transfer(address indexed from, address indexed to, uint64 value);
-    event Approval(
-        address indexed owner,
-        address indexed spender,
-        uint64 value
-    );
-
-    function totalSupply() external view returns (uint64);
-
-    function balanceOf(address) external view returns (uint64);
-
-    function allowance(address, address) external view returns (uint64);
-
-    function transfer(address, uint64) external returns (bool);
-
-    function approve(address, uint64) external returns (bool);
-
-    function transferFrom(address, address, uint64) external returns (bool);
-}
-
-interface IZRC20Metadata is IZRC20 {
-    function name() external view returns (string memory);
-
-    function symbol() external view returns (string memory);
-
-    function decimals() external view returns (uint8);
-}
-
-/*──────── Z-Flash-Loan (64-bit amounts) ────────*/
-interface IZ156FlashBorrower {
-    function onFlashLoan(
-        address initiator,
-        address token,
-        uint64 amount,
-        uint64 fee,
-        bytes calldata data
-    ) external returns (bytes32);
-}
-
-interface IZ156FlashLender {
-    function maxFlashLoan(address token) external view returns (uint64);
-
-    function flashFee(
-        address token,
-        uint64 amount
-    ) external view returns (uint64);
-
-    function flashLoan(
-        IZ156FlashBorrower receiver,
-        address token,
-        uint64 amount,
-        bytes calldata data
-    ) external returns (bool);
 }
 
 /*──────── Yield-Protocol controller surface (64-bit) ────────*/
@@ -130,7 +73,6 @@ uint64 constant MAX_BAL = type(uint64).max;
 uint256 constant _SCALE = 1e10; // 18-dec wei → 8-dec token
 bytes32 constant _FLASH_OK = keccak256("IZ156.ok");
 uint8 constant MAX_SLOTS = 8;
-uint64 constant MAX_LOCK_WIN = 2_628_000; // ~1 year (Ethereum blocks)
 
 /*──────── Data structs ────────*/
 struct Member {
@@ -171,10 +113,11 @@ struct Account {
 contract WrappedQRL is
     IYieldProtocol,
     IZRC20,
-    IZRC20Metadata,
     IZ156FlashLender,
     ReentrancyGuard
 {
+    uint64 public constant MAX_LOCK_WIN = 2_628_000; // ≈ 1 year (Ethereum blocks)
+
     /*──────── Storage ────────*/
     mapping(address => Account) private _acct;
     mapping(address => mapping(address => uint64)) private _allow;
