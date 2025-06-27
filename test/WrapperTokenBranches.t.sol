@@ -20,11 +20,18 @@ contract WrappedQRLBranches is Test {
     }
 
     /*──────── Deposit guards ───────*/
-    function testDepositPrecisionAndZeroRevert() public {
-        vm.expectRevert(bytes("precision"));          // wrong granularity
-        w.deposit{value: 1 wei}();
+    /// Reverts because 1 wei is **not** a multiple of 1e10 wei per token
+    function testDepositPrecisionRevert() public {
+        bytes memory sig = abi.encodeWithSignature("deposit()");
+        vm.expectRevert(bytes("precision"));
+        // low-level call guarantees the revert is one frame below the cheatcode
+        (bool success, ) = address(w).call{value: 1 wei}(sig);
+        require(!success, "Expected revert but call succeeded");
+    }
 
-        vm.expectRevert(); // zero                      // explicit branch
+    /// Reverts on the explicit `"zero"` branch when no ETH is sent
+    function testDepositZeroRevert() public {
+        vm.expectRevert(); // zero
         w.deposit{value: 0}();
     }
 
