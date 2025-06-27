@@ -611,7 +611,7 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
             amountIn,
             pA.reserveR,
             pA.reserveT,
-            feeN / 2
+            feeN
         );
         _pull(IZRC20(tokenFrom), walletFrom, amountIn);
         pA.reserveT += amountIn;
@@ -623,7 +623,7 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         Pool storage pB = pools[tokenTo];
         require(pB.reserveR > 0 && pB.reserveT > 0, "empty B");
         _updateCumulative(tokenTo, pB);
-        out = _outRtoT(reserveGot, pB.reserveR, pB.reserveT, feeN / 2);
+        out = _outRtoT(reserveGot, pB.reserveR, pB.reserveT, feeN);
         require(out >= minOut, "slippage");
         pB.reserveR += reserveGot;
         pB.reserveT -= out;
@@ -692,12 +692,12 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         /* hop-1: tokenFrom → RESERVE */
         Pool storage pA = pools[tokenFrom];
         require(pA.reserveR > 0 && pA.reserveT > 0, "empty A");
-        uint64 reserveGot = _outTtoR(amountIn, pA.reserveR, pA.reserveT, feeN / 2);
+        uint64 reserveGot = _outTtoR(amountIn, pA.reserveR, pA.reserveT, feeN);
 
         /* hop-2: RESERVE → tokenTo */
         Pool storage pB = pools[tokenTo];
         require(pB.reserveR > 0 && pB.reserveT > 0, "empty B");
-        out = _outRtoT(reserveGot, pB.reserveR, pB.reserveT, feeN / 2);
+        out = _outRtoT(reserveGot, pB.reserveR, pB.reserveT, feeN);
     }
 
     /*=====================================================================
