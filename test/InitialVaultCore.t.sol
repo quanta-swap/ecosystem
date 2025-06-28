@@ -275,4 +275,82 @@ contract BismarckVault_Test is Test {
         vm.expectRevert(); // amt
         vault.deposit(0);
     }
+
+    /*─────────────────────  Extra-coverage tests  ─────────────────────*/
+
+    /* View helpers and accounting sanity */
+    function testLiveTotalDepositedAndPendingShares() public {
+        // before deploy
+        assertFalse(vault.live(), "should not be live yet");
+        assertEq(vault.totalDeposited(), 0, "zero at T0");
+        assertEq(vault.pendingShares(alice), 0, "no shares yet");
+
+        /* Alice 100 – Bob 50  (within minted balances) */
+        vm.prank(alice);
+        vault.deposit(100 * ONE);
+        vm.prank(bob);
+        vault.deposit( 50 * ONE);
+
+        assertEq(vault.totalDeposited(), 150 * ONE, "aggregates correctly");
+        assertEq(vault.deposited(alice), 100 * ONE, "tracks per-user");
+
+        /* deploy: shares == wQRL in mock */
+        vm.prank(owner);
+        vault.deploy(140);              // minShares < 150
+
+        assertTrue(vault.live(), "now live");
+        assertEq(vault.pendingShares(alice), 100 * ONE, "shares 1:1");
+        assertEq(vault.pendingShares(bob),   50 * ONE, "shares 1:1");
+    }
+
+    /* User cannot cancel more than they have */
+    function testCancelTooMuchReverts() public {
+        vm.prank(alice);
+        vault.deposit(10 * ONE);
+
+        vm.prank(alice);
+        vm.expectRevert();   // > balance
+        vault.cancel(11 * ONE);
+    }
+
+    /* Vault owner cannot deploy twice */
+    function testSecondDeployReverts() public {
+        _seedAndDeploy();
+
+        vm.prank(owner);
+        vm.expectRevert(); // live     // already deployed
+        vault.deploy(1);
+    }
+
+    /* Withdraw without ever depositing */
+    function testWithdrawWithoutDepositReverts() public {
+        _seedAndDeploy();
+        vm.warp(block.timestamp + 400 days);   // vesting finished
+
+        vm.prank(carol);                       // never deposited
+        vm.expectRevert();                     // nothing to withdraw
+        vault.withdrawUnderlying(0, 0);
+    }
+
+    /* 1.  Calling claim() when nothing is vested must revert */
+    function testClaimWhenNothingVestedReverts() public {
+        // Alice deposits but we never advance time ⇒ nothing vested
+        vm.prank(alice);
+        vault.deposit(50 * ONE);
+
+        vm.prank(alice);
+        vm.expectRevert();          // "nothing" or generic
+        vault.claim();
+    }
+
+    /* 2.  Zero-amount cancel() shortcut / guard */
+    function testZeroAmountCancelReverts() public {
+        vm.prank(alice);
+        vault.deposit(10 * ONE);
+
+        vm.prank(alice);
+        vm.expectRevert();          // should reject amt == 0
+        vault.cancel(0);
+    }
+
 }

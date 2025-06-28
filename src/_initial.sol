@@ -234,4 +234,5 @@ contract BISMARCK is ReentrancyGuard {
         if (!live || exited[u]) return 0;
         return uint128((uint256(totalShares) * deposited[u]) / totalDeposited);
     }
+
 }
