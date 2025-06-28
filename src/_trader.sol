@@ -419,23 +419,23 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     /*──────────────────────── INTERNAL PURE MATH HELPERS ─────────────────────*/
 
     function _outRtoT256(
-        uint256 A,                 // amtIn
-        uint256 R,                 // resIn  (reserveR)
-        uint256 T,                 // resOut (reserveT)
-        uint64  feeN
+        uint256 A, // amtIn
+        uint256 R, // resIn  (reserveR)
+        uint256 T, // resOut (reserveT)
+        uint64 feeN
     ) private pure returns (uint256) {
-        uint256 num = A * feeN * T;           // A*fee*T
+        uint256 num = A * feeN * T; // A*fee*T
         uint256 den = (R * _FEE_DEN) + (A * feeN);
-        return num / den;                     // out ≥0
+        return num / den; // out ≥0
     }
 
     function _outTtoR256(
-        uint256 A,                 // amtIn (token)
-        uint256 R,                 // resR
-        uint256 T,                 // resT
-        uint64  feeN
+        uint256 A, // amtIn (token)
+        uint256 R, // resR
+        uint256 T, // resT
+        uint64 feeN
     ) private pure returns (uint256) {
-        uint256 gross = (A * R) / (T + A);    // before fee
+        uint256 gross = (A * R) / (T + A); // before fee
         return (gross * feeN) / _FEE_DEN;
     }
 
@@ -444,22 +444,22 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     function _solveDeltaRtoTPR(
         uint256 R,
         uint256 T,
-        uint64  feeN,
-        uint256 targetTPR,          // 1e18-scaled
-        uint256 maxSpend            // caller’s remaining reserve
+        uint64 feeN,
+        uint256 targetTPR, // 1e18-scaled
+        uint256 maxSpend // caller’s remaining reserve
     ) private pure returns (uint256 spend) {
         uint256 lo = 1;
         uint256 hi = maxSpend;
         while (lo <= hi) {
-            uint256 mid = (lo + hi) >> 1;     // binary-search
+            uint256 mid = (lo + hi) >> 1; // binary-search
             uint256 outT = _outRtoT256(mid, R, T, feeN);
-            uint256 Rn  = R + mid;
-            uint256 Tn  = T - outT;
+            uint256 Rn = R + mid;
+            uint256 Tn = T - outT;
             uint256 newTPR = (Tn * 1e18) / Rn;
             if (newTPR > targetTPR) {
-                lo = mid + 1;                 // need larger trade
+                lo = mid + 1; // need larger trade
             } else {
-                spend = mid;                  // mid is feasible
+                spend = mid; // mid is feasible
                 hi = mid - 1;
             }
         }
@@ -470,20 +470,20 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     function _solveDeltaTtoRPT(
         uint256 R,
         uint256 T,
-        uint64  feeN,
-        uint256 targetRPT,          // 1e18-scaled
-        uint256 maxSpend            // caller’s remaining token
+        uint64 feeN,
+        uint256 targetRPT, // 1e18-scaled
+        uint256 maxSpend // caller’s remaining token
     ) private pure returns (uint256 spend) {
         uint256 lo = 1;
         uint256 hi = maxSpend;
         while (lo <= hi) {
             uint256 mid = (lo + hi) >> 1;
             uint256 outR = _outTtoR256(mid, R, T, feeN);
-            uint256 Rn  = R - outR;
-            uint256 Tn  = T + mid;
+            uint256 Rn = R - outR;
+            uint256 Tn = T + mid;
             uint256 newRPT = (Rn * 1e18) / Tn;
             if (newRPT < targetRPT) {
-                lo = mid + 1;                 // need larger trade
+                lo = mid + 1; // need larger trade
             } else {
                 spend = mid;
                 hi = mid - 1;
@@ -494,16 +494,17 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     /*─────────────────── RESERVE → TOKEN  (interleaved) ──────────────────────*/
     function swapReserveForTokenWithOrders(
         address token,
-        uint64  amountIn,
-        uint64  minOut,
+        uint64 amountIn,
+        uint64 minOut,
         address to,
-        uint64  freeAmt,
+        uint64 freeAmt,
         uint64[] calldata ids
     ) external nonReentrant returns (uint64 outT) {
-
         require(
-            token != address(0) && token != address(RESERVE) &&
-            amountIn > 0       && to != address(0),
+            token != address(0) &&
+                token != address(RESERVE) &&
+                amountIn > 0 &&
+                to != address(0),
             "args"
         );
 
@@ -516,14 +517,15 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         _updateCumulative(token, pools[token]);
 
         uint64 remainR = amountIn;
-        uint256 ptr;                                     // index into ids[]
+        uint256 ptr; // index into ids[]
 
         while (remainR > 0) {
             /* seek next valid maker (selling token, i.e. isBuy == false) */
-            uint256 orderTPR;                              // 1e18-scaled
+            uint256 orderTPR; // 1e18-scaled
             for (; ptr < ids.length; ++ptr) {
                 Order storage o = orders[token][ids[ptr]];
-                if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve) continue;
+                if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve)
+                    continue;
                 orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
                 break;
             }
@@ -536,7 +538,8 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
                 uint256 spend = haveOrder
                     ? _solveDeltaRtoTPR(R, T, feeN, orderTPR, remainR)
                     : remainR;
-                if (spend == 0) {                         // cannot reach parity
+                if (spend == 0) {
+                    // cannot reach parity
                     spend = remainR;
                 }
                 uint256 tokenOut = _outRtoT256(spend, R, T, feeN);
@@ -544,22 +547,33 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
                 R += spend;
                 T -= tokenOut;
                 remainR -= uint64(spend);
-                outT   += uint64(tokenOut);
-                emit Swap(msg.sender, token, true, uint64(spend), uint64(tokenOut));
+                outT += uint64(tokenOut);
+                emit Swap(
+                    msg.sender,
+                    token,
+                    true,
+                    uint64(spend),
+                    uint64(tokenOut)
+                );
             } else {
                 /* order is better */
                 Order storage o = orders[token][ids[ptr]];
-                uint64 availTok = o.reserve - o.filled;          // token escrow left
-                uint256 affordableTok = (uint256(remainR) * o.reserve) / o.quantity;
-                uint64 takeTok = affordableTok >= availTok ? availTok : uint64(affordableTok);
-                if (takeTok == 0) break;                         // nothing affordable
+                uint64 availTok = o.reserve - o.filled; // token escrow left
+                uint256 affordableTok = (uint256(remainR) * o.reserve) /
+                    o.quantity;
+                uint64 takeTok = affordableTok >= availTok
+                    ? availTok
+                    : uint64(affordableTok);
+                if (takeTok == 0) break; // nothing affordable
 
-                uint64 payRes = uint64((uint256(takeTok) * o.quantity) / o.reserve);
+                uint64 payRes = uint64(
+                    (uint256(takeTok) * o.quantity) / o.reserve
+                );
                 _pull(RESERVE, msg.sender, payRes);
                 _recordFill(token, ids[ptr], takeTok, payRes);
 
                 remainR -= payRes;
-                outT    += takeTok;
+                outT += takeTok;
             }
         }
 
@@ -579,16 +593,17 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     /*─────────────────── TOKEN → RESERVE (interleaved) ───────────────────────*/
     function swapTokenForReserveWithOrders(
         address token,
-        uint64  amountIn,
-        uint64  minOut,
+        uint64 amountIn,
+        uint64 minOut,
         address to,
-        uint64  freeAmt,
+        uint64 freeAmt,
         uint64[] calldata ids
     ) external nonReentrant returns (uint64 outR) {
-
         require(
-            token != address(0) && token != address(RESERVE) &&
-            amountIn > 0       && to != address(0),
+            token != address(0) &&
+                token != address(RESERVE) &&
+                amountIn > 0 &&
+                to != address(0),
             "args"
         );
 
@@ -608,13 +623,14 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
             uint256 orderRPT;
             for (; ptr < ids.length; ++ptr) {
                 Order storage o = orders[token][ids[ptr]];
-                if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
+                if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve)
+                    continue;
                 orderRPT = (uint256(o.quantity) * 1e18) / o.reserve; // reserve per token
                 break;
             }
             bool haveOrder = ptr < ids.length;
 
-            uint256 poolRPT = (R * 1e18) / T;                       // reserve per token
+            uint256 poolRPT = (R * 1e18) / T; // reserve per token
 
             if (!haveOrder || poolRPT <= orderRPT) {
                 /* pool pays better – token→reserve until parity or exhaust */
@@ -628,20 +644,28 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
                 R -= reserveOut;
                 T += spend;
                 remainT -= uint64(spend);
-                outR   += uint64(reserveOut);
-                emit Swap(msg.sender, token, false, uint64(spend), uint64(reserveOut));
+                outR += uint64(reserveOut);
+                emit Swap(
+                    msg.sender,
+                    token,
+                    false,
+                    uint64(spend),
+                    uint64(reserveOut)
+                );
             } else {
                 /* order better */
                 Order storage o = orders[token][ids[ptr]];
                 uint64 availRes = o.reserve - o.filled;
-                uint64 takeRes  = availRes > remainT ? remainT : availRes;
-                uint64 giveTok  = uint64((uint256(takeRes) * o.reserve) / o.quantity);
+                uint64 takeRes = availRes > remainT ? remainT : availRes;
+                uint64 giveTok = uint64(
+                    (uint256(takeRes) * o.reserve) / o.quantity
+                );
 
                 _pull(IZRC20(token), msg.sender, giveTok);
                 _recordFill(token, ids[ptr], takeRes, giveTok);
 
                 remainT -= takeRes;
-                outR    += takeRes;
+                outR += takeRes;
             }
         }
 
@@ -662,19 +686,21 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     function swapTokenForTokenWithOrders(
         address tokenFrom,
         address tokenTo,
-        uint64  amountIn,
-        uint64  minOut,
+        uint64 amountIn,
+        uint64 minOut,
         address to,
-        uint64  freeAmt,
-        uint64[] calldata idsFrom,      // makers *buying* tokenFrom
-        uint64[] calldata idsTo        // makers *selling* tokenTo
+        uint64 freeAmt,
+        uint64[] calldata idsFrom, // makers *buying* tokenFrom
+        uint64[] calldata idsTo // makers *selling* tokenTo
     ) external nonReentrant returns (uint64 outT) {
-
         require(
-            tokenFrom != address(0) && tokenTo != address(0) &&
-            tokenFrom != tokenTo    &&
-            tokenFrom != address(RESERVE) && tokenTo != address(RESERVE) &&
-            amountIn > 0            && to != address(0),
+            tokenFrom != address(0) &&
+                tokenTo != address(0) &&
+                tokenFrom != tokenTo &&
+                tokenFrom != address(RESERVE) &&
+                tokenTo != address(RESERVE) &&
+                amountIn > 0 &&
+                to != address(0),
             "args"
         );
 
@@ -696,11 +722,10 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
 
     function _execTtoR_best(
         address token,
-        uint64  amtIn,
-        uint64  feeN,
+        uint64 amtIn,
+        uint64 feeN,
         uint64[] calldata ids
     ) private returns (uint64 outR) {
-
         uint256 R = pools[token].reserveR;
         uint256 T = pools[token].reserveT;
         require(R > 0 && T > 0, "empty");
@@ -713,7 +738,8 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
             uint256 orderRPT;
             for (; ptr < ids.length; ++ptr) {
                 Order storage o = orders[token][ids[ptr]];
-                if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
+                if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve)
+                    continue;
                 orderRPT = (uint256(o.quantity) * 1e18) / o.reserve;
                 break;
             }
@@ -729,16 +755,18 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
                 R -= out;
                 T += spend;
                 remainT -= uint64(spend);
-                outR   += uint64(out);
+                outR += uint64(out);
                 emit Swap(msg.sender, token, false, uint64(spend), uint64(out));
             } else {
                 Order storage o = orders[token][ids[ptr]];
                 uint64 availRes = o.reserve - o.filled;
-                uint64 takeRes  = availRes > remainT ? remainT : availRes;
-                uint64 giveTok  = uint64((uint256(takeRes) * o.reserve) / o.quantity);
+                uint64 takeRes = availRes > remainT ? remainT : availRes;
+                uint64 giveTok = uint64(
+                    (uint256(takeRes) * o.reserve) / o.quantity
+                );
                 _recordFill(token, ids[ptr], takeRes, giveTok);
                 remainT -= takeRes;
-                outR    += takeRes;
+                outR += takeRes;
             }
         }
 
@@ -752,12 +780,11 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
 
     function _execRtoT_best(
         address token,
-        uint64  amtIn,
-        uint64  feeN,
+        uint64 amtIn,
+        uint64 feeN,
         uint64[] calldata ids,
         address payTo
     ) private returns (uint64 outT) {
-
         uint256 R = pools[token].reserveR;
         uint256 T = pools[token].reserveT;
         require(R > 0 && T > 0, "empty");
@@ -770,7 +797,8 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
             uint256 orderTPR;
             for (; ptr < ids.length; ++ptr) {
                 Order storage o = orders[token][ids[ptr]];
-                if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve) continue;
+                if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve)
+                    continue;
                 orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
                 break;
             }
@@ -786,17 +814,28 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
                 R += spend;
                 T -= tokOut;
                 remainR -= uint64(spend);
-                outT   += uint64(tokOut);
-                emit Swap(msg.sender, token, true, uint64(spend), uint64(tokOut));
+                outT += uint64(tokOut);
+                emit Swap(
+                    msg.sender,
+                    token,
+                    true,
+                    uint64(spend),
+                    uint64(tokOut)
+                );
             } else {
                 Order storage o = orders[token][ids[ptr]];
                 uint64 availTok = o.reserve - o.filled;
-                uint256 affordableTok = (uint256(remainR) * o.reserve) / o.quantity;
-                uint64 takeTok = affordableTok >= availTok ? availTok : uint64(affordableTok);
-                uint64 payRes  = uint64((uint256(takeTok) * o.quantity) / o.reserve);
+                uint256 affordableTok = (uint256(remainR) * o.reserve) /
+                    o.quantity;
+                uint64 takeTok = affordableTok >= availTok
+                    ? availTok
+                    : uint64(affordableTok);
+                uint64 payRes = uint64(
+                    (uint256(takeTok) * o.quantity) / o.reserve
+                );
                 _recordFill(token, ids[ptr], takeTok, payRes);
                 remainR -= payRes;
-                outT    += takeTok;
+                outT += takeTok;
             }
         }
 
