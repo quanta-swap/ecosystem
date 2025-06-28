@@ -39,8 +39,8 @@ interface IReserveDEX {
     /* liquidity */
     function addLiquidity(
         address token,
-        uint64  reserveDesired,
-        uint64  tokenDesired
+        uint64 reserveDesired,
+        uint64 tokenDesired
     ) external returns (uint128 shares, uint64 reserveUsed, uint64 tokenUsed);
 
     function removeLiquidity(
@@ -51,8 +51,8 @@ interface IReserveDEX {
     /* swap: RESERVE → token (fee paid in RESERVE) */
     function swapReserveForToken(
         address token,
-        uint64  amountIn,
-        uint64  minOut,
+        uint64 amountIn,
+        uint64 minOut,
         address to,
         uint64 freeAmt
     ) external returns (uint64 amountOut);
@@ -107,6 +107,65 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         uint256 priceCum;
     } // ring‑buffer entry
 
+    // NEW: TODO
+
+    /*──────────────── LIMIT-ORDER BOOK – fixed-price fills ───────────────*/
+    mapping(address => uint64) private _nextOrderId;
+    mapping(address => mapping(address => mapping(uint64 => bool)))
+        private _orderOwned;
+    mapping(address => mapping(uint64 => Order)) private orders;
+
+    struct Order {
+        uint64 reserve; // total input escrowed at creation
+        uint64 quantity; // total output the maker expects at full fill
+        uint64 filled; // input already traded (≤ reserve)
+        bool isBuy; // true: RESERVE→token ; false: token→RESERVE
+    }
+
+    /*───────── EVENTS ─────────*/
+    event OrderPlaced(
+        address indexed maker,
+        address indexed token,
+        uint64 id,
+        bool isBuy,
+        uint64 inAmt,
+        uint64 minOut
+    );
+    event OrderCancelled(
+        address indexed maker,
+        address indexed token,
+        uint64 id,
+        uint64 refundIn,
+        uint64 claimOut
+    );
+
+    /*───────────────────── BATCH-ORDER EVENTS ───────────────────*/
+    event OrdersBatchPlaced(
+        // all new orders accepted
+        address indexed maker,
+        uint64 tokenGroups, // tokens.length
+        uint64 ordersTotal // Σ row lengths
+    );
+    event OrdersBatchCancelled(
+        // all specified orders removed & paid out
+        address indexed maker,
+        uint64 tokenGroups,
+        uint64 ordersTotal,
+        uint64 totalRefundIn, // sum of unused escrow returned
+        uint64 totalClaimOut // sum of proceeds paid
+    );
+
+    /** emitted every time an order is (partially) filled */
+    event OrderFilled(
+        address indexed token,
+        uint64 indexed id,
+        address taker,
+        uint64 makerInUsed, // input removed from maker’s escrow
+        uint64 makerOutGiven // proceeds credited to the order
+    );
+
+    // NEW: TODO (above)
+
     mapping(address token => Pool) private pools;
     mapping(address token => mapping(address lp => uint128)) public liqOf; // LP shares
     mapping(address token => Obs[_OBS_SIZE]) private _obs;
@@ -154,6 +213,497 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     // "FEE... FIE! FOE!! FUM!!!"
     function theme() external pure returns (string memory) {
         return "https://www.youtube.com/watch?v=et-VRZoChLY";
+    }
+
+    /*──────── single-order helpers ───────*/
+    function _placeOrder(
+        address maker,
+        address token,
+        bool isBuy,
+        uint64 amountIn,
+        uint64 minOut // becomes the fixed strike output
+    ) private returns (uint64 id) {
+        // escrow
+        if (isBuy) _pull(RESERVE, maker, amountIn);
+        else _pull(IZRC20(token), maker, amountIn);
+
+        id = ++_nextOrderId[token];
+        orders[token][id] = Order(amountIn, minOut, 0, isBuy);
+        _orderOwned[maker][token][id] = true;
+
+        emit OrderPlaced(maker, token, id, isBuy, amountIn, minOut);
+    }
+
+    /**
+     * @dev Matching engine must:
+     *  1. transfer `makerOut = inUsed * o.quantity / o.reserve`
+     *     **into the contract** *before* calling this function
+     *  2. pull `inUsed` of the maker’s escrow out to the taker
+     */
+    function _recordFill(
+        address token,
+        uint64 id,
+        uint64 inUsed,
+        uint64 makerOut // amount just deposited by taker
+    ) internal {
+        Order storage o = orders[token][id];
+        require(o.reserve - o.filled >= inUsed, "overfill");
+
+        /* verify fixed-price discipline */
+        uint256 expected = (uint256(inUsed) * o.quantity) / o.reserve;
+        require(makerOut == expected, "wrong price");
+
+        o.filled += inUsed;
+
+        /* move the maker’s escrowed input to the taker */
+        if (o.isBuy) {
+            // maker escrow is RESERVE; pay taker RESERVE
+            _push(RESERVE, msg.sender, inUsed);
+        } else {
+            // maker escrow is token; pay taker token
+            _push(IZRC20(token), msg.sender, inUsed);
+        }
+
+        emit OrderFilled(token, id, msg.sender, inUsed, makerOut);
+    }
+
+    function _cancelOrder(address maker, address token, uint64 id) private {
+        require(_orderOwned[maker][token][id], "not owner/absent");
+        Order memory o = orders[token][id];
+
+        /* compute what’s still in escrow (refund) */
+        uint64 refund = o.reserve - o.filled;
+
+        /* compute proceeds owed to maker at fixed price */
+        uint64 claim = uint64((uint256(o.filled) * o.quantity) / o.reserve);
+
+        /* wipe storage first */
+        delete orders[token][id];
+        delete _orderOwned[maker][token][id];
+
+        /* pay out */
+        if (refund > 0) {
+            if (o.isBuy) _push(RESERVE, maker, refund);
+            else _push(IZRC20(token), maker, refund);
+        }
+        if (claim > 0) {
+            if (o.isBuy) _push(IZRC20(token), maker, claim);
+            else _push(RESERVE, maker, claim);
+        }
+
+        emit OrderCancelled(maker, token, id, refund, claim);
+    }
+
+    /*───────────────────── BATCH-CREATE ─────────────────────────*/
+    /**
+     * @notice Create many fixed-price limit orders, grouped by token.
+     * @dev    `tokens.length == isBuys.length == amountIns.length == minOuts.length`
+     *         and every inner array has equal length per row.
+     * @return ids  2-D array mirroring the inputs; ids[i][j] is the new order-ID
+     *              for `tokens[i]` and the j-th order in that row.
+     */
+    function createLimitOrders(
+        address[] calldata tokens,
+        bool[][] calldata isBuys,
+        uint64[][] calldata amountIns,
+        uint64[][] calldata minOuts
+    ) external nonReentrant returns (uint64[][] memory ids) {
+        uint256 n = tokens.length;
+        require(
+            n > 0 &&
+                n == isBuys.length &&
+                n == amountIns.length &&
+                n == minOuts.length,
+            "len"
+        );
+
+        ids = new uint64[][](n);
+        uint64 total;
+
+        for (uint256 i; i < n; ++i) {
+            address tok = tokens[i];
+            require(tok != address(0) && tok != address(RESERVE), "token");
+
+            bool[] calldata rowB = isBuys[i];
+            uint64[] calldata rowA = amountIns[i];
+            uint64[] calldata rowQ = minOuts[i];
+            uint256 m = rowB.length;
+            require(m == rowA.length && m == rowQ.length, "row");
+
+            uint64[] memory rowIds = new uint64[](m);
+            for (uint256 j; j < m; ++j) {
+                require(rowA[j] > 0 && rowQ[j] > 0, "zero");
+                rowIds[j] = _placeOrder(
+                    msg.sender,
+                    tok,
+                    rowB[j],
+                    rowA[j],
+                    rowQ[j]
+                );
+            }
+            ids[i] = rowIds;
+            total += uint64(m);
+        }
+        emit OrdersBatchPlaced(msg.sender, uint64(n), total);
+    }
+
+    /*───────────────────── BATCH-CANCEL (+ CLAIM) ───────────────*/
+    /**
+     * @notice Cancel many orders (and implicitly claim all proceeds).
+     *         `tokens[i]` is matched with every id in `ids[i]`.
+     */
+    function cancelLimitOrders(
+        address[] calldata tokens,
+        uint64[][] calldata ids
+    ) external nonReentrant {
+        uint256 n = tokens.length;
+        require(n > 0 && n == ids.length, "len");
+
+        uint64 total;
+        uint64 sumRefund;
+        uint64 sumClaim;
+
+        for (uint256 i; i < n; ++i) {
+            address tok = tokens[i];
+            require(tok != address(0) && tok != address(RESERVE), "token");
+
+            uint64[] calldata row = ids[i];
+            for (uint256 j; j < row.length; ++j) {
+                uint64 id = row[j];
+                require(_orderOwned[msg.sender][tok][id], "not owner/absent");
+
+                Order memory o = orders[tok][id];
+                uint64 refund = o.reserve - o.filled;
+                uint64 claim = uint64(
+                    (uint256(o.filled) * o.quantity) / o.reserve
+                );
+
+                // erase before payout (re-entrancy safety)
+                delete orders[tok][id];
+                delete _orderOwned[msg.sender][tok][id];
+
+                if (refund > 0) {
+                    if (o.isBuy) _push(RESERVE, msg.sender, refund);
+                    else _push(IZRC20(tok), msg.sender, refund);
+                }
+                if (claim > 0) {
+                    if (o.isBuy) _push(IZRC20(tok), msg.sender, claim);
+                    else _push(RESERVE, msg.sender, claim);
+                }
+
+                sumRefund += refund;
+                sumClaim += claim;
+            }
+            total += uint64(row.length);
+        }
+        emit OrdersBatchCancelled(
+            msg.sender,
+            uint64(n),
+            total,
+            sumRefund,
+            sumClaim
+        );
+    }
+
+    /*───────────────────────── HYBRID ORDER-POOL SWAPS ─────────────────────────
+
+    – The taker supplies one side of the trade (`amountIn`) and gives an
+        **explicit price-sorted list** of limit-order IDs.  
+    – While there is remaining input, the routine **walks the list in order**,
+        filling each still-active order *iff* its fixed price beats the current
+        pool price.  
+    – As soon as the pool becomes cheaper (or the list is exhausted) the
+        remainder is executed directly against the AMM, in one shot.
+    – FREE is locked **once** up-front; the same feeNumerator is used for every
+        pool interaction inside the call, so no redundant `FREE.lock()` calls.
+
+    Gas-wise this is aggressively pared down – no extra storage, no quadratic
+    complexity, and all maths stay inside 256-bit safe-ranges.
+
+    ───────────────────────────────────────────────────────────────────────────*/
+
+    /// @notice swap RESERVE → `token`, using both limit orders (makers *sell*
+    ///         `token`) and the pool to achieve best execution.
+    /// @dev    `orderIds` must be sorted from *cheapest* to *worst* for the taker
+    ///         (i.e. descending tokenPerReserve). Already-filled / cancelled
+    ///         orders are silently skipped.
+    function swapReserveForTokenWithOrders(
+        address token,
+        uint64 amountIn,
+        uint64 minOut,
+        address to,
+        uint64 freeAmt,
+        uint64[] calldata orderIds
+    ) external nonReentrant returns (uint64 amountOut) {
+        require(
+            token != address(0) &&
+                token != address(RESERVE) &&
+                amountIn > 0 &&
+                to != address(0),
+            "bad args"
+        );
+
+        /*─── upfront fee-calc & FREE lock (only once) ───*/
+        uint64 feeN = _feeNum(freeAmt);
+        _applyFree(msg.sender, freeAmt);
+
+        uint64 remainIn = amountIn;
+        Pool storage p = pools[token];
+        require(p.reserveR > 0 && p.reserveT > 0, "empty pool");
+        _updateCumulative(token, p);
+
+        /* current spot (token / reserve) in 1e18 fixed-point for cheap compare */
+        uint256 spotTPR = (uint256(p.reserveT) * 1e18) / p.reserveR;
+
+        /*─── FIRST LEG: walk the order-book list ───*/
+        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
+            Order storage o = orders[token][orderIds[k]];
+            if (
+                o.reserve == 0 || // non-existent / cancelled
+                o.isBuy || // wrong side
+                o.filled >= o.reserve // fully filled
+            ) continue;
+
+            /* price check: order tokenPerReserve > current pool tokenPerReserve? */
+            uint256 orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
+            if (orderTPR <= spotTPR) break; // pool now cheaper ⇒ stop walking
+
+            uint64 availTok = o.reserve - o.filled;
+
+            /* max token we can afford with remainIn at order’s fixed price */
+            uint256 affordTok = (uint256(remainIn) * o.reserve) / o.quantity;
+            uint64 takeTok = affordTok >= availTok
+                ? availTok
+                : uint64(affordTok);
+            if (takeTok == 0) break; // can’t afford even 1 token – go pool
+
+            /* proportional reserve we owe to maker for the partial fill */
+            uint64 payRes = uint64((uint256(takeTok) * o.quantity) / o.reserve);
+
+            /* pull taker reserve into contract and record the fill */
+            _pull(RESERVE, msg.sender, payRes);
+            _recordFill(token, orderIds[k], takeTok, payRes);
+
+            remainIn -= payRes;
+            amountOut += takeTok;
+        }
+
+        /*─── SECOND LEG: whatever is left hits the AMM pool directly ───*/
+        if (remainIn > 0) {
+            uint64 outPool = _outRtoT(remainIn, p.reserveR, p.reserveT, feeN);
+            _pull(RESERVE, msg.sender, remainIn);
+            p.reserveR += remainIn;
+            p.reserveT -= outPool;
+            amountOut += outPool;
+            _maybeSnap(token, p);
+            emit Swap(msg.sender, token, true, remainIn, outPool);
+        }
+
+        require(amountOut >= minOut, "slippage");
+        _push(IZRC20(token), to, amountOut);
+    }
+
+    /*───────────────────────────────────────────────────────────────────────────*/
+
+    /// @notice swap `token` → RESERVE using orders (makers *buy* `token`)
+    ///         plus the pool. The logic is the exact mirror of the above.
+    function swapTokenForReserveWithOrders(
+        address token,
+        uint64 amountIn,
+        uint64 minOut,
+        address to,
+        uint64 freeAmt,
+        uint64[] calldata orderIds
+    ) external nonReentrant returns (uint64 amountOut) {
+        require(
+            token != address(0) &&
+                token != address(RESERVE) &&
+                amountIn > 0 &&
+                to != address(0),
+            "bad args"
+        );
+
+        uint64 feeN = _feeNum(freeAmt);
+        _applyFree(msg.sender, freeAmt);
+
+        uint64 remainIn = amountIn;
+        Pool storage p = pools[token];
+        require(p.reserveR > 0 && p.reserveT > 0, "empty pool");
+        _updateCumulative(token, p);
+
+        uint256 spotRPT = (uint256(p.reserveR) * 1e18) / p.reserveT; // reserve per token
+
+        /* FIRST: makers buying token (isBuy == true) */
+        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
+            Order storage o = orders[token][orderIds[k]];
+            if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
+
+            uint256 orderRPT = (uint256(o.quantity) * 1e18) / o.reserve;
+            if (orderRPT <= spotRPT) break; // AMM now pays better ⇒ stop
+
+            uint64 availRes = o.reserve - o.filled; // maker’s RESERVE escrow
+            uint64 takeRes = availRes > remainIn ? remainIn : availRes;
+            uint64 takeTok = uint64(
+                (uint256(takeRes) * o.reserve) / o.quantity
+            );
+
+            _pull(IZRC20(token), msg.sender, takeTok); // give token to maker
+            _recordFill(token, orderIds[k], takeRes, takeTok);
+
+            remainIn -= takeRes;
+            amountOut += takeRes;
+        }
+
+        /* SECOND: dump the rest into the pool */
+        if (remainIn > 0) {
+            uint64 outPool = _outTtoR(remainIn, p.reserveR, p.reserveT, feeN);
+            _pull(IZRC20(token), msg.sender, remainIn);
+            p.reserveT += remainIn;
+            p.reserveR -= outPool;
+            amountOut += outPool;
+            _maybeSnap(token, p);
+            emit Swap(msg.sender, token, false, remainIn, outPool);
+        }
+
+        require(amountOut >= minOut, "slippage");
+        _push(RESERVE, to, amountOut);
+    }
+
+    /*───────────────────────────────────────────────────────────────────────────*/
+
+    /// @notice Two-hop TOKEN-for-TOKEN best-execution route.
+    /// @dev    You pass two distinct order-lists:
+    ///         – `idsFrom`  ↦ makers *buying* `tokenFrom`
+    ///         – `idsTo`    ↦ makers *selling* `tokenTo`
+    ///         Each must be cheapest-to-worst for the taker.
+    ///         FREE is locked exactly once, fee rebate shared across both hops.
+    function swapTokenForTokenWithOrders(
+        address tokenFrom,
+        address tokenTo,
+        uint64 amountIn,
+        uint64 minOut,
+        address to,
+        uint64 freeAmt,
+        uint64[] calldata idsFrom,
+        uint64[] calldata idsTo
+    ) external nonReentrant returns (uint64 amountOut) {
+        require(
+            tokenFrom != address(0) &&
+                tokenTo != address(0) &&
+                tokenFrom != tokenTo &&
+                tokenFrom != address(RESERVE) &&
+                tokenTo != address(RESERVE) &&
+                amountIn > 0 &&
+                to != address(0),
+            "bad args"
+        );
+
+        uint64 feeN = _feeNum(freeAmt);
+        _applyFree(msg.sender, freeAmt);
+
+        /*─── HOP-1: tokenFrom → RESERVE (mirror of previous) ───*/
+        uint64 reserveGot = _routeTokenToReserve(
+            tokenFrom,
+            amountIn,
+            idsFrom,
+            feeN
+        );
+
+        /*─── HOP-2: RESERVE → tokenTo (mirror of first function) ───*/
+        amountOut = _routeReserveToToken(tokenTo, reserveGot, idsTo, feeN, to);
+
+        require(amountOut >= minOut, "slippage");
+    }
+
+    /*────────────────────── INTERNAL ROUTERS (shared) ───────────────────────*/
+
+    function _routeTokenToReserve(
+        address token,
+        uint64 amtIn,
+        uint64[] calldata orderIds,
+        uint64 feeN
+    ) private returns (uint64 reserveOut) {
+        uint64 remainIn = amtIn;
+        Pool storage p = pools[token];
+        require(p.reserveR > 0 && p.reserveT > 0, "empty A");
+        _updateCumulative(token, p);
+
+        uint256 spotRPT = (uint256(p.reserveR) * 1e18) / p.reserveT;
+
+        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
+            Order storage o = orders[token][orderIds[k]];
+            if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
+            uint256 orderRPT = (uint256(o.quantity) * 1e18) / o.reserve;
+            if (orderRPT <= spotRPT) break;
+
+            uint64 availRes = o.reserve - o.filled;
+            uint64 takeRes = availRes > remainIn ? remainIn : availRes;
+            uint64 giveTok = uint64(
+                (uint256(takeRes) * o.reserve) / o.quantity
+            );
+
+            _pull(IZRC20(token), msg.sender, giveTok);
+            _recordFill(token, orderIds[k], takeRes, giveTok);
+
+            remainIn -= takeRes;
+            reserveOut += takeRes;
+        }
+
+        if (remainIn > 0) {
+            uint64 poolOut = _outTtoR(remainIn, p.reserveR, p.reserveT, feeN);
+            _pull(IZRC20(token), msg.sender, remainIn);
+            p.reserveT += remainIn;
+            p.reserveR -= poolOut;
+            reserveOut += poolOut;
+            _maybeSnap(token, p);
+            emit Swap(msg.sender, token, false, remainIn, poolOut);
+        }
+    }
+
+    function _routeReserveToToken(
+        address token,
+        uint64 amtIn,
+        uint64[] calldata orderIds,
+        uint64 feeN,
+        address payTo
+    ) private returns (uint64 tokenOut) {
+        uint64 remainIn = amtIn;
+        Pool storage p = pools[token];
+        require(p.reserveR > 0 && p.reserveT > 0, "empty B");
+        _updateCumulative(token, p);
+
+        uint256 spotTPR = (uint256(p.reserveT) * 1e18) / p.reserveR;
+
+        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
+            Order storage o = orders[token][orderIds[k]];
+            if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve) continue;
+            uint256 orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
+            if (orderTPR <= spotTPR) break;
+
+            uint64 availTok = o.reserve - o.filled;
+            uint256 afford = (uint256(remainIn) * o.reserve) / o.quantity;
+            uint64 takeTok = afford >= availTok ? availTok : uint64(afford);
+            uint64 payRes = uint64((uint256(takeTok) * o.quantity) / o.reserve);
+
+            _pull(RESERVE, msg.sender, payRes);
+            _recordFill(token, orderIds[k], takeTok, payRes);
+
+            remainIn -= payRes;
+            tokenOut += takeTok;
+        }
+
+        if (remainIn > 0) {
+            uint64 poolOut = _outRtoT(remainIn, p.reserveR, p.reserveT, feeN);
+            _pull(RESERVE, msg.sender, remainIn);
+            p.reserveR += remainIn;
+            p.reserveT -= poolOut;
+            tokenOut += poolOut;
+            _maybeSnap(token, p);
+            emit Swap(msg.sender, token, true, remainIn, poolOut);
+        }
+
+        _push(IZRC20(token), payTo, tokenOut);
+        return tokenOut;
     }
 
     /*=====================================================================
@@ -607,12 +1157,7 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         Pool storage pA = pools[tokenFrom];
         require(pA.reserveR > 0 && pA.reserveT > 0, "empty A");
         _updateCumulative(tokenFrom, pA);
-        uint64 reserveGot = _outTtoR(
-            amountIn,
-            pA.reserveR,
-            pA.reserveT,
-            feeN
-        );
+        uint64 reserveGot = _outTtoR(amountIn, pA.reserveR, pA.reserveT, feeN);
         _pull(IZRC20(tokenFrom), walletFrom, amountIn);
         pA.reserveT += amountIn;
         pA.reserveR -= reserveGot;
@@ -745,5 +1290,4 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         uint64 dt = nowTs - older.ts;
         priceQ64 = uint128((curCum - older.priceCum) / dt);
     }
-
 }
