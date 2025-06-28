@@ -448,25 +448,35 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     function _solveDeltaRtoTPR(
         uint256 R,
         uint256 T,
-        uint64 feeN,
-        uint256 targetTPR, // 1e18-scaled
-        uint256 maxSpend // caller’s remaining reserve
+        uint64  feeN,
+        uint256 targetTPR,
+        uint256 maxSpend
     ) private pure returns (uint256 spend) {
-        uint256 lo = 1;
-        uint256 hi = maxSpend;
-        while (lo <= hi) {
-            uint256 mid = (lo + hi) >> 1; // binary-search
-            uint256 outT = _outRtoT256(mid, R, T, feeN);
-            uint256 Rn = R + mid;
-            uint256 Tn = T - outT;
-            uint256 newTPR = (Tn * 1e18) / Rn;
-            if (newTPR > targetTPR) {
-                lo = mid + 1; // need larger trade
-            } else {
-                spend = mid; // mid is feasible
-                hi = mid - 1;
-            }
-        }
+        // cast once – easier to read
+        int256 r  = int256(R);
+        int256 t  = int256(T);
+        int256 k  = int256(targetTPR);
+        int256 fn = int256(uint256(feeN));
+        int256 fd = int256(uint256(_FEE_DEN));
+
+        // Quadratic coefficients (may be negative, so signed)
+        int256 A = k * fn;                         // always ≥0
+        int256 B = k * r * (fn + fd);              // ≥0
+        int256 C = k * fd * r * r - fd * r * t;    // can be <0
+
+        // Discriminant D = B² - 4AC  (guaranteed ≥0 under invariants)
+        int256 D = B*B - 4*A*C;
+        require(D >= 0, "math err");
+
+        // Babylonian sqrt on uint
+        uint256 sqrtD = _sqrt(uint256(D));
+
+        // Positive root of the quadratic
+        int256 root = (-B + int256(sqrtD)) / (2*A);
+        if (root <= 0) return 0;                   // under-priced already
+
+        uint256 x = uint256(root);
+        spend = x <= maxSpend ? x : maxSpend;
     }
 
     /* deltaT such that pool RPT after a T→R swap
@@ -474,25 +484,32 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
     function _solveDeltaTtoRPT(
         uint256 R,
         uint256 T,
-        uint64 feeN,
-        uint256 targetRPT, // 1e18-scaled
-        uint256 maxSpend // caller’s remaining token
+        uint64  feeN,
+        uint256 targetRPT,   // 1e18-scaled RESERVE / TOKEN
+        uint256 maxSpend
     ) private pure returns (uint256 spend) {
-        uint256 lo = 1;
-        uint256 hi = maxSpend;
-        while (lo <= hi) {
-            uint256 mid = (lo + hi) >> 1;
-            uint256 outR = _outTtoR256(mid, R, T, feeN);
-            uint256 Rn = R - outR;
-            uint256 Tn = T + mid;
-            uint256 newRPT = (Rn * 1e18) / Tn;
-            if (newRPT < targetRPT) {
-                lo = mid + 1; // need larger trade
-            } else {
-                spend = mid;
-                hi = mid - 1;
-            }
-        }
+        // Casts
+        int256 r  = int256(R);
+        int256 t  = int256(T);
+        int256 k  = int256(targetRPT);
+        int256 fn = int256(uint256(feeN));
+        int256 fd = int256(uint256(_FEE_DEN));
+
+        // Coefficients for quadratic in spendT
+        // Derived from (R - outR)/(T + spend) == k  with outR formula
+        int256 A = k * fn;                         // ≥0
+        int256 B = k * t * (fn + fd);              // ≥0
+        int256 C = k * fd * t * t - fd * r * t;    // can be <0
+
+        int256 D = B*B - 4*A*C;
+        require(D >= 0, "math err");
+
+        uint256 sqrtD = _sqrt(uint256(D));
+        int256 root = (-B + int256(sqrtD)) / (2*A);
+        if (root <= 0) return 0;
+
+        uint256 x = uint256(root);
+        spend = x <= maxSpend ? x : maxSpend;
     }
 
     /*────────────────────────── ERRORS ─────────────────────────*/
