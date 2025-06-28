@@ -405,305 +405,408 @@ contract KRIEGSMARINE is ReentrancyGuard, IReserveDEX {
         );
     }
 
-    /*───────────────────────── HYBRID ORDER-POOL SWAPS ─────────────────────────
+    /*═══════════════════════════════════════════════════════════════════════════
+            BEST-EXECUTION HYBRID SWAPS  –  price-time priority, interleaved
+    Every marginal wei is routed to the cheaper venue *right now*; the loop
+    keeps re-evaluating after each micro-fill, so the pool and book can leap-
+    frog many times in one call.
 
-    – The taker supplies one side of the trade (`amountIn`) and gives an
-        **explicit price-sorted list** of limit-order IDs.  
-    – While there is remaining input, the routine **walks the list in order**,
-        filling each still-active order *iff* its fixed price beats the current
-        pool price.  
-    – As soon as the pool becomes cheaper (or the list is exhausted) the
-        remainder is executed directly against the AMM, in one shot.
-    – FREE is locked **once** up-front; the same feeNumerator is used for every
-        pool interaction inside the call, so no redundant `FREE.lock()` calls.
+    Helper notation
+        TPR = tokens-per-reserve  (more  = better for taker)
+        RPT = reserve-per-token   (less = better for taker)
+    ═══════════════════════════════════════════════════════════════════════════*/
 
-    Gas-wise this is aggressively pared down – no extra storage, no quadratic
-    complexity, and all maths stay inside 256-bit safe-ranges.
+    /*──────────────────────── INTERNAL PURE MATH HELPERS ─────────────────────*/
 
-    ───────────────────────────────────────────────────────────────────────────*/
+    function _outRtoT256(
+        uint256 A,                 // amtIn
+        uint256 R,                 // resIn  (reserveR)
+        uint256 T,                 // resOut (reserveT)
+        uint64  feeN
+    ) private pure returns (uint256) {
+        uint256 num = A * feeN * T;           // A*fee*T
+        uint256 den = (R * _FEE_DEN) + (A * feeN);
+        return num / den;                     // out ≥0
+    }
 
-    /// @notice swap RESERVE → `token`, using both limit orders (makers *sell*
-    ///         `token`) and the pool to achieve best execution.
-    /// @dev    `orderIds` must be sorted from *cheapest* to *worst* for the taker
-    ///         (i.e. descending tokenPerReserve). Already-filled / cancelled
-    ///         orders are silently skipped.
+    function _outTtoR256(
+        uint256 A,                 // amtIn (token)
+        uint256 R,                 // resR
+        uint256 T,                 // resT
+        uint64  feeN
+    ) private pure returns (uint256) {
+        uint256 gross = (A * R) / (T + A);    // before fee
+        return (gross * feeN) / _FEE_DEN;
+    }
+
+    /* deltaR such that pool TPR after an R→T swap
+    drops *just to* targetTPR (or as close as possible ≤ maxSpend)          */
+    function _solveDeltaRtoTPR(
+        uint256 R,
+        uint256 T,
+        uint64  feeN,
+        uint256 targetTPR,          // 1e18-scaled
+        uint256 maxSpend            // caller’s remaining reserve
+    ) private pure returns (uint256 spend) {
+        uint256 lo = 1;
+        uint256 hi = maxSpend;
+        while (lo <= hi) {
+            uint256 mid = (lo + hi) >> 1;     // binary-search
+            uint256 outT = _outRtoT256(mid, R, T, feeN);
+            uint256 Rn  = R + mid;
+            uint256 Tn  = T - outT;
+            uint256 newTPR = (Tn * 1e18) / Rn;
+            if (newTPR > targetTPR) {
+                lo = mid + 1;                 // need larger trade
+            } else {
+                spend = mid;                  // mid is feasible
+                hi = mid - 1;
+            }
+        }
+    }
+
+    /* deltaT such that pool RPT after a T→R swap
+    rises *just to* targetRPT (or as close as possible ≤ maxSpend)          */
+    function _solveDeltaTtoRPT(
+        uint256 R,
+        uint256 T,
+        uint64  feeN,
+        uint256 targetRPT,          // 1e18-scaled
+        uint256 maxSpend            // caller’s remaining token
+    ) private pure returns (uint256 spend) {
+        uint256 lo = 1;
+        uint256 hi = maxSpend;
+        while (lo <= hi) {
+            uint256 mid = (lo + hi) >> 1;
+            uint256 outR = _outTtoR256(mid, R, T, feeN);
+            uint256 Rn  = R - outR;
+            uint256 Tn  = T + mid;
+            uint256 newRPT = (Rn * 1e18) / Tn;
+            if (newRPT < targetRPT) {
+                lo = mid + 1;                 // need larger trade
+            } else {
+                spend = mid;
+                hi = mid - 1;
+            }
+        }
+    }
+
+    /*─────────────────── RESERVE → TOKEN  (interleaved) ──────────────────────*/
     function swapReserveForTokenWithOrders(
         address token,
-        uint64 amountIn,
-        uint64 minOut,
+        uint64  amountIn,
+        uint64  minOut,
         address to,
-        uint64 freeAmt,
-        uint64[] calldata orderIds
-    ) external nonReentrant returns (uint64 amountOut) {
+        uint64  freeAmt,
+        uint64[] calldata ids
+    ) external nonReentrant returns (uint64 outT) {
+
         require(
-            token != address(0) &&
-                token != address(RESERVE) &&
-                amountIn > 0 &&
-                to != address(0),
-            "bad args"
+            token != address(0) && token != address(RESERVE) &&
+            amountIn > 0       && to != address(0),
+            "args"
         );
 
-        /*─── upfront fee-calc & FREE lock (only once) ───*/
         uint64 feeN = _feeNum(freeAmt);
         _applyFree(msg.sender, freeAmt);
 
-        uint64 remainIn = amountIn;
-        Pool storage p = pools[token];
-        require(p.reserveR > 0 && p.reserveT > 0, "empty pool");
-        _updateCumulative(token, p);
+        uint256 R = pools[token].reserveR;
+        uint256 T = pools[token].reserveT;
+        require(R > 0 && T > 0, "empty");
+        _updateCumulative(token, pools[token]);
 
-        /* current spot (token / reserve) in 1e18 fixed-point for cheap compare */
-        uint256 spotTPR = (uint256(p.reserveT) * 1e18) / p.reserveR;
+        uint64 remainR = amountIn;
+        uint256 ptr;                                     // index into ids[]
 
-        /*─── FIRST LEG: walk the order-book list ───*/
-        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
-            Order storage o = orders[token][orderIds[k]];
-            if (
-                o.reserve == 0 || // non-existent / cancelled
-                o.isBuy || // wrong side
-                o.filled >= o.reserve // fully filled
-            ) continue;
+        while (remainR > 0) {
+            /* seek next valid maker (selling token, i.e. isBuy == false) */
+            uint256 orderTPR;                              // 1e18-scaled
+            for (; ptr < ids.length; ++ptr) {
+                Order storage o = orders[token][ids[ptr]];
+                if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve) continue;
+                orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
+                break;
+            }
+            bool haveOrder = ptr < ids.length;
 
-            /* price check: order tokenPerReserve > current pool tokenPerReserve? */
-            uint256 orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
-            if (orderTPR <= spotTPR) break; // pool now cheaper ⇒ stop walking
+            uint256 poolTPR = (T * 1e18) / R;
 
-            uint64 availTok = o.reserve - o.filled;
+            if (!haveOrder || poolTPR >= orderTPR) {
+                /* pool is better – trade *just enough* to flip advantage */
+                uint256 spend = haveOrder
+                    ? _solveDeltaRtoTPR(R, T, feeN, orderTPR, remainR)
+                    : remainR;
+                if (spend == 0) {                         // cannot reach parity
+                    spend = remainR;
+                }
+                uint256 tokenOut = _outRtoT256(spend, R, T, feeN);
+                _pull(RESERVE, msg.sender, uint64(spend));
+                R += spend;
+                T -= tokenOut;
+                remainR -= uint64(spend);
+                outT   += uint64(tokenOut);
+                emit Swap(msg.sender, token, true, uint64(spend), uint64(tokenOut));
+            } else {
+                /* order is better */
+                Order storage o = orders[token][ids[ptr]];
+                uint64 availTok = o.reserve - o.filled;          // token escrow left
+                uint256 affordableTok = (uint256(remainR) * o.reserve) / o.quantity;
+                uint64 takeTok = affordableTok >= availTok ? availTok : uint64(affordableTok);
+                if (takeTok == 0) break;                         // nothing affordable
 
-            /* max token we can afford with remainIn at order’s fixed price */
-            uint256 affordTok = (uint256(remainIn) * o.reserve) / o.quantity;
-            uint64 takeTok = affordTok >= availTok
-                ? availTok
-                : uint64(affordTok);
-            if (takeTok == 0) break; // can’t afford even 1 token – go pool
+                uint64 payRes = uint64((uint256(takeTok) * o.quantity) / o.reserve);
+                _pull(RESERVE, msg.sender, payRes);
+                _recordFill(token, ids[ptr], takeTok, payRes);
 
-            /* proportional reserve we owe to maker for the partial fill */
-            uint64 payRes = uint64((uint256(takeTok) * o.quantity) / o.reserve);
-
-            /* pull taker reserve into contract and record the fill */
-            _pull(RESERVE, msg.sender, payRes);
-            _recordFill(token, orderIds[k], takeTok, payRes);
-
-            remainIn -= payRes;
-            amountOut += takeTok;
+                remainR -= payRes;
+                outT    += takeTok;
+            }
         }
 
-        /*─── SECOND LEG: whatever is left hits the AMM pool directly ───*/
-        if (remainIn > 0) {
-            uint64 outPool = _outRtoT(remainIn, p.reserveR, p.reserveT, feeN);
-            _pull(RESERVE, msg.sender, remainIn);
-            p.reserveR += remainIn;
-            p.reserveT -= outPool;
-            amountOut += outPool;
+        require(outT >= minOut, "slippage");
+
+        /* commit new pool reserves */
+        {
+            Pool storage p = pools[token];
+            p.reserveR = uint64(R);
+            p.reserveT = uint64(T);
             _maybeSnap(token, p);
-            emit Swap(msg.sender, token, true, remainIn, outPool);
         }
 
-        require(amountOut >= minOut, "slippage");
-        _push(IZRC20(token), to, amountOut);
+        _push(IZRC20(token), to, outT);
     }
 
-    /*───────────────────────────────────────────────────────────────────────────*/
-
-    /// @notice swap `token` → RESERVE using orders (makers *buy* `token`)
-    ///         plus the pool. The logic is the exact mirror of the above.
+    /*─────────────────── TOKEN → RESERVE (interleaved) ───────────────────────*/
     function swapTokenForReserveWithOrders(
         address token,
-        uint64 amountIn,
-        uint64 minOut,
+        uint64  amountIn,
+        uint64  minOut,
         address to,
-        uint64 freeAmt,
-        uint64[] calldata orderIds
-    ) external nonReentrant returns (uint64 amountOut) {
+        uint64  freeAmt,
+        uint64[] calldata ids
+    ) external nonReentrant returns (uint64 outR) {
+
         require(
-            token != address(0) &&
-                token != address(RESERVE) &&
-                amountIn > 0 &&
-                to != address(0),
-            "bad args"
+            token != address(0) && token != address(RESERVE) &&
+            amountIn > 0       && to != address(0),
+            "args"
         );
 
         uint64 feeN = _feeNum(freeAmt);
         _applyFree(msg.sender, freeAmt);
 
-        uint64 remainIn = amountIn;
-        Pool storage p = pools[token];
-        require(p.reserveR > 0 && p.reserveT > 0, "empty pool");
-        _updateCumulative(token, p);
+        uint256 R = pools[token].reserveR;
+        uint256 T = pools[token].reserveT;
+        require(R > 0 && T > 0, "empty");
+        _updateCumulative(token, pools[token]);
 
-        uint256 spotRPT = (uint256(p.reserveR) * 1e18) / p.reserveT; // reserve per token
+        uint64 remainT = amountIn;
+        uint256 ptr;
 
-        /* FIRST: makers buying token (isBuy == true) */
-        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
-            Order storage o = orders[token][orderIds[k]];
-            if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
+        while (remainT > 0) {
+            /* next valid maker (buying token, isBuy == true) */
+            uint256 orderRPT;
+            for (; ptr < ids.length; ++ptr) {
+                Order storage o = orders[token][ids[ptr]];
+                if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
+                orderRPT = (uint256(o.quantity) * 1e18) / o.reserve; // reserve per token
+                break;
+            }
+            bool haveOrder = ptr < ids.length;
 
-            uint256 orderRPT = (uint256(o.quantity) * 1e18) / o.reserve;
-            if (orderRPT <= spotRPT) break; // AMM now pays better ⇒ stop
+            uint256 poolRPT = (R * 1e18) / T;                       // reserve per token
 
-            uint64 availRes = o.reserve - o.filled; // maker’s RESERVE escrow
-            uint64 takeRes = availRes > remainIn ? remainIn : availRes;
-            uint64 takeTok = uint64(
-                (uint256(takeRes) * o.reserve) / o.quantity
-            );
+            if (!haveOrder || poolRPT <= orderRPT) {
+                /* pool pays better – token→reserve until parity or exhaust */
+                uint256 spend = haveOrder
+                    ? _solveDeltaTtoRPT(R, T, feeN, orderRPT, remainT)
+                    : remainT;
+                if (spend == 0) spend = remainT;
 
-            _pull(IZRC20(token), msg.sender, takeTok); // give token to maker
-            _recordFill(token, orderIds[k], takeRes, takeTok);
+                uint256 reserveOut = _outTtoR256(spend, R, T, feeN);
+                _pull(IZRC20(token), msg.sender, uint64(spend));
+                R -= reserveOut;
+                T += spend;
+                remainT -= uint64(spend);
+                outR   += uint64(reserveOut);
+                emit Swap(msg.sender, token, false, uint64(spend), uint64(reserveOut));
+            } else {
+                /* order better */
+                Order storage o = orders[token][ids[ptr]];
+                uint64 availRes = o.reserve - o.filled;
+                uint64 takeRes  = availRes > remainT ? remainT : availRes;
+                uint64 giveTok  = uint64((uint256(takeRes) * o.reserve) / o.quantity);
 
-            remainIn -= takeRes;
-            amountOut += takeRes;
+                _pull(IZRC20(token), msg.sender, giveTok);
+                _recordFill(token, ids[ptr], takeRes, giveTok);
+
+                remainT -= takeRes;
+                outR    += takeRes;
+            }
         }
 
-        /* SECOND: dump the rest into the pool */
-        if (remainIn > 0) {
-            uint64 outPool = _outTtoR(remainIn, p.reserveR, p.reserveT, feeN);
-            _pull(IZRC20(token), msg.sender, remainIn);
-            p.reserveT += remainIn;
-            p.reserveR -= outPool;
-            amountOut += outPool;
+        require(outR >= minOut, "slippage");
+
+        /* commit pool */
+        {
+            Pool storage p = pools[token];
+            p.reserveR = uint64(R);
+            p.reserveT = uint64(T);
             _maybeSnap(token, p);
-            emit Swap(msg.sender, token, false, remainIn, outPool);
         }
 
-        require(amountOut >= minOut, "slippage");
-        _push(RESERVE, to, amountOut);
+        _push(RESERVE, to, outR);
     }
 
-    /*───────────────────────────────────────────────────────────────────────────*/
-
-    /// @notice Two-hop TOKEN-for-TOKEN best-execution route.
-    /// @dev    You pass two distinct order-lists:
-    ///         – `idsFrom`  ↦ makers *buying* `tokenFrom`
-    ///         – `idsTo`    ↦ makers *selling* `tokenTo`
-    ///         Each must be cheapest-to-worst for the taker.
-    ///         FREE is locked exactly once, fee rebate shared across both hops.
+    /*──────────────── TOKEN ↔ TOKEN  (two interleaved hops) ────────────────*/
     function swapTokenForTokenWithOrders(
         address tokenFrom,
         address tokenTo,
-        uint64 amountIn,
-        uint64 minOut,
+        uint64  amountIn,
+        uint64  minOut,
         address to,
-        uint64 freeAmt,
-        uint64[] calldata idsFrom,
-        uint64[] calldata idsTo
-    ) external nonReentrant returns (uint64 amountOut) {
+        uint64  freeAmt,
+        uint64[] calldata idsFrom,      // makers *buying* tokenFrom
+        uint64[] calldata idsTo        // makers *selling* tokenTo
+    ) external nonReentrant returns (uint64 outT) {
+
         require(
-            tokenFrom != address(0) &&
-                tokenTo != address(0) &&
-                tokenFrom != tokenTo &&
-                tokenFrom != address(RESERVE) &&
-                tokenTo != address(RESERVE) &&
-                amountIn > 0 &&
-                to != address(0),
-            "bad args"
+            tokenFrom != address(0) && tokenTo != address(0) &&
+            tokenFrom != tokenTo    &&
+            tokenFrom != address(RESERVE) && tokenTo != address(RESERVE) &&
+            amountIn > 0            && to != address(0),
+            "args"
         );
 
         uint64 feeN = _feeNum(freeAmt);
         _applyFree(msg.sender, freeAmt);
 
-        /*─── HOP-1: tokenFrom → RESERVE (mirror of previous) ───*/
-        uint64 reserveGot = _routeTokenToReserve(
-            tokenFrom,
-            amountIn,
-            idsFrom,
-            feeN
-        );
+        /* ── hop-1: tokenFrom → RESERVE (best execution) ── */
+        _pull(IZRC20(tokenFrom), msg.sender, amountIn);
+        uint64 gotR = _execTtoR_best(tokenFrom, amountIn, feeN, idsFrom);
 
-        /*─── HOP-2: RESERVE → tokenTo (mirror of first function) ───*/
-        amountOut = _routeReserveToToken(tokenTo, reserveGot, idsTo, feeN, to);
+        /* ── hop-2: RESERVE → tokenTo (best execution) ── */
+        uint64 gotTok = _execRtoT_best(tokenTo, gotR, feeN, idsTo, to);
 
-        require(amountOut >= minOut, "slippage");
+        require(gotTok >= minOut, "slippage");
+        outT = gotTok;
     }
 
-    /*────────────────────── INTERNAL ROUTERS (shared) ───────────────────────*/
+    /*───────────────── internal best-exec legs for hop trades ───────────────*/
 
-    function _routeTokenToReserve(
+    function _execTtoR_best(
         address token,
-        uint64 amtIn,
-        uint64[] calldata orderIds,
-        uint64 feeN
-    ) private returns (uint64 reserveOut) {
-        uint64 remainIn = amtIn;
+        uint64  amtIn,
+        uint64  feeN,
+        uint64[] calldata ids
+    ) private returns (uint64 outR) {
+
+        uint256 R = pools[token].reserveR;
+        uint256 T = pools[token].reserveT;
+        require(R > 0 && T > 0, "empty");
+        _updateCumulative(token, pools[token]);
+
+        uint64 remainT = amtIn;
+        uint256 ptr;
+
+        while (remainT > 0) {
+            uint256 orderRPT;
+            for (; ptr < ids.length; ++ptr) {
+                Order storage o = orders[token][ids[ptr]];
+                if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
+                orderRPT = (uint256(o.quantity) * 1e18) / o.reserve;
+                break;
+            }
+            bool have = ptr < ids.length;
+            uint256 poolRPT = (R * 1e18) / T;
+
+            if (!have || poolRPT <= orderRPT) {
+                uint256 spend = have
+                    ? _solveDeltaTtoRPT(R, T, feeN, orderRPT, remainT)
+                    : remainT;
+                if (spend == 0) spend = remainT;
+                uint256 out = _outTtoR256(spend, R, T, feeN);
+                R -= out;
+                T += spend;
+                remainT -= uint64(spend);
+                outR   += uint64(out);
+                emit Swap(msg.sender, token, false, uint64(spend), uint64(out));
+            } else {
+                Order storage o = orders[token][ids[ptr]];
+                uint64 availRes = o.reserve - o.filled;
+                uint64 takeRes  = availRes > remainT ? remainT : availRes;
+                uint64 giveTok  = uint64((uint256(takeRes) * o.reserve) / o.quantity);
+                _recordFill(token, ids[ptr], takeRes, giveTok);
+                remainT -= takeRes;
+                outR    += takeRes;
+            }
+        }
+
         Pool storage p = pools[token];
-        require(p.reserveR > 0 && p.reserveT > 0, "empty A");
-        _updateCumulative(token, p);
+        p.reserveR = uint64(R);
+        p.reserveT = uint64(T);
+        _maybeSnap(token, p);
 
-        uint256 spotRPT = (uint256(p.reserveR) * 1e18) / p.reserveT;
-
-        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
-            Order storage o = orders[token][orderIds[k]];
-            if (o.reserve == 0 || !o.isBuy || o.filled >= o.reserve) continue;
-            uint256 orderRPT = (uint256(o.quantity) * 1e18) / o.reserve;
-            if (orderRPT <= spotRPT) break;
-
-            uint64 availRes = o.reserve - o.filled;
-            uint64 takeRes = availRes > remainIn ? remainIn : availRes;
-            uint64 giveTok = uint64(
-                (uint256(takeRes) * o.reserve) / o.quantity
-            );
-
-            _pull(IZRC20(token), msg.sender, giveTok);
-            _recordFill(token, orderIds[k], takeRes, giveTok);
-
-            remainIn -= takeRes;
-            reserveOut += takeRes;
-        }
-
-        if (remainIn > 0) {
-            uint64 poolOut = _outTtoR(remainIn, p.reserveR, p.reserveT, feeN);
-            _pull(IZRC20(token), msg.sender, remainIn);
-            p.reserveT += remainIn;
-            p.reserveR -= poolOut;
-            reserveOut += poolOut;
-            _maybeSnap(token, p);
-            emit Swap(msg.sender, token, false, remainIn, poolOut);
-        }
+        return outR;
     }
 
-    function _routeReserveToToken(
+    function _execRtoT_best(
         address token,
-        uint64 amtIn,
-        uint64[] calldata orderIds,
-        uint64 feeN,
+        uint64  amtIn,
+        uint64  feeN,
+        uint64[] calldata ids,
         address payTo
-    ) private returns (uint64 tokenOut) {
-        uint64 remainIn = amtIn;
+    ) private returns (uint64 outT) {
+
+        uint256 R = pools[token].reserveR;
+        uint256 T = pools[token].reserveT;
+        require(R > 0 && T > 0, "empty");
+        _updateCumulative(token, pools[token]);
+
+        uint64 remainR = amtIn;
+        uint256 ptr;
+
+        while (remainR > 0) {
+            uint256 orderTPR;
+            for (; ptr < ids.length; ++ptr) {
+                Order storage o = orders[token][ids[ptr]];
+                if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve) continue;
+                orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
+                break;
+            }
+            bool have = ptr < ids.length;
+            uint256 poolTPR = (T * 1e18) / R;
+
+            if (!have || poolTPR >= orderTPR) {
+                uint256 spend = have
+                    ? _solveDeltaRtoTPR(R, T, feeN, orderTPR, remainR)
+                    : remainR;
+                if (spend == 0) spend = remainR;
+                uint256 tokOut = _outRtoT256(spend, R, T, feeN);
+                R += spend;
+                T -= tokOut;
+                remainR -= uint64(spend);
+                outT   += uint64(tokOut);
+                emit Swap(msg.sender, token, true, uint64(spend), uint64(tokOut));
+            } else {
+                Order storage o = orders[token][ids[ptr]];
+                uint64 availTok = o.reserve - o.filled;
+                uint256 affordableTok = (uint256(remainR) * o.reserve) / o.quantity;
+                uint64 takeTok = affordableTok >= availTok ? availTok : uint64(affordableTok);
+                uint64 payRes  = uint64((uint256(takeTok) * o.quantity) / o.reserve);
+                _recordFill(token, ids[ptr], takeTok, payRes);
+                remainR -= payRes;
+                outT    += takeTok;
+            }
+        }
+
         Pool storage p = pools[token];
-        require(p.reserveR > 0 && p.reserveT > 0, "empty B");
-        _updateCumulative(token, p);
+        p.reserveR = uint64(R);
+        p.reserveT = uint64(T);
+        _maybeSnap(token, p);
 
-        uint256 spotTPR = (uint256(p.reserveT) * 1e18) / p.reserveR;
-
-        for (uint256 k; k < orderIds.length && remainIn > 0; ++k) {
-            Order storage o = orders[token][orderIds[k]];
-            if (o.reserve == 0 || o.isBuy || o.filled >= o.reserve) continue;
-            uint256 orderTPR = (uint256(o.reserve) * 1e18) / o.quantity;
-            if (orderTPR <= spotTPR) break;
-
-            uint64 availTok = o.reserve - o.filled;
-            uint256 afford = (uint256(remainIn) * o.reserve) / o.quantity;
-            uint64 takeTok = afford >= availTok ? availTok : uint64(afford);
-            uint64 payRes = uint64((uint256(takeTok) * o.quantity) / o.reserve);
-
-            _pull(RESERVE, msg.sender, payRes);
-            _recordFill(token, orderIds[k], takeTok, payRes);
-
-            remainIn -= payRes;
-            tokenOut += takeTok;
-        }
-
-        if (remainIn > 0) {
-            uint64 poolOut = _outRtoT(remainIn, p.reserveR, p.reserveT, feeN);
-            _pull(RESERVE, msg.sender, remainIn);
-            p.reserveR += remainIn;
-            p.reserveT -= poolOut;
-            tokenOut += poolOut;
-            _maybeSnap(token, p);
-            emit Swap(msg.sender, token, true, remainIn, poolOut);
-        }
-
-        _push(IZRC20(token), payTo, tokenOut);
-        return tokenOut;
+        _push(IZRC20(token), payTo, outT);
+        return outT;
     }
 
     /*=====================================================================
