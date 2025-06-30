@@ -5,15 +5,15 @@ pragma solidity ^0.8.24;
 │ SplitOptimalNoFee64 – *gas-lean* analytic splitter for one 256-tick CLMM   │
 │ window plus one fee-free V2 CPMM that start at the same spot price.        │
 │                                                                           │
-│ •  Keeps the exact closed-form maths but removes every expendable mulDiv. │
-│ •  Shifts replace all /·2⁹⁶ and ·2⁹⁶/ ops; custom errors drop revert text.│
-│ •  ~1.3 k-gas cheaper than the reference implementation on main-path.     │
+│ • Keeps the exact closed-form maths but removes every expendable mulDiv.  │
+│ • Shifts replace all /·2⁹⁶ and ·2⁹⁶/ ops; custom errors drop revert text. │
 *───────────────────────────────────────────────────────────────────────────*/
 library SplitOptimalNoFee64 {
     /*──────────────  Custom errors  ─────────────*/
-    error EmptyPool();          // zero L or reserves
-    error LimitTooHigh();       // √Plim ≥ √P0 for 0→1, or ≤ for 1→0
+    error EmptyPool();           // zero L or reserves
+    error LimitTooHigh();        // √Plim ≥ √P0 for 0→1, or ≤ for 1→0
     error Uint64Overflow();
+    error ZeroDenominator();     // added: mulDiv denominator collapsed to 0
 
     /*──────────────  Public types  ─────────────*/
     struct Split {
@@ -86,6 +86,7 @@ library SplitOptimalNoFee64 {
 
                 // CLMM leg
                 uint256 denom = (sqrtP0 * sqrtStar) >> 96;     // √P₀√P★ / 2⁹⁶
+                if (denom == 0) revert ZeroDenominator();      // <<==== FIX #2
                 dxV3 = mulDiv(L, sqrtP0 - sqrtStar, denom);
             } else {
                 // ratio_Q96 = √P★ / √P₀
@@ -95,7 +96,7 @@ library SplitOptimalNoFee64 {
                 dxV2 = (uint256(R1) * (ratio_Q96 - Q96)) >> 96;
 
                 // CLMM leg
-                dxV3 = mulDiv(L, sqrtStar - sqrtP0, Q96);
+                dxV3 = mulDiv(L, sqrtStar - sqrtP0, Q96);      // denom = 2⁹⁶ (never 0)
             }
 
             /*────────── Clip 1-wei rounding overrun ──────────*/
@@ -110,6 +111,9 @@ library SplitOptimalNoFee64 {
                 }
             }
 
+            /*────────── Individual uint64 safety check ───────*/      // <<==== FIX #3
+            if (dxV2 > type(uint64).max || dxV3 > type(uint64).max) revert Uint64Overflow();
+
             /*──────────────  Populate struct  ───────────────*/
             S.inV3  = _cast64(dxV3);
             S.inV2  = _cast64(dxV2);
@@ -120,7 +124,7 @@ library SplitOptimalNoFee64 {
 
     /*══════════════════ Helpers  ══════════════════*/
 
-    /// @dev 512-bit mul-div, unchanged (≈260 gas)
+    /// @dev 512-bit mul-div, unchanged
     function mulDiv(
         uint256 a,
         uint256 b,
