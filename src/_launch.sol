@@ -77,6 +77,8 @@ contract RocketLauncher is ReentrancyGuard {
         bool launched; // true once LP minted
         uint128 remainingShares; // LP tokens still held by contract
         uint128 maximumShares; // total LP minted at launch
+        uint64 leftARemaining;
+        uint64 leftBRemaining;
     }
 
     struct RocketEntry {
@@ -100,16 +102,16 @@ contract RocketLauncher is ReentrancyGuard {
         address controller,
         IZRC20 input,
         IZRC20 output,
-        IDEX   exchange,
-        uint64 outputAmount,   // requested, not yet trusted
+        IDEX exchange,
+        uint64 outputAmount, // requested, not yet trusted
         uint64 launchTime,
         uint64 flightTime
     ) external nonReentrant returns (uint64 rocketId) {
         // ────── basic sanity checks ──────
-        require(address(input)  != address(0), "input=0");
+        require(address(input) != address(0), "input=0");
         require(address(output) != address(0), "output=0");
-        require(outputAmount    > 0,           "output=0");
-        require(launchTime      > block.timestamp, "launch<now");
+        require(outputAmount > 0, "output=0");
+        require(launchTime > block.timestamp, "launch<now");
 
         // ────── pull creator funds & measure actual receipt ──────
         uint256 balBefore = output.balanceOf(address(this));
@@ -117,8 +119,8 @@ contract RocketLauncher is ReentrancyGuard {
             output.transferFrom(msg.sender, address(this), outputAmount),
             "output xfer fail"
         );
-        uint256 balAfter      = output.balanceOf(address(this));
-        uint64  received      = _toUint64(balAfter - balBefore);
+        uint256 balAfter = output.balanceOf(address(this));
+        uint64 received = _toUint64(balAfter - balBefore);
         require(received > 0, "deflationary burn");
 
         // ────── persist rocket (uses *received* not requested) ──────
@@ -126,16 +128,18 @@ contract RocketLauncher is ReentrancyGuard {
         rockets.push(
             Rocket({
                 controller: controller,
-                input:      input,
-                output:     output,
-                exchange:   exchange,
+                input: input,
+                output: output,
+                exchange: exchange,
                 outputAmount: received,
-                inputAmount:   0,
-                launchTime:    launchTime,
-                flightTime:    flightTime,
-                launched:      false,
+                inputAmount: 0,
+                launchTime: launchTime,
+                flightTime: flightTime,
+                launched: false,
                 remainingShares: 0,
-                maximumShares:   0
+                maximumShares: 0,
+                leftARemaining: 0,
+                leftBRemaining: 0
             })
         );
 
@@ -157,7 +161,7 @@ contract RocketLauncher is ReentrancyGuard {
      */
     function embarkRocket(
         uint64 rocketId,
-        uint64 inputAmount   // requested, not yet trusted
+        uint64 inputAmount // requested, not yet trusted
     ) external nonReentrant returns (uint64 entryId) {
         // ────── basic guards ──────
         require(inputAmount > 0, "amount=0");
@@ -171,8 +175,8 @@ contract RocketLauncher is ReentrancyGuard {
             R.input.transferFrom(msg.sender, address(this), inputAmount),
             "input xfer fail"
         );
-        uint256 balAfter   = R.input.balanceOf(address(this));
-        uint64  received   = _toUint64(balAfter - balBefore);   // handles burns
+        uint256 balAfter = R.input.balanceOf(address(this));
+        uint64 received = _toUint64(balAfter - balBefore); // handles burns
         require(received > 0, "deflationary burn");
 
         // ────── update cumulative input with overflow protection ──────
@@ -185,8 +189,8 @@ contract RocketLauncher is ReentrancyGuard {
         rocketEntries[rocketId].push(
             RocketEntry({
                 participant: msg.sender,
-                amount:      received,
-                claimed:     false
+                amount: received,
+                claimed: false
             })
         );
 
@@ -222,11 +226,14 @@ contract RocketLauncher is ReentrancyGuard {
 
         /*── controller grace window ─*/
         if (R.controller != address(0) && msg.sender != R.controller) {
-            require(block.timestamp >= R.launchTime + 1 days, "controller grace");
+            require(
+                block.timestamp >= R.launchTime + 1 days,
+                "controller grace"
+            );
         }
 
         /*── single reset-then-set allowances ─*/
-        _safeApprove(R.input,  address(R.exchange), R.inputAmount);
+        _safeApprove(R.input, address(R.exchange), R.inputAmount);
         _safeApprove(R.output, address(R.exchange), R.outputAmount);
 
         /*── mint LP (AMM returns *actual* consumed amounts) ─*/
@@ -237,113 +244,113 @@ contract RocketLauncher is ReentrancyGuard {
             R.outputAmount
         );
 
-        // Accept ≤ supplied; anything else is a true slip.
+        // Expect the exchange liquidity to be empty before our addition.
         require(aIn <= R.inputAmount && bIn <= R.outputAmount, "slip");
 
         /*── immediately zero allowances (one SSTORE each) ─*/
         // Direct approve is cheaper than calling _safeApprove again.
-        require(R.input.approve(address(R.exchange),  0), "clr A");
+        require(R.input.approve(address(R.exchange), 0), "clr A");
         require(R.output.approve(address(R.exchange), 0), "clr B");
 
-        /*── roll forward any leftovers ─*/
-        uint64 leftA = R.inputAmount  - aIn;
+        uint64 leftA = R.inputAmount - aIn;
         uint64 leftB = R.outputAmount - bIn;
-        R.inputAmount  = aIn; // only the part now backing LP counts
-        R.outputAmount = bIn;
 
         /*── finalise state ─*/
-        R.launched        = true;
-        R.maximumShares   = shares;
+        R.launched = true;
+        R.maximumShares = shares;
         R.remainingShares = shares;
-
-        // Leftovers stay in the contract and are swept later.
-        if (leftA > 0 || leftB > 0) {
-            // nothing to do now – `sweepDust` will handle it.
-        }
+        R.leftARemaining = leftA;
+        R.leftBRemaining = leftB;
     }
 
     /*════════════════════   P O S T-F L I G H T   C L A I M   ═════════════*/
+
     /**
-     * @notice Redeem LP shares, withdraw underlying amounts, and send to caller.
-     * @dev    One call per entry.  Uses CEI pattern to block re-entrancy.
+     * @notice Claim a participant’s pro-rata share of LP tokens plus any
+     *         un-pooled leftovers from launch.
+     *
+     * @dev **Fair-order invariant.**
+     *      The function now subtracts the caller’s `amount` from
+     *      `R.inputAmount` immediately after computing the leftover slice,
+     *      making the denominator shrink for *every* claim (starved or not).
+     *      This guarantees that leftover distribution is independent of
+     *      claim order.
+     *
+     * Assumptions
+     * ───────────
+     * • All IZRC20 balances fit in 64 bits (token-universe invariant).
+     * • External AMM (`IDEX`) obeys its documented invariants:
+     *   `removeLiquidity()` returns the underlying A and B amounts that back
+     *   exactly `shares` LP tokens or reverts.
+     * • The function runs under the `nonReentrant` modifier, so CEI ordering
+     *   protects against re-entrancy through external calls.
      */
     function claimLiquidity(
         uint64 rocketId,
         uint64 entryId
     ) external nonReentrant {
-        /*── standard guards ─*/
-        require(rocketId < rockets.length, "rocket OOB");
+        /*──── 0. Boilerplate guards ───────────────────────────────────────*/
+        require(rocketId < rockets.length, "rocket OOB"); // valid rocket
         Rocket storage R = rockets[rocketId];
-        require(R.launched, "not launched");
-        require(block.timestamp >= R.launchTime + R.flightTime, "locked");
-        require(entryId < rocketEntries[rocketId].length, "entry OOB");
+        require(R.launched, "not launched"); // must be live
+        require(block.timestamp >= R.launchTime + R.flightTime, "locked"); // lock over
+        require(entryId < rocketEntries[rocketId].length, "entry OOB"); // valid entry
         RocketEntry storage E = rocketEntries[rocketId][entryId];
-        require(E.participant == msg.sender, "not owner");
-        require(!E.claimed, "claimed");
+        require(E.participant == msg.sender, "not owner"); // caller ownership
+        require(!E.claimed, "claimed"); // single-use
 
-        /*── share calculation ─*/
-        uint256 shares256 = (uint256(E.amount) * uint256(R.maximumShares))
-                        / uint256(R.inputAmount);
-        uint128 shares = uint128(shares256);
-        if (shares > R.remainingShares) shares = R.remainingShares;
+        /*──── 1. LP-share calculation (256-bit intermediate) ─────────────*/
+        uint256 shares256 = (uint256(E.amount) * uint256(R.maximumShares)) /
+            uint256(R.inputAmount);
+        uint128 shares = uint128(shares256); // safe down-cast
+        if (shares > R.remainingShares) shares = R.remainingShares; // rounding clamp
 
-        /*── starved? full refund & denominator shrink ─*/
+        /*──── 2. Starved deposit branch – zero shares, full refund ───────*/
         if (shares == 0) {
-            E.claimed = true;
-            R.inputAmount -= E.amount;              // keep maths exact
-            require(R.input.transfer(msg.sender, E.amount), "refund");
+            E.claimed = true; // mark consumed
+            R.inputAmount -= E.amount; // shrink divisor
+            require(R.input.transfer(msg.sender, E.amount), "refund"); // give back A
             emit RocketClaimed(rocketId, entryId, msg.sender, 0, E.amount, 0);
-            return;
+            return; // done
         }
 
-        /*── state changes BEFORE external calls ─*/
-        E.claimed          = true;
-        R.remainingShares -= shares;
+        /*──── 3. Leftover slice (order-independent) ──────────────────────*/
+        // Calculate owedA/owedB BEFORE shrinking R.inputAmount.
+        uint64 owedA = 0;
+        uint64 owedB = 0;
+        if (R.leftARemaining > 0) {
+            owedA = _toUint64(
+                (uint256(R.leftARemaining) * uint256(E.amount)) /
+                    uint256(R.inputAmount)
+            );
+            R.leftARemaining -= owedA; // burn slice from pool
+        }
+        if (R.leftBRemaining > 0) {
+            owedB = _toUint64(
+                (uint256(R.leftBRemaining) * uint256(E.amount)) /
+                    uint256(R.inputAmount)
+            );
+            R.leftBRemaining -= owedB;
+        }
 
-        /*── burn LP & send proceeds ─*/
+        /*──── 4. State updates (CEI – all before external calls) ─────────*/
+        E.claimed = true; // finalise entry
+        R.remainingShares -= shares; // burn LP owed
+        R.inputAmount -= E.amount; // shrink divisor
+
+        /*──── 5. Unwind LP and transfer tokens ───────────────────────────*/
         (uint64 amtA, uint64 amtB) = R.exchange.removeLiquidity(
             R.input,
             R.output,
             shares
         );
-        require(R.input.transfer(msg.sender,  amtA), "xfer A");
-        require(R.output.transfer(msg.sender, amtB), "xfer B");
+        uint64 payA = amtA + owedA; // total A owed
+        uint64 payB = amtB + owedB; // total B owed
 
-        emit RocketClaimed(rocketId, entryId, msg.sender, shares, amtA, amtB);
-    }
+        require(R.input.transfer(msg.sender, payA), "xfer A"); // send token A
+        require(R.output.transfer(msg.sender, payB), "xfer B"); // send token B
 
-    /**
-     * @notice Sweep residual LP or token dust after every entry is claimed.
-     *
-     * Intent
-     * ──────
-     * • Prevent orphaned value from integer-division rounding.
-     * • Forward dust to the rocket creator (if `controller` was used) or to the
-     *   caller when `controller == 0x0`, avoiding accidental burns.
-     *
-     * Assumptions
-     * ───────────
-     * • `remainingShares == 0` means *all* participants have claimed.
-     * • Token transfers follow ERC-20 semantics (`true` on success, revert on fail).
-     */
-    function sweepDust(uint64 rocketId) external nonReentrant {
-        // ────── rocket and share checks ──────
-        require(rocketId < rockets.length, "rocket OOB");
-        Rocket storage R = rockets[rocketId];
-        require(R.remainingShares == 0, "shares>0");
-
-        // ────── measure residual balances safely ──────
-        uint64 balA = _toUint64(R.input.balanceOf(address(this)));
-        uint64 balB = _toUint64(R.output.balanceOf(address(this)));
-
-        // ────── choose recipient ──────
-        address receiver = R.controller != address(0)
-            ? R.controller
-            : msg.sender;
-
-        // ────── forward dust ──────
-        if (balA > 0) require(R.input.transfer(receiver, balA), "sweep A");
-        if (balB > 0) require(R.output.transfer(receiver, balB), "sweep B");
+        emit RocketClaimed(rocketId, entryId, msg.sender, shares, payA, payB);
     }
 
     /*═══════════════════════  R E A D - O N L Y  ═════════════════════════*/
@@ -397,12 +404,14 @@ contract RocketLauncher is ReentrancyGuard {
         uint64 amount
     ) private {
         uint256 current = token.allowance(address(this), spender);
-        if (current == amount) return;                 // already perfect
+        if (current == amount) return; // already perfect
 
-        if (current != 0) {                            // reset if required
+        if (current != 0) {
+            // reset if required
             require(token.approve(spender, 0), "approve-reset");
         }
-        if (amount != 0) {                             // set target
+        if (amount != 0) {
+            // set target
             require(token.approve(spender, amount), "approve-set");
         }
     }
