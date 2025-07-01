@@ -29,15 +29,42 @@ library SplitOptimalNoFee64 {
     /*════════════ ENTRY – INPUT CAPPED ════════════*/
 
     /**
-     * Return the maximum-output allocation that can **spend at most**
-     * `amountInMax` without ever pushing the blended marginal price past
-     * `sqrtPlim_Q96`.
+     * @notice Compute the *maximum-output* allocation of an input swap that spends **at most**
+     *         `amountInMax` without ever pushing the blended marginal price beyond
+     *         the user-supplied limit `sqrtPlim_Q96`.  The limit must lie inside the
+     *         current 256-tick CLMM window.
      *
-     * The closed-form solution works in three phases:
-     *  (1)  Solve analytically for √P★ (equalised marginal price or the cap).
-     *  (2)  Back-solve exact in-amounts for V2 and V3 that land on √P★.
-     *  (3)  Compute the outputs and clip any 1-wei overshoot in the caller’s
-     *       favour.
+     * @dev Closed-form, no-iteration three-phase solver:
+     *      1. Solve analytically for the target price √P★ that equalises V2 and V3
+     *         marginal prices, or hits `sqrtPlim_Q96` if the cap binds.
+     *      2. Back-solve the exact tokenIn routed through each venue (V2 CPMM / V3 CLMM)
+     *         so that execution stops precisely at √P★.
+     *      3. Clip any 1-wei overshoot in the caller’s favour (never exceeds `amountInMax`).
+     *
+     *      All maths are promoted to 256-bit.  512-bit mulDiv is only used where a
+     *      256-bit product could overflow.  The function is safe under the strict
+     *      64-bit-token invariant (`R0`, `R1`, `inV?`, `outV?` ≤ 2⁶⁴-1).
+     *
+     * @param amountInMax  Maximum tokenIn the caller can spend (uint64).
+     * @param zeroForOne   `true` for token0 → token1 swaps, `false` for token1 → token0.
+     * @param sqrtP0_Q96   Starting square-root price shared by both pools in Q64.96 format.
+     * @param sqrtPlim_Q96 Price limit (same encoding) not to be crossed.
+     * @param L            Active CLMM liquidity inside the 256-tick window (uint128).
+     * @param R0           V2 reserve of token0 (uint64).
+     * @param R1           V2 reserve of token1 (uint64).
+     *
+     * @return S           Packed `Split` struct:
+     *                     • `inV3` tokens routed into the CLMM.
+     *                     • `inV2` tokens routed into the CPMM.
+     *                     • `outV3` tokens received from the CLMM.
+     *                     • `outV2` tokens received from the CPMM.
+     *                     Every field is uint64; all casts are range-checked.
+     *
+     * @custom:reverts EmptyPool        When `L`, `R0`, or `R1` is zero.
+     * @custom:reverts LimitTooHigh     When `sqrtPlim_Q96` is on the wrong side of `sqrtP0_Q96`.
+     * @custom:reverts Uint64Overflow   When any computed in/out leg exceeds 2⁶⁴-1.
+     * @custom:reverts ZeroDenominator  If an internal mulDiv denominator collapses to zero
+     *                                  (should be unreachable under normal invariants).
      */
     function splitForInput(
         uint64 amountInMax,
@@ -67,6 +94,8 @@ library SplitOptimalNoFee64 {
 
                 /* Δ (Q96-scaled) = amount / K */
                 uint256 d96 = (uint256(amountInMax) << 96) / K;
+                /// FIX: revert if Δ exceeds 160-bit envelope – never clamp
+                if (d96 > type(uint160).max) revert Uint64Overflow();
 
                 /*──────── DEFENSIVE FIX #1 ─────────*
                  * Cap Δ so (Q96 + d96) never ∉ uint256
@@ -86,6 +115,8 @@ library SplitOptimalNoFee64 {
                 /* token1 capacity K = R1 + L·√P₀ / 2⁹⁶ */
                 uint256 K = uint256(R1) + mulDiv(L, sqrtP0_Q96, Q96);
                 uint256 d96 = (uint256(amountInMax) << 96) / K;
+                /// FIX: revert if Δ exceeds 160-bit envelope – never clamp
+                if (d96 > type(uint160).max) revert Uint64Overflow();
 
                 /* DEFENSIVE FIX #1 mirror branch */
                 uint256 MAX_D96 = type(uint160).max;
@@ -93,30 +124,48 @@ library SplitOptimalNoFee64 {
 
                 /* √P★ = √P₀ · (1 + Δ) */
                 sqrtStar = mulDiv(sqrtP0_Q96, Q96 + d96, Q96);
+                /* Enforce user cap if we overshot */
                 if (sqrtStar > sqrtPlim_Q96) sqrtStar = sqrtPlim_Q96;
             }
 
-            /*───────────────────────────────────────*
-             * 2. Back-solve exact inputs             *
-             *───────────────────────────────────────*/
-            uint256 dxV2;
-            uint256 dxV3;
+            /*────────────────────── Back-solve exact inputs ──────────────────────*
+            *  At this point we already know the target price √P★.  All that      *
+            *  remains is to allocate the caller’s tokenIn between:               *
+            *      – the fee-free V2 CPMM (R0,R1), and                            *
+            *      – the 256-tick CLMM window (liquidity L).                      *
+            *                                                                      *
+            *  For both directions we derive closed-form expressions by           *
+            *  integrating the marginal-price curves over the interval            *
+            *  [√P₀ … √P★].  No iteration, no rounding-error accumulation.        *
+            *──────────────────────────────────────────────────────────────────────*/
+            uint256 dxV2;   // tokenIn routed through V2
+            uint256 dxV3;   // tokenIn routed through V3
 
             if (zeroForOne) {
-                /* ratio96 = √P₀ / √P★ in Q96-fixed-point */
+                /*──────────────── token0 → token1 branch ────────────────*/
+
+                // ratio96 = √P₀ / √P★  (Q64.96 fixed-point; ≥ 1.0)
                 uint256 ratio96 = (uint256(sqrtP0_Q96) << 96) / sqrtStar;
 
-                /* dxV2 = R0 · (ratio − 1) / 2⁹⁶   (product fits 256b) */
+                // V2 input:  R0 · (ratio − 1)
+                // Right-shift by 96 instead of explicit /2⁹⁶.
                 dxV2 = (uint256(R0) * (ratio96 - Q96)) >> 96;
 
-                /* dxV3 = L · (√P₀ − √P★) / (√P₀√P★ / 2⁹⁶)  */
+                // V3 input:  L · (√P₀ − √P★) / (√P₀√P★/2⁹⁶)
                 uint256 denom = mulDiv(sqrtP0, sqrtStar, Q96);
-                if (denom == 0) revert ZeroDenominator();
+                if (denom == 0) revert ZeroDenominator();  // ≈ impossible but free guard
                 dxV3 = mulDiv(L, sqrtP0 - sqrtStar, denom);
+
             } else {
+                /*──────────────── token1 → token0 branch ────────────────*/
+
+                // ratio96 = √P★ / √P₀  (Q64.96; ≥ 1.0)
                 uint256 ratio96 = (uint256(sqrtStar) << 96) / sqrtP0_Q96;
+
+                // V2 input uses token1 side of the reserves (R1).
                 dxV2 = (uint256(R1) * (ratio96 - Q96)) >> 96;
 
+                // V3 input simplifies because the denominator is exactly 2⁹⁶.
                 dxV3 = mulDiv(L, sqrtStar - sqrtP0, Q96);
             }
 
@@ -152,12 +201,34 @@ library SplitOptimalNoFee64 {
     /*════════════ ENTRY – OUTPUT CAPPED ════════════*/
 
     /**
-     * Return the minimum-cost allocation that can **deliver up to**
-     * `amountOutMax`, subject to the same marginal-price cap.
+     * @notice Compute the *minimum‑cost* allocation required to deliver **up to**
+     *         `amountOutMax` without ever letting the blended marginal price
+     *         surpass `sqrtPlim_Q96`.  If the desired output is impossible
+     *         before the cap binds, the function returns the cap‑bound allocation
+     *         and a smaller realised output.
      *
-     * If the requested output is unattainable before the cap bites the
-     * function returns the cap-bound allocation and a smaller realised
-     * output.  A 1-wei caller-favouring clip is applied symmetrically.
+     * @dev Algorithmic mirror of `splitForInput` operating in output‑space:
+     *      1. Determine a stopping price √P★ that either yields `amountOutMax`
+     *         or hits the price cap (whichever occurs first).
+     *      2. Back‑solve exact tokenIn routed through V2 and V3 to stop at √P★.
+     *      3. Apply a 1‑wei caller‑favouring clip so that the final tokenOut
+     *         never exceeds `amountOutMax`.
+     *
+     * @param amountOutMax Maximum tokenOut the caller wishes to receive (uint64).
+     * @param zeroForOne   `true` for token0 → token1 swaps, `false` for token1 → token0.
+     * @param sqrtP0_Q96   Starting square‑root price of both pools in Q64.96 format.
+     * @param sqrtPlim_Q96 Price cap within the 256‑tick window (same encoding).
+     * @param L            Active CLMM liquidity (uint128).
+     * @param R0           V2 reserve of token0 (uint64).
+     * @param R1           V2 reserve of token1 (uint64).
+     *
+     * @return S           Packed `Split` struct (same field semantics as `splitForInput`).
+     *
+     * @custom:reverts EmptyPool        When `L`, `R0`, or `R1` is zero.
+     * @custom:reverts LimitTooHigh     When `sqrtPlim_Q96` is on the wrong side of `sqrtP0_Q96`.
+     * @custom:reverts Uint64Overflow   When any computed in/out leg exceeds 2⁶⁴‑1.
+     * @custom:reverts ZeroDenominator  If an internal mulDiv denominator collapses to zero
+     *                                  (theoretically unreachable under работа invariants).
      */
     function splitForOutput(
         uint64 amountOutMax,
@@ -311,44 +382,31 @@ library SplitOptimalNoFee64 {
         return uint160(_sqrt(ratioX192)); // √(price·2¹⁹²)
     }
 
-    /*──────── integer √ (Babylonian) ───*/
-    function _sqrt(uint256 x) private pure returns (uint256 y) {
+    /**
+     * @notice Integer square-root (Babylonian) accurate to < 2⁻¹²⁰.
+     * @dev Four Newton iterations bring the result to ±1 wei for any
+     *      256-bit input.  The final branch corrects the rare 1-wei overshoot.
+     */
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
         if (x == 0) return 0;
 
         uint256 z = 1;
         uint256 xx = x;
-        if (xx >> 128 > 0) {
-            xx >>= 128;
-            z <<= 64;
-        }
-        if (xx >> 64 > 0) {
-            xx >>= 64;
-            z <<= 32;
-        }
-        if (xx >> 32 > 0) {
-            xx >>= 32;
-            z <<= 16;
-        }
-        if (xx >> 16 > 0) {
-            xx >>= 16;
-            z <<= 8;
-        }
-        if (xx >> 8 > 0) {
-            xx >>= 8;
-            z <<= 4;
-        }
-        if (xx >> 4 > 0) {
-            xx >>= 4;
-            z <<= 2;
-        }
-        if (xx >> 2 > 0) {
-            z <<= 1;
-        }
+        if (xx >> 128 > 0) { xx >>= 128; z <<= 64; }
+        if (xx >>  64 > 0) { xx >>=  64; z <<= 32; }
+        if (xx >>  32 > 0) { xx >>=  32; z <<= 16; }
+        if (xx >>  16 > 0) { xx >>=  16; z <<=  8; }
+        if (xx >>   8 > 0) { xx >>=   8; z <<=  4; }
+        if (xx >>   4 > 0) {               z <<=  2; }
+        if (xx >>   2 > 0) {               z <<=  1; }
 
+        // ───────── Newton steps (unrolled) ─────────
         y = (z + x / z) >> 1;
         y = (y + x / y) >> 1;
+        y = (y + x / y) >> 1;   // extra iteration #3
+        y = (y + x / y) >> 1;   // extra iteration #4
 
-        if (y * y > x) --y;
+        if (y * y > x) --y;     // 1-wei sanitiser
     }
 
     /*──────── 512-bit mulDiv ───────────*/
@@ -433,3 +491,54 @@ library SplitOptimalNoFee64 {
         return uint64(x);
     }
 }
+
+/// @title AddressSort – deterministic lexicographic ordering for two addresses
+/// @notice Returns the two input addresses in ascending (lexicographic) order.
+/// @dev  ─────────────────────────────────────────────────────────────────────
+///      • Lexicographic order is the same as numerical order on the 160-bit
+///        address value, so casting to `uint160` lets us use cheap integer
+///        comparisons.  
+///      • The function is `internal` and `pure`; the compiler can inline it,
+///        eliminating the call frame and saving gas wherever it is used.  
+///      • Equal inputs are permitted; the duplicates are returned unchanged.  
+library AddressSort {
+    /**
+     * @notice Sort two addresses lexicographically.
+     * @param a The first (unsorted) address.
+     * @param b The second (unsorted) address.
+     * @return first  The lexicographically smaller / equal address.
+     * @return second The lexicographically larger / equal address.
+     *
+     * INTENT, ASSUMPTIONS, AND REASONING
+     * ----------------------------------
+     * • The EVM views an address as a 20-byte big-endian integer; comparing the
+     *   `uint160` representations therefore yields the same order users see in
+     *   hexadecimal form.  
+     * • Casting `address → uint160` is a zero-cost operation at compile-time,
+     *   preferable to converting to `bytes` (which would allocate memory).  
+     * • We avoid branching on equality by using a single ≤ comparison, saving a
+     *   logical operation when the inputs are identical.  
+     */
+    function sortPair(address a, address b)
+        internal                                  // scope: library-internal use only
+        pure                                      // no state or environmental reads
+        returns (address first, address second)   // named outputs enable implicit return
+    {
+        // ─── Cast addresses to integers for comparison ──────────────────────
+        uint160 aNum = uint160(a);   // underlying 160-bit value of `a`
+        uint160 bNum = uint160(b);   // underlying 160-bit value of `b`
+
+        // ─── Order selection ────────────────────────────────────────────────
+        if (aNum <= bNum) {
+            // `a` is already first (or the two are identical).
+            first  = a;
+            second = b;
+        } else {
+            // `b` precedes `a`; swap the order.
+            first  = b;
+            second = a;
+        }
+        // Implicit return of `first` and `second`. Compiler inlines for zero-gas return.
+    }
+}
+

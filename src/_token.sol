@@ -38,9 +38,9 @@ contract TradesPerDayToken is IZRC20 {
         emit AdminAdded(msg.sender);
     }
 
-    /* "...but not everyone bowed to this power!" */
+    /* "Move between the lines, a soldier breaking the confines!" */
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=Xszx_9UPwV8";
+        return "https://www.youtube.com/watch?v=wbkEFIVXLNw";
     }
 
     /*──────── IZRC-20 view functions ────────*/

@@ -41,6 +41,8 @@ interface IYieldProtocol {
     event YieldAdded(uint64 pid, uint64 amountTok);
     event YieldPaid(uint64 pid, uint64 amountTok);
 
+    event LockupStarted(address wallet, uint64 startBlock, uint64 duration);
+
     /* cfg */
     function createProtocol(
         address ctrl,
@@ -81,9 +83,11 @@ struct Member {
     uint64 unlock;
     uint64 stake;
 }
+
 struct Quad {
     uint64[4] slot;
 }
+
 struct Protocol {
     address ctrl;
     uint64 minStake;
@@ -94,22 +98,60 @@ struct Protocol {
     uint128 collected;
     uint192 yAcc;
 }
+
 struct Reserved {
     uint128 inStart;
     uint128 outStart;
     uint192 yStart;
     uint64 joinMin;
 }
+
 struct Account {
     uint64 bal;
-    uint64 ptrA;
-    uint64 ptrB;
+    uint64 ptrA; // if 0, no quad
+    uint64 ptrB; // if 0, no quad
     uint8 mask;
+    uint56 lock; // if 0, no lockup
 }
 
-/*─────────────────────────────────────────────────────
-│  WrappedQRL-Z implementation
-└────────────────────────────────────────────────────*/
+struct AirLock {
+    uint64 startTime;
+    uint64 duration;
+}
+
+event AirDropCreated (uint64 indexed dropId, IZRC20 indexed token, uint64 startsAt, uint64 endsAt);
+
+event AirDropClaimed (uint64 indexed dropId, address indexed who, uint64 amount);
+
+struct AirDrop {
+    IZRC20 token;
+    address burner; // where to send remaining tokens after endTime
+    uint64 remaining; // total airdrop tokens available
+    uint64 perToken; // unit airdrop tokens per unit of claiming token
+    uint64 perWalletMax; // 0 = no limit, else max per wallet claiming
+    uint64 startTime; // wallet must be locked before (or at) this time
+    // if claiming wallet's unlock date is earlier, their lock is extended
+    uint64 endTime; // cannot claim upon or after this time
+}
+
+event AirDropNotification (
+    address indexed token,
+    string icon,
+    string name,
+    string desc,
+    string link,
+    uint64 startsAt,
+    uint64 endsAt
+);
+
+struct AirDropMetaData {
+    IZRC20 token;
+    string icon;
+    string name;
+    string desc;
+    string link;
+}
+
 contract WrappedQRL is
     IYieldProtocol,
     IZRC20,
@@ -121,7 +163,10 @@ contract WrappedQRL is
     /*──────── Storage ────────*/
     mapping(address => Account) private _acct;
     mapping(address => mapping(address => uint64)) private _allow;
+    mapping(address => mapping(uint64 => bool)) private _airdropClaimed;
 
+    AirDrop[] private _drops;
+    AirLock[] private _locks;
     Protocol[] private _prot;
     Reserved[] private _res;
     Member[] private _mem;
@@ -139,6 +184,8 @@ contract WrappedQRL is
 
     /*──────── Constructor ────────*/
     constructor() payable {
+        _drops.push(); // not necessary, but for consistency
+        _locks.push();
         _prot.push();
         _res.push();
         _mem.push();
@@ -153,9 +200,165 @@ contract WrappedQRL is
         }
     }
 
-    // "I can see it... the rise of a digital nation!"
+    /* v---- AIRDROPS ----v */
+
+    function lock(uint64 duration) external nonReentrant {
+        require(duration > 0, "zero");
+        require(duration <= MAX_LOCK_WIN, "max");
+        Account storage a = _acct[msg.sender];
+        require(a.lock == 0, "active");
+        _locks.push(AirLock(uint64(block.timestamp), duration));
+        a.lock = uint56(_locks.length - 1);
+        emit LockupStarted(msg.sender, uint64(block.number), duration);
+    }
+
+    function lockInfo(
+        address who
+    ) external view returns (uint64 start, uint64 duration, uint64 end) {
+        Account storage a = _acct[who];
+        if (a.lock != 0) {
+            AirLock storage l = _locks[a.lock];
+            start = l.startTime;
+            duration = l.duration;
+            end = start + duration;
+        } else {
+            start = 0;
+            duration = 0;
+            end = 0;
+        }
+    }
+
+    function drop(
+        AirDrop calldata airdrop,
+        AirDropMetaData calldata metadata
+    ) external {
+        require(address(airdrop.token) != address(0), "token0");
+        // require(airdrop.burner != address(0), "burner0");
+        require(airdrop.remaining > 0, "remaining0");
+        require(airdrop.perToken > 0, "perToken0");
+        require(airdrop.startTime < airdrop.endTime, "time");
+        // move tokens to this contract
+        IZRC20(airdrop.token).transferFrom(
+            msg.sender,
+            address(this),
+            airdrop.remaining
+        );
+        _drops.push(airdrop);
+        emit AirDropCreated(
+            uint64(_drops.length - 1),
+            airdrop.token,
+            airdrop.startTime,
+            airdrop.endTime
+        );
+        emit AirDropNotification(
+            address(airdrop.token),
+            metadata.icon,
+            metadata.name,
+            metadata.desc,
+            metadata.link,
+            airdrop.startTime,
+            airdrop.endTime
+        );
+    }
+
+    function dropInfo(
+        uint64 dropId
+    )
+        external
+        view
+        returns (
+            IZRC20 token,
+            address burner,
+            uint64 remaining,
+            uint64 perToken,
+            uint64 perWalletMax,
+            uint64 startTime,
+            uint64 endTime
+        )
+    {
+        require(dropId < _drops.length && dropId != 0, "drop");
+        AirDrop storage d = _drops[dropId];
+        return (
+            d.token,
+            d.burner,
+            d.remaining,
+            d.perToken,
+            d.perWalletMax,
+            d.startTime,
+            d.endTime
+        );
+    }
+
+    function burn(uint64 dropId) external {
+        require(dropId < _drops.length && dropId != 0, "drop");
+        AirDrop storage d = _drops[dropId];
+        // require(d.burner != address(0), "burner0");
+        // require airdrop has ended
+        require(block.timestamp >= d.endTime, "active");
+        uint64 amt = d.remaining;
+        d.remaining = 0;
+        d.token.transfer(d.burner, amt);
+    }
+
+    function claimAll(uint64[] calldata drops) external {
+        uint64 len = uint64(drops.length);
+        require(len > 0, "empty");
+        for (uint64 i = 0; i < len; ++i) {
+            claimOne(drops[i]);
+        }
+    }
+
+    /**
+     * Performs the cap-claim math and transfers funds to the caller
+     * if they are available. If not enough is available, the remaining
+     * amount is transferred and the airdrop is left empty as a result.
+     * If the caller has already claimed, or if the airdrop is not active,
+     * this function will revert. Updates the caller's lock window duration
+     * such that the lock ends at this airdrop's end time, if the end time
+     * of the caller's lock is before the end time of the airdrop.
+     * 
+     * Requirements:
+     * - `drop` must be a valid airdrop ID (non-zero and within range).
+     * - Current time must be within the airdrop's start and end times.
+     * - Caller must not have already claimed this airdrop.
+     * - Caller must have an active lock that started before or at the airdrop's start time.
+     * - The airdrop must have remaining tokens to claim.
+     * - If the calculated claim amount exceeds the airdrop's remaining tokens,
+     *   it will be capped to the remaining amount.
+     */
+    function claimOne(uint64 drop_) internal {
+        require(drop_ < _drops.length && drop_ != 0, "drop");
+        AirDrop storage d = _drops[drop_];
+        require(
+            block.timestamp >= d.startTime && block.timestamp < d.endTime,
+            "time"
+        );
+        require(!_airdropClaimed[msg.sender][drop_], "claimed");
+        Account storage a = _acct[msg.sender];
+        require(a.lock != 0, "no-lock");
+        AirLock storage l = _locks[a.lock];
+        require(l.startTime <= d.startTime, "lock-time");
+        uint64 amt = (uint64(a.bal) * d.perToken);
+        if (d.perWalletMax > 0 && amt > d.perWalletMax) amt = d.perWalletMax;
+        require(amt > 0, "zero");
+        if (amt > d.remaining) amt = d.remaining;
+        d.remaining -= amt;
+        _airdropClaimed[msg.sender][drop_] = true;
+        d.token.transfer(msg.sender, amt);
+        emit AirDropClaimed(drop_, msg.sender, amt);
+        // extend lock if needed
+        uint64 lockEnd = l.startTime + l.duration;
+        if (lockEnd < d.endTime) {
+            l.duration = uint64(d.endTime - l.startTime);
+            emit LockupStarted(msg.sender, uint64(block.number), l.duration);
+        }
+    }
+
+    // ^---- AIRDROPS ----^
+
+    // "We made it happen... we're the chosen ones!"
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=O8CsM96SEtM";
+        return "https://www.youtube.com/watch?v=pJvduG0E628";
     }
 
     /*──────── Modifiers ────────*/
@@ -607,6 +810,11 @@ contract WrappedQRL is
     function _xfer(address f, address t, uint64 v) internal {
         require(t != address(0), "to0");
         Account storage fa = _acct[f];
+        // require the account is unlocked
+        if (fa.lock != 0) {
+            AirLock storage l = _locks[fa.lock];
+            require(block.timestamp >= l.startTime + l.duration, "locked");
+        }
         for (uint8 s; s < MAX_SLOTS; ++s)
             if ((fa.mask & (1 << s)) != 0)
                 require(block.number >= _member(fa, s).unlock, "locked");
