@@ -3,16 +3,16 @@ pragma solidity ^0.8.24;
 
 /*============================================================================*\
 │ ░ R O C K E T ░  L A U N C H E R                                             │
-│                                                                             │
-│ A one-shot “liquidity rocket” that pairs a creator-supplied *output* token  │
-│ with participant-supplied *input* tokens, then adds the pair to an external │
-│ AMM (`IDEX`).  After an optional lock-up (`flightTime`) the position is     │
-│ unwound and proceeds are paid back to each participant pro-rata.           │
-│                                                                             │
-│ — No cancellation once created (prevents grief-style blue-balling).         │
-│ — Per-rocket entry isolation blocks cross-claim theft.                      │
-│ — Re-entrancy guard + CEI pattern on all state-mutating paths.              │
-│ — 256-bit intermediate math avoids overflow during share calculation.       │
+│                                                                              │
+│ A one-shot “liquidity rocket” that pairs a creator-supplied *output* token   │
+│ with participant-supplied *input* tokens, then adds the pair to an external  │
+│ AMM (`IDEX`).  After an optional lock-up (`flightTime`) the position is      │
+│ unwound and proceeds are paid back to each participant pro-rata.             │
+│                                                                              │
+│ — No cancellation once created (prevents grief-style blue-balling).          │
+│ — Per-rocket entry isolation blocks cross-claim theft.                       │
+│ — Re-entrancy guard + CEI pattern on all state-mutating paths.               │
+│ — 256-bit intermediate math avoids overflow during share calculation.        │
 \*============================================================================*/
 
 import "./IDEX.sol";
@@ -266,89 +266,104 @@ contract RocketLauncher is ReentrancyGuard {
     /*════════════════════   P O S T-F L I G H T   C L A I M   ═════════════*/
 
     /**
-     * @notice Claim a participant’s pro-rata share of LP tokens plus any
-     *         un-pooled leftovers from launch.
+     * @notice Claim this entry’s share of the LP position **plus** its slice of
+     *         any tokens that failed to enter the pool at launch (“left-overs”).
      *
-     * @dev **Fair-order invariant.**
-     *      The function now subtracts the caller’s `amount` from
-     *      `R.inputAmount` immediately after computing the leftover slice,
-     *      making the denominator shrink for *every* claim (starved or not).
-     *      This guarantees that leftover distribution is independent of
-     *      claim order.
+     * ───────────────────────────── Intent ─────────────────────────────
+     * • Guarantee **order-independent** payouts: the math must not care who
+     *   claims first or last.
+     * • Mop up every last wei:
+     *     – The *last* claimer receives any residual LP rounding dust.
+     *     – The *last* claimer receives any residual left-over tokens.
+     * • Follow strict CEI + re-entrancy guard discipline.
      *
-     * Assumptions
-     * ───────────
+     * ──────────────────────────── Assumptions ─────────────────────────
      * • All IZRC20 balances fit in 64 bits (token-universe invariant).
-     * • External AMM (`IDEX`) obeys its documented invariants:
-     *   `removeLiquidity()` returns the underlying A and B amounts that back
-     *   exactly `shares` LP tokens or reverts.
-     * • The function runs under the `nonReentrant` modifier, so CEI ordering
-     *   protects against re-entrancy through external calls.
+     * • `IDEX.removeLiquidity()` returns the amount of A and B backing exactly
+     *   `shares` LP tokens or reverts.
+     * • Function executes under `nonReentrant`.
      */
     function claimLiquidity(
         uint64 rocketId,
         uint64 entryId
     ) external nonReentrant {
-        /*──── 0. Boilerplate guards ───────────────────────────────────────*/
-        require(rocketId < rockets.length, "rocket OOB"); // valid rocket
+        /*──────────── 0. Basic guards ──────────────────────────────────*/
+        require(rocketId < rockets.length, "rocket OOB");
         Rocket storage R = rockets[rocketId];
-        require(R.launched, "not launched"); // must be live
-        require(block.timestamp >= R.launchTime + R.flightTime, "locked"); // lock over
-        require(entryId < rocketEntries[rocketId].length, "entry OOB"); // valid entry
+        require(R.launched, "not launched");
+        require(block.timestamp >= R.launchTime + R.flightTime, "locked");
+        require(entryId < rocketEntries[rocketId].length, "entry OOB");
         RocketEntry storage E = rocketEntries[rocketId][entryId];
-        require(E.participant == msg.sender, "not owner"); // caller ownership
-        require(!E.claimed, "claimed"); // single-use
+        require(E.participant == msg.sender, "not owner");
+        require(!E.claimed, "claimed");
 
-        /*──── 1. LP-share calculation (256-bit intermediate) ─────────────*/
+        /*──────────── 1. Detect “last-claimer” upfront ─────────────────*/
+        // If the caller’s deposit equals the current divisor, every other
+        // entry must already be claimed, so this caller is last.
+        bool isLast = (R.inputAmount == E.amount);
+
+        /*──────────── 2. Compute LP share (256-bit intermediate) ───────*/
         uint256 shares256 = (uint256(E.amount) * uint256(R.maximumShares)) /
-            uint256(R.inputAmount);
-        uint128 shares = uint128(shares256); // safe down-cast
-        if (shares > R.remainingShares) shares = R.remainingShares; // rounding clamp
+                            uint256(R.inputAmount);
+        uint128 shares = uint128(shares256);               // safe down-cast
 
-        /*──── 2. Starved deposit branch – zero shares, full refund ───────*/
+        // Rounding guard: cap overshoot (should only matter for first claimer
+        // when everyone deposited the same tiny amount).
+        if (shares > R.remainingShares) shares = R.remainingShares;
+
+        /*──────────── 3. Starved deposit (0 shares) branch ─────────────*/
         if (shares == 0) {
-            E.claimed = true; // mark consumed
-            R.inputAmount -= E.amount; // shrink divisor
-            require(R.input.transfer(msg.sender, E.amount), "refund"); // give back A
+            E.claimed = true;
+            R.inputAmount -= E.amount;                     // shrink divisor
+            require(R.input.transfer(msg.sender, E.amount), "refund");
             emit RocketClaimed(rocketId, entryId, msg.sender, 0, E.amount, 0);
-            return; // done
+            return;
         }
 
-        /*──── 3. Leftover slice (order-independent) ──────────────────────*/
-        // Calculate owedA/owedB BEFORE shrinking R.inputAmount.
-        uint64 owedA = 0;
-        uint64 owedB = 0;
-        if (R.leftARemaining > 0) {
-            owedA = _toUint64(
-                (uint256(R.leftARemaining) * uint256(E.amount)) /
+        /*──────────── 4. Left-over slice calculation ───────────────────*/
+        uint64 owedA;
+        uint64 owedB;
+
+        if (isLast) {
+            // Sweep whatever dust is left — guarantees no stranded tokens.
+            owedA = R.leftARemaining;
+            owedB = R.leftBRemaining;
+            R.leftARemaining = 0;
+            R.leftBRemaining = 0;
+            shares = R.remainingShares;                    // grab all LP dust
+        } else {
+            // Standard proportional slice.
+            if (R.leftARemaining > 0) {
+                owedA = _toUint64(
+                    (uint256(R.leftARemaining) * uint256(E.amount)) /
                     uint256(R.inputAmount)
-            );
-            R.leftARemaining -= owedA; // burn slice from pool
-        }
-        if (R.leftBRemaining > 0) {
-            owedB = _toUint64(
-                (uint256(R.leftBRemaining) * uint256(E.amount)) /
+                );
+                R.leftARemaining -= owedA;
+            }
+            if (R.leftBRemaining > 0) {
+                owedB = _toUint64(
+                    (uint256(R.leftBRemaining) * uint256(E.amount)) /
                     uint256(R.inputAmount)
-            );
-            R.leftBRemaining -= owedB;
+                );
+                R.leftBRemaining -= owedB;
+            }
         }
 
-        /*──── 4. State updates (CEI – all before external calls) ─────────*/
-        E.claimed = true; // finalise entry
-        R.remainingShares -= shares; // burn LP owed
-        R.inputAmount -= E.amount; // shrink divisor
+        /*──────────── 5. State updates (all before externals) ──────────*/
+        E.claimed        = true;
+        R.remainingShares -= shares;
+        R.inputAmount    -= E.amount;                      // divisor shrinks
 
-        /*──── 5. Unwind LP and transfer tokens ───────────────────────────*/
+        /*──────────── 6. Unwind LP and pay caller ──────────────────────*/
         (uint64 amtA, uint64 amtB) = R.exchange.removeLiquidity(
-            R.input,
-            R.output,
-            shares
+            R.input, R.output, shares
         );
-        uint64 payA = amtA + owedA; // total A owed
-        uint64 payB = amtB + owedB; // total B owed
 
-        require(R.input.transfer(msg.sender, payA), "xfer A"); // send token A
-        require(R.output.transfer(msg.sender, payB), "xfer B"); // send token B
+        uint64 payA = amtA + owedA;
+        uint64 payB = amtB + owedB;
+
+        require(R.input.transfer(msg.sender, payA), "xfer A");
+        require(R.output.transfer(msg.sender, payB), "xfer B");
 
         emit RocketClaimed(rocketId, entryId, msg.sender, shares, payA, payB);
     }
