@@ -204,20 +204,21 @@ contract QuantaSwapV1Pool {
     TWAP.State private _twap; // the sole oracle state blob
 
     using UniV2PoolLib64 for UniV2PoolLib64.Pool;
-    UniV2PoolLib64.Pool private _cp;  // constant-product liquidity
+    UniV2PoolLib64.Pool private _cp; // constant-product liquidity
     mapping(address => uint64) _lp;
 
     function addLiquidity(uint64 a0, uint64 a1) external {
         // Pull tokens **before** the mutate – CEI pattern
         BASE.transferFrom(msg.sender, address(this), a0);
         QUOTE.transferFrom(msg.sender, address(this), a1);
-        uint64 lpMint = _cp.mint(a0, a1);           // mutates _cp
-        _lp[msg.sender] += lpMint;                  // your internal accounting
+        uint64 lpMint = _cp.mint(a0, a1); // mutates _cp
+        _lp[msg.sender] += lpMint; // your internal accounting
     }
 
     function removeLiquidity(uint64 lp) external {
-        uint64 out0; uint64 out1;
-        (out0, out1) = _cp.burn(lp);                // mutates _cp
+        uint64 out0;
+        uint64 out1;
+        (out0, out1) = _cp.burn(lp); // mutates _cp
         _lp[msg.sender] -= lp;
         BASE.transfer(msg.sender, out0);
         QUOTE.transfer(msg.sender, out1);
@@ -512,7 +513,9 @@ contract QuantaSwapV1Pool {
         }
     }
 
-    function getPoolPrice(bool baseForQuote) internal view returns (uint64 priceQ32_32) {
+    function getPoolPrice(
+        bool baseForQuote
+    ) internal view returns (uint64 priceQ32_32) {
         if (baseForQuote) {
             return _cp.price0To1Q32_32();
         } else {
@@ -714,169 +717,361 @@ contract QuantaSwapV1Pool {
         }
     }
 
-    // orders and floats are assumed to be favorably ordered at pass-in
+    // ────────────────────────────  INTERNAL HELPERS  ────────────────────────────
+
     /**
-     * @notice Merge-sorted swap execution over Orders and Floats.
-     *         • Pushes TWAP first, so floats price off the latest data.
-     *         • Always takes liquidity from the best-priced side next.
-     *         • Mutates reserves in-place, then does token transfers (CEI).
+     * @dev Consume up to `remainingIn` against the constant-product pool.
+     *
+     *      Direction legend (same as the rest of the file):
+     *        baseForQuote = true   → taker PAYS  BASE (token-0), receives QUOTE (token-1)
+     *                      = false → taker PAYS  QUOTE,           receives BASE.
+     *
+     *      All arithmetic lives in 128-bit space; reserves are 64-bit.
+     *
+     * @return inRemaining  Portion of `remainingIn` still unspent.
+     * @return outGenerated Tokens the taker receives from the pool.
+     */
+    function _fillPoolForInput(
+        bool baseForQuote,
+        uint64 remainingIn
+    ) private returns (uint64 inRemaining, uint64 outGenerated) {
+        if (remainingIn == 0) return (0, 0);
+
+        if (baseForQuote) {
+            // Token-0 ➜ Token-1  (zeroForOne == true)
+            outGenerated = UniV2PoolLib64.getAmountOut(
+                remainingIn,
+                _cp.reserve0,
+                _cp.reserve1,
+                _cp.feePpm
+            );
+            if (outGenerated == 0) return (remainingIn, 0);
+
+            // mutate reserves
+            _cp.reserve0 += remainingIn;
+            _cp.reserve1 -= outGenerated;
+        } else {
+            // Token-1 ➜ Token-0  (zeroForOne == false)
+            outGenerated = UniV2PoolLib64.getAmountOut(
+                remainingIn,
+                _cp.reserve1,
+                _cp.reserve0,
+                _cp.feePpm
+            );
+            if (outGenerated == 0) return (remainingIn, 0);
+
+            _cp.reserve1 += remainingIn;
+            _cp.reserve0 -= outGenerated;
+        }
+
+        inRemaining = 0; ///< everything was consumed
+    }
+
+    /**
+     * @dev Exact-OUT leg against the pool (mirrors `_fillPoolForInput`).
+     *
+     * @return outRemaining  Portion of desired `remainingOut` still unfilled.
+     * @return inRequired    Tokens the taker must pay the pool.
+     */
+    function _fillPoolForOutput(
+        bool baseForQuote,
+        uint64 remainingOut
+    ) private returns (uint64 outRemaining, uint64 inRequired) {
+        if (remainingOut == 0) return (0, 0);
+
+        if (baseForQuote) {
+            // Wants QUOTE, will pay BASE.
+            inRequired = UniV2PoolLib64.getAmountIn(
+                remainingOut,
+                _cp.reserve0,
+                _cp.reserve1,
+                _cp.feePpm
+            );
+            if (inRequired == 0) return (remainingOut, 0);
+
+            _cp.reserve0 += inRequired;
+            _cp.reserve1 -= remainingOut;
+        } else {
+            // Wants BASE, will pay QUOTE.
+            inRequired = UniV2PoolLib64.getAmountIn(
+                remainingOut,
+                _cp.reserve1,
+                _cp.reserve0,
+                _cp.feePpm
+            );
+            if (inRequired == 0) return (remainingOut, 0);
+
+            _cp.reserve1 += inRequired;
+            _cp.reserve0 -= remainingOut;
+        }
+
+        outRemaining = 0;
+    }
+
+    // ───────────────────────────  MAIN MERGE FUNCTION  ──────────────────────────
+
+    /*══════════════════════════════════════════════════════════════════════════*\
+    │                        P O O L   H E L P E R S                             │
+    \*══════════════════════════════════════════════════════════════════════════*/
+
+    function _poolFillExactIn(
+        bool baseForQuote,
+        uint64 amountIn,
+        uint64 r0,
+        uint64 r1
+    ) private pure returns (uint64 outGenerated, uint64 newR0, uint64 newR1) {
+        if (amountIn == 0) return (0, r0, r1);
+
+        if (baseForQuote) {
+            outGenerated = UniV2PoolLib64.getAmountOut(
+                amountIn,
+                r0,
+                r1,
+                0 // fee = 0 : all fee was up-front
+            );
+            if (outGenerated == 0) return (0, r0, r1);
+            newR0 = r0 + amountIn;
+            newR1 = r1 - outGenerated;
+        } else {
+            outGenerated = UniV2PoolLib64.getAmountOut(amountIn, r1, r0, 0);
+            if (outGenerated == 0) return (0, r0, r1);
+            newR1 = r1 + amountIn;
+            newR0 = r0 - outGenerated;
+        }
+    }
+
+    function _poolFillExactOut(
+        bool baseForQuote,
+        uint64 amountOut,
+        uint64 r0,
+        uint64 r1
+    ) private pure returns (uint64 inRequired, uint64 newR0, uint64 newR1) {
+        if (amountOut == 0) return (0, r0, r1);
+
+        if (baseForQuote) {
+            inRequired = UniV2PoolLib64.getAmountIn(amountOut, r0, r1, 0);
+            if (inRequired == 0) return (0, r0, r1);
+            newR0 = r0 + inRequired;
+            newR1 = r1 - amountOut;
+        } else {
+            inRequired = UniV2PoolLib64.getAmountIn(amountOut, r1, r0, 0);
+            if (inRequired == 0) return (0, r0, r1);
+            newR1 = r1 + inRequired;
+            newR0 = r0 - amountOut;
+        }
+    }
+
+    /*══════════════════════════════════════════════════════════════════════════*\
+    │                               execute                                      │
+    \*══════════════════════════════════════════════════════════════════════════*/
+
+    enum Src {
+        NONE,
+        ORD,
+        FLT,
+        POOL
+    }
+
+    /**
+     * @notice Best-price matcher over Orders, Floats and the CP pool.
+     * @dev    Forward-progress & corruption-hardened rewrite.
+     *
+     *         ────────────────────────────────────────────────────────────────
+     *         Key invariants / design choices
+     *         ────────────────────────────────────────────────────────────────
+     *         • “Input” and “Output” are always from the taker’s perspective
+     *           (input = what they pay, output = what they receive).
+     *         • Fee is applied **once** on the side the taker pays and is
+     *           credited to the pool reserves.  It is *not* considered traded
+     *           volume and therefore excluded from the oracle note.
+     *         • We only touch storage twice at the very end to flush `_cp`
+     *           reserves back (r0, r1) — everything else lives in memory.
+     *         • The main while-loop is guaranteed to make progress or exit:
+     *           after every iteration `needIn` or `needOut` strictly decreases,
+     *           otherwise we `break;` to avoid a DoS.
+     *         • Access-control on maker liquidity *not* enforced here — if you
+     *           do want ownership gating, add it to the fill helpers.
      */
     function execute(
         int64[] calldata orders,
         int64[] calldata floats,
-        bool exactInput, // true  = exact-in; false = exact-out
-        bool baseForQuote, // true  = pay BASE, receive QUOTE
-        uint64 amount, // exact input (or output) amount
-        uint64 limit // min-out (exact-in) or max-in (exact-out)
-    ) external returns (uint64 input, uint64 output) {
-        /*─────────────────── 1. Oracle upkeep (fresh TWAP) ───────────────────*/
-        _twap.push(); // roll window this block
-        uint64 twapDir = _twap.twap(); // quotePerBase
-        if (!baseForQuote) twapDir = invertPrice(twapDir); // basePerQuote
+        bool exactInput,      // true  = exact-in ; false = exact-out
+        bool baseForQuote,    // true  = pay BASE, receive QUOTE
+        uint64 amount,        // fixed input  (or output) amount
+        uint64 limit          // min-out (exact-in) | max-in (exact-out)
+    ) external returns (uint64 input, uint64 output)
+    {
+        /* ───────────────────────────── 1. Fee handling ──────────────────── */
+        uint64 feePpm   = _cp.feePpm;
+        uint64 feeAcc   = 0;          // tokens skimmed to the pool
+        uint64 needIn   = 0;          // taker input still to source
+        uint64 needOut  = 0;          // taker output still to provide
 
-        /*─────────────────── 2. Execution working state ──────────────────────*/
-        uint64 needIn = exactInput ? amount : 0;
-        uint64 needOut = exactInput ? 0 : amount;
+        if (exactInput) {
+            // Caller pre-approves `amount`; we skim the fee upfront.
+            uint128 fee = (uint128(amount) * feePpm + 999_999) / 1_000_000; // ceil
+            feeAcc = uint64(fee);
+            needIn = amount - feeAcc;      // net amount to be traded
+            input  = amount;               // total pull later
+        } else {
+            // Fee applied once final net input is known (see step 7).
+            needOut = amount;
+        }
 
-        uint oPtr = 0; // cursor in orders[]
-        uint fPtr = 0; // cursor in floats[]
+        /* ─────────────────────────── 2. Freshen TWAP  ───────────────────── */
+        _twap.push();                      // commit prev-block slice
+        uint64 twapDir = _twap.twap();     // quote / base
+        if (!baseForQuote) twapDir = invertPrice(twapDir);
 
-        /*─────────────────── 3. Merge-sorted fill loop ───────────────────────*/
+        /* ─────────────────────────── 3. Local reserves ─────────────────── */
+        uint64 r0 = _cp.reserve0;
+        uint64 r1 = _cp.reserve1;
+
+        /* cursors into the user-supplied sorted ID lists */
+        uint256 oPtr = 0;
+        uint256 fPtr = 0;
+
+        /* ─────────────────────────── 4. Fill loop  ──────────────────────── */
         while (exactInput ? needIn > 0 : needOut > 0) {
-            /* ░░░  peek next order price (0 = no liquidity left) ░░░ */
-            uint64 orderPrice = 0;
-            while (oPtr < orders.length && orderPrice == 0) {
-                Order storage ord = ordersNormal[uint64(orders[oPtr])];
-                orderPrice = getExecutePriceOrder(ord, baseForQuote);
-                if (orderPrice == 0) ++oPtr; // skip empty order
+
+            /* 4-A: peek best executable price for each source (0 = unusable) */
+            uint64 pxOrd = 0;
+            while (oPtr < orders.length && pxOrd == 0) {
+                Order storage o = ordersNormal[uint64(orders[oPtr])];
+                pxOrd = getExecutePriceOrder(o, baseForQuote);
+                if (pxOrd == 0) ++oPtr;            // empty side → skip
             }
 
-            /* ░░░  peek next float price  ░░░ */
-            uint64 floatPrice = 0;
-            while (fPtr < floats.length && floatPrice == 0) {
-                Float storage flt = floatsNormal[uint64(floats[fPtr])];
-                floatPrice = getExecutePriceFloat(flt, baseForQuote, twapDir);
-                if (floatPrice == 0) ++fPtr; // skip empty float
+            uint64 pxFlt = 0;
+            while (fPtr < floats.length && pxFlt == 0) {
+                Float storage f = floatsNormal[uint64(floats[fPtr])];
+                pxFlt = getExecutePriceFloat(f, baseForQuote, twapDir);
+                if (pxFlt == 0) ++fPtr;
             }
 
-            /* ░░░  ensure some liquidity exists  ░░░ */
-            if (orderPrice == 0 && floatPrice == 0) {
-                break;
-            }
+            uint64 pxPool = (r0 == 0 || r1 == 0)
+                ? 0
+                : baseForQuote
+                    ? uint64((uint128(r1) << 32) / r0)  // quote / base
+                    : uint64((uint128(r0) << 32) / r1); // quote / base
 
-            bool takeOrder;
-            if (orderPrice == 0) takeOrder = false;
-            else if (floatPrice == 0) takeOrder = true;
-            else {
-                // pick better price
-                takeOrder = baseForQuote
-                    ? (orderPrice >= floatPrice)
-                    : (orderPrice <= floatPrice);
-            }
+            if (pxOrd | pxFlt | pxPool == 0) break; // dead-end: no liquidity
 
-            /* ░░░  pull from the chosen provider ░░░ */
-            if (takeOrder) {
-                Order storage ordFill = ordersNormal[uint64(orders[oPtr])];
+            /* 4-B: select best price in taker’s favour */
+            Src best = Src.NONE;
+            uint64 bestPx;
 
+            if (pxOrd != 0) { best = Src.ORD; bestPx = pxOrd; }
+            if (pxFlt != 0 &&
+                (best == Src.NONE ||
+                 (baseForQuote ? pxFlt > bestPx : pxFlt < bestPx)))
+            { best = Src.FLT; bestPx = pxFlt; }
+            if (pxPool != 0 &&
+                (best == Src.NONE ||
+                 (baseForQuote ? pxPool > bestPx : pxPool < bestPx)))
+            { best = Src.POOL; bestPx = pxPool; }
+
+            /* 4-C: execute against chosen source */
+            uint64 progress; // how much of need{In,Out} we satisfied this iter
+
+            if (best == Src.ORD) {
+                Order storage oFill = ordersNormal[uint64(orders[oPtr])];
                 if (exactInput) {
                     uint64 got;
-                    (needIn, got) = fillOrderForInput(
-                        ordFill,
-                        baseForQuote,
-                        needIn
-                    );
+                    (needIn, got) = fillOrderForInput(oFill, baseForQuote, needIn);
                     output += got;
+                    progress = got;
                 } else {
-                    uint64 need;
-                    (needOut, need) = fillOrderForOutput(
-                        ordFill,
-                        baseForQuote,
-                        needOut
-                    );
-                    input += need;
+                    uint64 req;
+                    (needOut, req) = fillOrderForOutput(oFill, baseForQuote, needOut);
+                    needIn += req;
+                    progress = req;
                 }
+                if ((baseForQuote ? oFill.quoteAmountReserve : oFill.baseAmountReserve) == 0)
+                    ++oPtr;
 
-                // advance cursor if this order is empty in the chosen direction
-                if (
-                    (baseForQuote && ordFill.quoteAmountReserve == 0) ||
-                    (!baseForQuote && ordFill.baseAmountReserve == 0)
-                ) ++oPtr;
-            } else {
-                // take from float
-                Float storage fltFill = floatsNormal[uint64(floats[fPtr])];
-
+            } else if (best == Src.FLT) {
+                Float storage fFill = floatsNormal[uint64(floats[fPtr])];
                 if (exactInput) {
                     uint64 got;
                     (needIn, got) = fillFloatForInput(
-                        fltFill,
-                        baseForQuote,
-                        needIn,
-                        twapDir
+                        fFill, baseForQuote, needIn, twapDir
                     );
-                    output += got;
+                    output  += got;
+                    progress = got;
                 } else {
-                    uint64 need;
-                    (needOut, need) = fillFloatForOutput(
-                        fltFill,
-                        baseForQuote,
-                        needOut,
-                        twapDir
+                    uint64 req;
+                    (needOut, req) = fillFloatForOutput(
+                        fFill, baseForQuote, needOut, twapDir
                     );
-                    input += need;
+                    needIn  += req;
+                    progress = req;
                 }
+                if ((baseForQuote ? fFill.quoteAmountReserve : fFill.baseAmountReserve) == 0)
+                    ++fPtr;
 
-                if (
-                    (baseForQuote && fltFill.quoteAmountReserve == 0) ||
-                    (!baseForQuote && fltFill.baseAmountReserve == 0)
-                ) ++fPtr;
+            } else {
+                /* Src.POOL – consistent return signature: (out, newR0, newR1) */
+                if (exactInput) {
+                    uint64 outGen;
+                    (outGen, r0, r1) = _poolFillExactIn(baseForQuote, needIn, r0, r1);
+                    needIn  = 0;              // all net input spent
+                    output += outGen;
+                    progress = outGen;
+                } else {
+                    uint64 inReq;
+                    (inReq, r0, r1) = _poolFillExactOut(baseForQuote, needOut, r0, r1);
+                    needOut  = 0;
+                    needIn  += inReq;
+                    progress = inReq;
+                }
             }
+
+            /* Guard: if nothing progressed we bail to avoid gas-death */
+            if (progress == 0) break;
         }
 
-        /*─────────────────── 4. Slippage guard & tallies ─────────────────────*/
+        /* ─────────────────── 5. Finalise fee for exact-OUT path ─────────── */
+        if (!exactInput) {
+            uint128 fee = (uint128(needIn) * feePpm + 999_999) / 1_000_000;
+            feeAcc = uint64(fee);
+            input  = needIn + feeAcc;      // total pull
+        }
+
+        /* ─────────────────── 6. Slippage check - caller guarantees ─────── */
         if (exactInput) {
-            require(output >= limit, "QSP:min-out slippage");
-            input = amount; // caller's exact input
+            require(output >= limit, "QSP:min-out");
         } else {
-            require(input <= limit, "QSP:max-in slippage");
-            output = amount; // caller's exact output
+            require(input  <= limit, "QSP:max-in");
+            output = amount;               // promised exact output
         }
 
-        /*─────────────────── 5. Token transfers (CEI) ────────────────────────*/
+        /* ─────────────────── 7. Credit protocol fee to reserves ─────────── */
+        if (feeAcc != 0) {
+            if (baseForQuote) r0 += feeAcc;
+            else              r1 += feeAcc;
+        }
+
+        /* ─────────────────── 8. Flush pool reserves (2 SSTOREs) ─────────── */
+        if (r0 != _cp.reserve0) _cp.reserve0 = r0;
+        if (r1 != _cp.reserve1) _cp.reserve1 = r1;
+
+        /* ─────────────────── 9. External token transfers (CEI) ─────────── */
         if (baseForQuote) {
-            if (input > 0)
-                require(
-                    BASE.transferFrom(msg.sender, address(this), input),
-                    "BASE transferFrom failed"
-                );
-            if (output > 0)
-                require(
-                    QUOTE.transfer(msg.sender, output),
-                    "QUOTE transfer failed"
-                );
+            if (input  != 0) BASE.transferFrom(msg.sender, address(this), input);
+            if (output != 0) QUOTE.transfer(msg.sender, output);
         } else {
-            if (input > 0)
-                require(
-                    QUOTE.transferFrom(msg.sender, address(this), input),
-                    "QUOTE transferFrom failed"
-                );
-            if (output > 0)
-                require(
-                    BASE.transfer(msg.sender, output),
-                    "BASE transfer failed"
-                );
+            if (input  != 0) QUOTE.transferFrom(msg.sender, address(this), input);
+            if (output != 0) BASE.transfer(msg.sender, output);
         }
 
-        // Base volume exchanged this swap (always in 64-bit universe)
-        uint64 baseVol = baseForQuote ? input : output;
-        if (baseVol > 0) {
-            /* quote-per-base price in Q32.32 */
-            uint64 priceQ32_32 = baseForQuote
-                ? uint64((uint128(output) << 32) / input) // quote / base
-                : uint64((uint128(input) << 32) / output); // quote / base
-
-            // Single oracle note – matcher would normally call this,
-            // but an on-chain path that goes through `execute` must too.
-            _twap.recordNote(priceQ32_32, baseVol);
+        /* ─────────────────── 10. One oracle note on *net* trade ─────────── */
+        uint64 netBaseVol = baseForQuote ? (input - feeAcc) : output;
+        if (netBaseVol != 0) {
+            uint64 pxQ32 = baseForQuote
+                ? uint64((uint128(output) << 32) / netBaseVol)      // quote / base
+                : uint64((uint128(input - feeAcc) << 32) / output); // quote / base
+            _twap.recordNote(pxQ32, netBaseVol);
         }
     }
 
