@@ -99,6 +99,24 @@ struct Protocol {
     uint192 yAcc;
 }
 
+/* External links, descriptors, icons, etc */
+struct ProtocolMetadata {
+    string uri;
+    string icon;
+    string name;
+    string desc;
+    string[] risks;
+    string[] rewards;
+}
+
+/* contains protocol metadata */
+event ProtocolSignal (
+    uint64 indexed pid,
+    ProtocolMetadata metadata
+);
+
+event ControllerChanged(uint64 indexed pid, address ctrl, bool added);
+
 struct Reserved {
     uint128 inStart;
     uint128 outStart;
@@ -114,44 +132,6 @@ struct Account {
     uint56 lock; // if 0, no lockup
 }
 
-struct AirLock {
-    uint64 startTime;
-    uint64 duration;
-}
-
-event AirDropCreated (uint64 indexed dropId, IZRC20 indexed token, uint64 startsAt, uint64 endsAt);
-
-event AirDropClaimed (uint64 indexed dropId, address indexed who, uint64 amount);
-
-struct AirDrop {
-    IZRC20 token;
-    address burner; // where to send remaining tokens after endTime
-    uint64 remaining; // total airdrop tokens available
-    uint64 perToken; // unit airdrop tokens per unit of claiming token
-    uint64 perWalletMax; // 0 = no limit, else max per wallet claiming
-    uint64 startTime; // wallet must be locked before (or at) this time
-    // if claiming wallet's unlock date is earlier, their lock is extended
-    uint64 endTime; // cannot claim upon or after this time
-}
-
-event AirDropNotification (
-    address indexed token,
-    string icon,
-    string name,
-    string desc,
-    string link,
-    uint64 startsAt,
-    uint64 endsAt
-);
-
-struct AirDropMetaData {
-    IZRC20 token;
-    string icon;
-    string name;
-    string desc;
-    string link;
-}
-
 contract WrappedQRL is
     IYieldProtocol,
     IZRC20,
@@ -163,10 +143,19 @@ contract WrappedQRL is
     /*──────── Storage ────────*/
     mapping(address => Account) private _acct;
     mapping(address => mapping(address => uint64)) private _allow;
-    mapping(address => mapping(uint64 => bool)) private _airdropClaimed;
 
-    AirDrop[] private _drops;
-    AirLock[] private _locks;
+    /*───────────────────────────────────────────────────────────────────────────────*
+    │ ControllerRegistry – fixed-size whitelist per protocol                        │
+    │                                                                               │
+    │ • _isCtrl[pid][addr]    → O(1) auth check used by the onlyController modifier │
+    │ • _ctrlList[pid][i]     → dense 0-terminated array for enumeration           │
+    │ • _ctrlCnt[pid]         → current number of controllers ( 1 ≤ cnt ≤ MAX_CTRL )│
+    *───────────────────────────────────────────────────────────────────────────────*/
+    uint8  constant MAX_CTRL = 8;                       // hard cap keeps loops tiny
+    mapping(uint64 => mapping(address => bool)) _isCtrl; // pid → addr → is-member
+    mapping(uint64 => address[MAX_CTRL])       _ctrlList; // pid → dense array
+    mapping(uint64 => uint8)                   _ctrlCnt;  // pid → current length
+
     Protocol[] private _prot;
     Reserved[] private _res;
     Member[] private _mem;
@@ -184,8 +173,6 @@ contract WrappedQRL is
 
     /*──────── Constructor ────────*/
     constructor() payable {
-        _drops.push(); // not necessary, but for consistency
-        _locks.push();
         _prot.push();
         _res.push();
         _mem.push();
@@ -200,161 +187,17 @@ contract WrappedQRL is
         }
     }
 
-    /* v---- AIRDROPS ----v */
+    event AccountLocked(address wallet, uint56 endsAt);
 
-    function lock(uint64 duration) external nonReentrant {
-        require(duration > 0, "zero");
-        require(duration <= MAX_LOCK_WIN, "max");
+    function lock(uint56 endsAt) external nonReentrant {
         Account storage a = _acct[msg.sender];
-        require(a.lock == 0, "active");
-        _locks.push(AirLock(uint64(block.timestamp), duration));
-        a.lock = uint56(_locks.length - 1);
-        emit LockupStarted(msg.sender, uint64(block.number), duration);
+        a.lock = endsAt;
+        emit AccountLocked(msg.sender, endsAt);
     }
 
-    function lockInfo(
-        address who
-    ) external view returns (uint64 start, uint64 duration, uint64 end) {
-        Account storage a = _acct[who];
-        if (a.lock != 0) {
-            AirLock storage l = _locks[a.lock];
-            start = l.startTime;
-            duration = l.duration;
-            end = start + duration;
-        } else {
-            start = 0;
-            duration = 0;
-            end = 0;
-        }
+    function unlocksAt(address who) external view returns (uint56) {
+        return _acct[who].lock;
     }
-
-    function drop(
-        AirDrop calldata airdrop,
-        AirDropMetaData calldata metadata
-    ) external {
-        require(address(airdrop.token) != address(0), "token0");
-        // require(airdrop.burner != address(0), "burner0");
-        require(airdrop.remaining > 0, "remaining0");
-        require(airdrop.perToken > 0, "perToken0");
-        require(airdrop.startTime < airdrop.endTime, "time");
-        // move tokens to this contract
-        IZRC20(airdrop.token).transferFrom(
-            msg.sender,
-            address(this),
-            airdrop.remaining
-        );
-        _drops.push(airdrop);
-        emit AirDropCreated(
-            uint64(_drops.length - 1),
-            airdrop.token,
-            airdrop.startTime,
-            airdrop.endTime
-        );
-        emit AirDropNotification(
-            address(airdrop.token),
-            metadata.icon,
-            metadata.name,
-            metadata.desc,
-            metadata.link,
-            airdrop.startTime,
-            airdrop.endTime
-        );
-    }
-
-    function dropInfo(
-        uint64 dropId
-    )
-        external
-        view
-        returns (
-            IZRC20 token,
-            address burner,
-            uint64 remaining,
-            uint64 perToken,
-            uint64 perWalletMax,
-            uint64 startTime,
-            uint64 endTime
-        )
-    {
-        require(dropId < _drops.length && dropId != 0, "drop");
-        AirDrop storage d = _drops[dropId];
-        return (
-            d.token,
-            d.burner,
-            d.remaining,
-            d.perToken,
-            d.perWalletMax,
-            d.startTime,
-            d.endTime
-        );
-    }
-
-    function burn(uint64 dropId) external {
-        require(dropId < _drops.length && dropId != 0, "drop");
-        AirDrop storage d = _drops[dropId];
-        // require(d.burner != address(0), "burner0");
-        // require airdrop has ended
-        require(block.timestamp >= d.endTime, "active");
-        uint64 amt = d.remaining;
-        d.remaining = 0;
-        d.token.transfer(d.burner, amt);
-    }
-
-    function claimAll(uint64[] calldata drops) external {
-        uint64 len = uint64(drops.length);
-        require(len > 0, "empty");
-        for (uint64 i = 0; i < len; ++i) {
-            claimOne(drops[i]);
-        }
-    }
-
-    /**
-     * Performs the cap-claim math and transfers funds to the caller
-     * if they are available. If not enough is available, the remaining
-     * amount is transferred and the airdrop is left empty as a result.
-     * If the caller has already claimed, or if the airdrop is not active,
-     * this function will revert. Updates the caller's lock window duration
-     * such that the lock ends at this airdrop's end time, if the end time
-     * of the caller's lock is before the end time of the airdrop.
-     * 
-     * Requirements:
-     * - `drop` must be a valid airdrop ID (non-zero and within range).
-     * - Current time must be within the airdrop's start and end times.
-     * - Caller must not have already claimed this airdrop.
-     * - Caller must have an active lock that started before or at the airdrop's start time.
-     * - The airdrop must have remaining tokens to claim.
-     * - If the calculated claim amount exceeds the airdrop's remaining tokens,
-     *   it will be capped to the remaining amount.
-     */
-    function claimOne(uint64 drop_) internal {
-        require(drop_ < _drops.length && drop_ != 0, "drop");
-        AirDrop storage d = _drops[drop_];
-        require(
-            block.timestamp >= d.startTime && block.timestamp < d.endTime,
-            "time"
-        );
-        require(!_airdropClaimed[msg.sender][drop_], "claimed");
-        Account storage a = _acct[msg.sender];
-        require(a.lock != 0, "no-lock");
-        AirLock storage l = _locks[a.lock];
-        require(l.startTime <= d.startTime, "lock-time");
-        uint64 amt = (uint64(a.bal) * d.perToken);
-        if (d.perWalletMax > 0 && amt > d.perWalletMax) amt = d.perWalletMax;
-        require(amt > 0, "zero");
-        if (amt > d.remaining) amt = d.remaining;
-        d.remaining -= amt;
-        _airdropClaimed[msg.sender][drop_] = true;
-        d.token.transfer(msg.sender, amt);
-        emit AirDropClaimed(drop_, msg.sender, amt);
-        // extend lock if needed
-        uint64 lockEnd = l.startTime + l.duration;
-        if (lockEnd < d.endTime) {
-            l.duration = uint64(d.endTime - l.startTime);
-            emit LockupStarted(msg.sender, uint64(block.number), l.duration);
-        }
-    }
-
-    // ^---- AIRDROPS ----^
 
     // "We made it happen... we're the chosen ones!"
     function theme() external pure returns (string memory) {
@@ -362,8 +205,9 @@ contract WrappedQRL is
     }
 
     /*──────── Modifiers ────────*/
+    /// @dev Caller must be an authorised controller for this protocol ID.
     modifier onlyController(uint64 pid) {
-        require(msg.sender == _prot[pid].ctrl, "ctrl");
+        require(_isCtrl[pid][msg.sender], "ctrl");
         _;
     }
 
@@ -375,9 +219,26 @@ contract WrappedQRL is
     ) public override returns (uint64 id) {
         require(ctrl != address(0), "ctrl0");
         require(lockWin <= MAX_LOCK_WIN, "lockWin");
+
         id = uint64(_prot.length);
-        _prot.push(Protocol(ctrl, minStake, lockWin, 0, 0, 0, 0, 0));
+        _prot.push(Protocol(ctrl /* kept for back-compat but unused in auth */,
+                            minStake,
+                            lockWin,
+                            0,0,0,0,0));
+
+        // ---------- initialise controller set ----------
+        _isCtrl[id][ctrl] = true;
+        _ctrlList[id][0]  = ctrl;
+        _ctrlCnt[id]      = 1;
+
         emit ProtocolCreated(id, ctrl, lockWin, minStake);
+    }
+
+    function signalProtocol(
+        uint64 pid,
+        ProtocolMetadata calldata metadata
+    ) external onlyController(pid) returns (uint64 id) {
+        emit ProtocolSignal(id, metadata);
     }
 
     function setMinStake(
@@ -386,6 +247,74 @@ contract WrappedQRL is
     ) external override onlyController(pid) {
         _prot[pid].minStake = newMin;
         emit MinStakeUpdated(pid, newMin);
+    }
+
+    /*───────────────────────────────────────────────────────────────────────────────*
+    │ Controller mutators – any current controller may call                        │
+    *───────────────────────────────────────────────────────────────────────────────*/
+
+    /// Add a new controller. Reverts if the set is full or duplicate.
+    function addController(uint64 pid, address newCtrl)
+        external
+        onlyController(pid)
+    {
+        require(newCtrl != address(0),       "ctrl0");
+        require(!_isCtrl[pid][newCtrl],      "dupe");
+        uint8 cnt = _ctrlCnt[pid];
+        require(cnt < MAX_CTRL,              "full");
+
+        _isCtrl[pid][newCtrl]  = true;
+        _ctrlList[pid][cnt]    = newCtrl;
+        _ctrlCnt[pid]          = cnt + 1;
+
+        emit ControllerChanged(pid, newCtrl, true);
+    }
+
+    /// Remove an existing controller. Caller must stay ≥1 controller in set.
+    function removeController(uint64 pid, address oldCtrl)
+        external
+        onlyController(pid)
+    {
+        require(_isCtrl[pid][oldCtrl],       "missing");
+        require(_ctrlCnt[pid] > 1,           "last"); // never orphan the protocol
+
+        // Clear slot & compact the dense array
+        uint8 cnt = _ctrlCnt[pid];
+        for (uint8 i; i < cnt; ++i) {
+            if (_ctrlList[pid][i] == oldCtrl) {
+                _ctrlList[pid][i] = _ctrlList[pid][cnt - 1];
+                _ctrlList[pid][cnt - 1] = address(0);
+                break;
+            }
+        }
+        _ctrlCnt[pid] = cnt - 1;
+        _isCtrl[pid][oldCtrl] = false;
+
+        emit ControllerChanged(pid, oldCtrl, false); // semantics: “changed” = membership Δ
+    }
+
+    /// Atomic swap helper – saves one transaction over add→remove.
+    function swapController(uint64 pid, address oldCtrl, address newCtrl)
+        external
+        onlyController(pid)
+    {
+        require(newCtrl != address(0),       "ctrl0");
+        require(_isCtrl[pid][oldCtrl],       "missing");
+        require(!_isCtrl[pid][newCtrl],      "dupe");
+
+        // Replace in dense list
+        uint8 cnt = _ctrlCnt[pid];
+        for (uint8 i; i < cnt; ++i)
+            if (_ctrlList[pid][i] == oldCtrl) {
+                _ctrlList[pid][i] = newCtrl;
+                break;
+            }
+
+        _isCtrl[pid][oldCtrl] = false;
+        _isCtrl[pid][newCtrl] = true;
+
+        emit ControllerChanged(pid, newCtrl, true);
+        emit ControllerChanged(pid, oldCtrl, false);
     }
 
     /*──────── Haircuts & Yield ────────*/
@@ -506,6 +435,19 @@ contract WrappedQRL is
         return true;
     }
 
+    function transferBatch(
+        address[] calldata to,
+        uint64[] calldata v
+    ) external nonReentrant returns (bool) {
+        require(to.length == v.length, "len");
+        _harvest(msg.sender);
+        for (uint256 i; i < to.length; ++i) {
+            _harvest(to[i]);
+            _xfer(msg.sender, to[i], v[i]);
+        }
+        return true;
+    }
+
     function transfer(
         address to,
         uint64 v
@@ -513,6 +455,30 @@ contract WrappedQRL is
         _harvest(msg.sender);
         _harvest(to);
         _xfer(msg.sender, to, v);
+        return true;
+    }
+
+    function transferFromBatch(
+        address from,
+        address[] calldata to,
+        uint64[] calldata v
+    ) external nonReentrant returns (bool) {
+        require(to.length == v.length, "len");
+
+        uint64 cur = _allow[from][msg.sender];
+        uint64 tot;
+        for (uint256 i; i < v.length; ++i) tot += v[i];
+        require(cur >= tot, "allow");
+        if (cur != type(uint64).max) {
+            _allow[from][msg.sender] = cur - tot;
+            emit Approval(from, msg.sender, cur - tot);
+        }
+
+        _harvest(from);
+        for (uint256 i; i < to.length; ++i) {
+            _harvest(to[i]);
+            _xfer(from, to[i], v[i]);
+        }
         return true;
     }
 
@@ -545,28 +511,58 @@ contract WrappedQRL is
         return 0;
     }
 
+    /**
+     * @notice Zero-fee flash-loan of WQRL-Z.
+     *
+     * @dev   Security guarantees
+     *        --------------------
+     *        1. **Front-run allowance** – we abort if any allowance for
+     *           `address(this)` exists _before_ the loan (msg `"pre-allow"`).
+     *        2. **Callback magic**     – borrower must return `_FLASH_OK`
+     *           (msg `"cb"` on mismatch).
+     *        3. **Exact repayment**    – post-callback allowance must have
+     *           grown by _exactly_ `amt`; otherwise we revert with `"repay"`.
+     *        4. **Balance invariant**  – borrower’s net balance ends unchanged.
+     *
+     *        Gas impact versus the original: +1 SLOAD (allowAfter) and a
+     *        single comparison—negligible.
+     */
     function flashLoan(
         IZ156FlashBorrower r,
         address t,
         uint64 amt,
         bytes calldata d
     ) external override nonReentrant returns (bool) {
-        require(t == address(this), "tok");
-        require(!_hasMembership(address(r)), "member");
+        /*─────────────────────── pre-flight guards ────────────────────────*/
+        require(t == address(this),            "tok");            // wrong token
         address borrower = address(r);
-        require(msg.sender == borrower, "receiver mismatch");
-        uint64 balBefore = _acct[borrower].bal;
+        require(msg.sender == borrower,        "receiver mismatch");
+        require(!_hasMembership(borrower),     "member");         // disallow nested stake
         require(_allow[borrower][address(this)] == 0, "pre-allow");
-        require(amt <= MAX_BAL - _tot, "supply");
-        _mint(borrower, amt);
-        require(r.onFlashLoan(address(this), t, amt, 0, d) == _FLASH_OK, "cb");
-        uint64 allow = _allow[borrower][address(this)];
-        require(allow >= amt, "repay");
-        _allow[borrower][address(this)] = allow - amt;
-        emit Approval(borrower, address(this), allow - amt);
-        _burn(borrower, amt);
-        require(_acct[borrower].bal == balBefore, "bal-change");
-        _refreshSnap(borrower);
+        require(amt <= MAX_BAL - _tot,         "supply");
+
+        /*──────────────────── snapshot original state ─────────────────────*/
+        uint64 balBefore   = _acct[borrower].bal; // balance integrity
+        uint64 allowBefore = 0;                   // confirmed above
+
+        /*────────────────────────── execute loan ──────────────────────────*/
+        _mint(borrower, amt);                                        // grant funds
+        require(
+            r.onFlashLoan(address(this), t, amt, 0, d) == _FLASH_OK,
+            "cb"
+        );
+
+        /*─────────────────────── verify repayment ─────────────────────────*/
+        uint64 allowAfter = _allow[borrower][address(this)];
+        require(allowAfter == amt + allowBefore, "repay");           // exact delta
+
+        _allow[borrower][address(this)] = allowAfter - amt;          // consume
+        emit Approval(borrower, address(this), allowAfter - amt);
+
+        _burn(borrower, amt);                                        // burn return
+        require(_acct[borrower].bal == balBefore, "bal-change");     // no drift
+        _refreshSnap(borrower);                                      // sync stake
+
         return true;
     }
 
@@ -699,32 +695,68 @@ contract WrappedQRL is
         emit Left(msg.sender, pid);
     }
 
-    /* propagation */
+    /**
+     * @notice  Mirrors an account-level balance change (`delta`) into every
+     *          protocol membership the wallet holds.
+     *
+     * @param who      The wallet whose stake snapshots are being updated.
+     * @param delta    Signed change in the wallet’s token balance.
+     *                 * > 0*  → balance increases.  
+     *                 * < 0*  → balance decreases.
+     * @param skipPid  Protocol ID whose global totals should **not** be touched
+     *                 (used by mint / burn helpers to avoid double-counting).
+     *
+     * @dev  Invariant: `p.inBal`, `rs.inStart`, `m.stake` are all ≥ 0 at all
+     *       times; any decrement must therefore be bounds-checked first.
+     *
+     *       Revision “laser fix” adds those explicit guards so an unexpected
+     *       negative `delta` can never wrap the counters.
+     */
     function _propagate(address who, int256 delta, uint64 skipPid) internal {
-        if (delta == 0) return;
+        if (delta == 0) return;                      // fast-exit
+
         Account storage a = _acct[who];
+
+        // MAX_SLOTS is a compile-time 8, so the loop is tight and cheap.
         for (uint8 s; s < MAX_SLOTS; ++s) {
-            if ((a.mask & (1 << s)) == 0) continue;
-            Member storage m = _member(a, s);
-            Protocol storage p = _prot[m.pid];
+            if ((a.mask & (1 << s)) == 0) continue; // unused slot
+
+            Member   storage m  = _member(a, s);
+            Protocol storage p  = _prot[m.pid];
             Reserved storage rs = _res[m.resPtr];
+
             bool skip = (m.pid == skipPid);
+
             if (delta > 0) {
-                uint128 d = uint128(uint256(delta));
+                /* -------- balance increases -------- */
+                uint128 d = uint128(uint256(delta));       // |delta| fits 64-bit
+
                 if (!skip) {
-                    p.inBal += d;
-                    rs.inStart += d;
+                    p.inBal   += d;                        // grow protocol stake
+                    rs.inStart += d;                       // grow snapshot base
                 }
-                m.stake += uint64(d);
-                if (skip) rs.inStart += d;
+
+                m.stake += uint64(d);                      // grow member stake
+
+                if (skip) rs.inStart += d;                 // keep invariants
+
             } else {
-                uint128 d = uint128(uint256(-delta));
+                /* -------- balance decreases -------- */
+                uint128 d = uint128(uint256(-delta));      // |delta| fits 64-bit
+
+                // --- new explicit guards (prevent underflow / wraparound) ---
+                require(m.stake    >= d, "stake<delta");
+                require(rs.inStart >= d, "inStart<delta");
+                if (!skip) require(p.inBal >= d, "inBal<delta");
+
                 if (!skip) {
-                    p.inBal -= d;
+                    p.inBal   -= d;
                     rs.inStart -= d;
                 }
+
                 m.stake -= uint64(d);
-                if (skip) rs.inStart -= d;
+
+                if (skip) rs.inStart -= d;                 // keep invariants
             }
         }
     }
@@ -812,8 +844,8 @@ contract WrappedQRL is
         Account storage fa = _acct[f];
         // require the account is unlocked
         if (fa.lock != 0) {
-            AirLock storage l = _locks[fa.lock];
-            require(block.timestamp >= l.startTime + l.duration, "locked");
+            require(block.timestamp >= fa.lock, "locked");
+            fa.lock = 0;
         }
         for (uint8 s; s < MAX_SLOTS; ++s)
             if ((fa.mask & (1 << s)) != 0)

@@ -2,7 +2,6 @@
 pragma solidity ^0.8.24;
 
 import "lib/forge-std/src/Test.sol";
-import "../src/_token.sol";
 import {IZ156FlashBorrower} from "../src/IZ156Flash.sol";
 import {IZRC20} from "../src/IZRC20.sol";
 import {WrappedQRL} from "../src/_native.sol";
