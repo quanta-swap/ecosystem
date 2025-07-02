@@ -185,13 +185,11 @@ contract WQ is IZRC20 {
         uint256 len = dst.length;
         require(len == wad.length, "len");
 
-        unchecked {
-            for (uint256 i; i < len; ++i) {
-                require(
-                    transferFrom(src, dst[i], wad[i]),
-                    "xfer fail"
-                );
-            }
+        for (uint256 i; i < len; ++i) {
+            require(
+                transferFrom(src, dst[i], wad[i]),
+                "xfer fail"
+            );
         }
         return true;
     }

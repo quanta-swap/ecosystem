@@ -269,23 +269,19 @@ contract Crowdsaler is ReentrancyGuard {
         require(msg.sender == cs.controller, "not ctrl");
         require(!cs.controllerClaimed, "claimed");
 
+        uint64 unsold;               // track unsold output for event
         if (cs.raisedAmount >= cs.minimumRaise) {
             uint64 raised = cs.raisedAmount;
             cs.controllerClaimed = true;
-            if (raised > 0)
-                require(cs.input.transfer(msg.sender, raised), "xfer");
+            if (raised > 0) cs.input.transfer(msg.sender, raised);
+            unsold = 0;
         } else {
-            uint64 unsold = cs.outputAmount;
+            unsold = cs.outputAmount;
             cs.controllerClaimed = true;
-            if (unsold > 0)
-                require(cs.output.transfer(msg.sender, unsold), "xfer");
+            if (unsold > 0) cs.output.transfer(msg.sender, unsold);
         }
-        emit CrowdsaleControllerClaimed(
-            id,
-            msg.sender,
-            cs.raisedAmount,
-            cs.outputAmount
-        );
+
+        emit CrowdsaleControllerClaimed(id, msg.sender, cs.raisedAmount, unsold);
     }
 
     // After a successful sale, let controller sweep leftover output once:
@@ -298,9 +294,10 @@ contract Crowdsaler is ReentrancyGuard {
         require(cs.totalClaimedOut == cs.outputAmount, "claims open");
         require(cs.controllerClaimed, "ctrl unclaimed");
 
-        uint64 dust = uint64(cs.output.balanceOf(address(this)));
+        uint64 dust = cs.outputAmount - cs.totalClaimedOut; // safe: uint64
         require(dust > 0, "no dust");
-        require(cs.output.transfer(msg.sender, dust), "xfer");
+        cs.output.transfer(msg.sender, dust);
+
         emit CrowdsaleDustWithdrawn(id, msg.sender, dust);
     }
 }

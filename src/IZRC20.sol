@@ -22,7 +22,7 @@ pragma solidity ^0.8.24;
  */
 interface IZRC20 {
     /*──────────────────────────────────
-    │  ERC-20 Events (uint64 amounts)  │
+    │  ZRC-20 Events (uint64 amounts)  │
     └──────────────────────────────────*/
     event Transfer(
         address indexed from,
@@ -44,16 +44,20 @@ interface IZRC20 {
     function decimals()    external pure returns (uint8); // SHOULD return 8-18
 
     /*───────────────────────────────
-    │  ERC-20 Read-only Functions   │
+    │  ZRC-20 Read-only Functions   │
     └───────────────────────────────*/
     function totalSupply() external view returns (uint64);
     function balanceOf(address account) external view returns (uint64);
     function allowance(address owner, address spender) external view returns (uint64);
 
     /*───────────────────────────────
-    │  ERC-20 State-changing Calls  │
+    │  ZRC-20 State-changing Calls  │
     └───────────────────────────────*/
     function transfer(address to, uint64 amount) external returns (bool);
+    function transferBatch(
+        address[] calldata dst,
+        uint64[] calldata wad
+    ) external returns (bool success);
 
     function approve(address spender, uint64 amount) external returns (bool);
 
@@ -62,4 +66,10 @@ interface IZRC20 {
         address to,
         uint64 amount
     ) external returns (bool);
+    function transferFromBatch(
+        address src,
+        address[] calldata dst,
+        uint64[] calldata wad
+    ) external returns (bool success);
+
 }
