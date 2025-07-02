@@ -3,11 +3,8 @@ pragma solidity ^0.8.24;
 
 import {IZRC20} from "./IZRC20.sol";   // adjust the relative path if needed
 import {IZ156FlashBorrower, IZ156FlashLender} from "./IZ156Flash.sol"; // adjust the relative path if needed
-/*───────────────────────────────────────────────────────────────
-│  IZRC-20 + Z-Flash + Yield-Protocol (64-bit token amounts)
-│  Wrapped QRL – revision “Z-ae”
-│  8 decimals   •   MAX_SUPPLY = 2⁶⁴-1 units  (≈1.84e11 whole coins)
-───────────────────────────────────────────────────────────────*/
+
+// TODO: Make this into the stablecoin dollar contract instead.
 
 /* ───────────────  Re-entrancy guard  ─────────────── */
 abstract contract ReentrancyGuard {
@@ -107,6 +104,7 @@ struct ProtocolMetadata {
     string desc;
     string[] risks;
     string[] rewards;
+    string alert;
 }
 
 /* contains protocol metadata */
