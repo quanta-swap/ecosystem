@@ -835,4 +835,119 @@ contract WrapperTokenManual is Test {
         );
         assertEq(aliceAfter2, aliceAfter1, "balance changed on second harvest");
     }
+
+    /**
+     * After a controller reserves a haircut, any outgoing `transfer`
+     * must re-run `_harvest()` first, which burns part of the wallet’s
+     * stake.  Attempting to move the *pre-haircut* amount therefore
+     * fails with `bal`.
+     */
+    function testTransferFailsAfterHaircutHarvest() external {
+        uint64 pid = 1;
+
+        /* Alice stakes 10 tok & joins the protocol. */
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = pid;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        /* Controller reserves a 6 tok haircut (burn will be > 0). */
+        vm.prank(CTL);
+        w.signalHaircut(pid, 6 * ONE);
+
+        /* Roll past the 1-second lock-up so the ‘locked’ guard won’t trip. */
+        vm.warp(block.timestamp + 365 days);
+
+        /* Alice tries to transfer her original 10 tok – must revert. */
+        vm.prank(AL);
+        vm.expectRevert();
+        w.transfer(BO, 10 * ONE);
+    }
+
+    /**
+     * Same scenario as above but routed through `transferFrom`.
+     * 1.  Alice approves Bob.
+     * 2.  Controller reserves a haircut.
+     * 3.  Bob’s `transferFrom` re-harvests Alice → burn → insufficient bal.
+     */
+    function testTransferFromFailsAfterHaircutHarvest() external {
+        uint64 pid = 1;
+
+        /* Alice stakes 10 tok & joins. */
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = pid;
+        w.setMembership(join, 0);
+        w.approve(BO, 10 * ONE);          // grant allowance to Bob
+        vm.stopPrank();
+
+        /* Controller reserves a 6 tok haircut. */
+        vm.prank(CTL);
+        w.signalHaircut(pid, 6 * ONE);
+
+        /* Advance time past the slot-level unlock. */
+        vm.warp(block.timestamp + 365 days);
+
+        /* Bob pulls – harvest fires first, balance now < 10 tok → revert. */
+        vm.prank(BO);
+        vm.expectRevert();
+        w.transferFrom(AL, BO, 10 * ONE);
+    }
+
+    /**
+     * @notice
+     *     Sole-staker scenario:
+     *       • Alice joins a fresh protocol as the ONLY member.
+     *       • Controller contributes +1 token yield.
+     *       • A `forceHarvest` must credit Alice with **exactly** that 1 token,
+     *         and must NOT change `totalSupply` (pure redistribution).
+     */
+    function testSoloStakerHarvestsFullYield() external {
+        /* 0️⃣  Spin-up an empty protocol (pid = 2) */
+        uint64 pid = w.createProtocol(CTL, 1, ONE);     // lockWin = 1 blk
+
+        /* 1️⃣  Alice stakes 2 tok and joins – she’s the sole member */
+        vm.startPrank(AL);
+        w.deposit{value: 2 * WEI_ONE}();                // mint 2 tok
+        uint64[8] memory join; join[0] = pid;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        /* 2️⃣  Controller funds +1 tok yield (needs a token to burn) */
+        vm.prank(CTL);
+        w.deposit{value: WEI_ONE}();                    // fuel CTL’s balance
+        vm.prank(CTL);
+        w.addYield(pid, ONE);                           // contribute yield
+
+        /* 📸  Snapshots before harvest */
+        uint64 balBefore    = w.balanceOf(AL);
+        uint64 supplyBefore = w.totalSupply();
+
+        /* 3️⃣  Force-harvest Alice */
+        address[] memory list = new address[](1);
+        list[0] = AL;
+        w.forceHarvest(list);
+
+        /* ✅  Assertions */
+        uint64 balAfter    = w.balanceOf(AL);
+        uint64 supplyAfter = w.totalSupply();
+
+        // (a) Alice got the full 1 token
+        assertEq(
+            balAfter - balBefore,
+            ONE,
+            "yield not fully credited to sole staker"
+        );
+
+        // (b) No mint / burn happened – supply unchanged
+        assertEq(
+            supplyAfter,
+            supplyBefore,
+            "totalSupply changed on pure-yield harvest"
+        );
+    }
+
 }

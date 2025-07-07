@@ -136,9 +136,6 @@ struct ProtocolMetadata {
     string alert;
 }
 
-/* contains protocol metadata */
-event ProtocolSignal(uint64 indexed pid, ProtocolMetadata metadata);
-
 event ControllerChanged(uint64 indexed pid, address ctrl, bool added);
 
 struct Reserved {
@@ -162,6 +159,9 @@ contract WrappedQRL is
     IZ156FlashLender,
     ReentrancyGuard
 {
+    /* contains protocol metadata */
+    event ProtocolSignal(uint64 indexed pid, ProtocolMetadata metadata);
+
     uint64 public constant MAX_LOCK_WIN = 365 days; // ≈ 1 year (Ethereum blocks)
 
     /*──────── Storage ────────*/
@@ -678,19 +678,8 @@ contract WrappedQRL is
         for (uint8 i; i < MAX_SLOTS && cur < MAX_SLOTS; ++i) {
             uint64 pid = addPids[i];
             if (pid == 0 || _mark[pid] != tag) continue; // not requested
-
-            bool already;
-            for (uint8 s; s < MAX_SLOTS; ++s) {
-                // O(8) scan
-                if ((a.mask & (1 << s)) != 0 && _member(a, s).pid == pid) {
-                    already = true; // already joined
-                    break;
-                }
-            }
-            if (!already) {
-                _joinPid(a, pid); // join new protocol
-                ++cur;
-            }
+            _joinPid(a, pid); // join new protocol
+            ++cur;
         }
     }
 
@@ -813,7 +802,7 @@ contract WrappedQRL is
 
                 m.stake += uint64(d); // grow member stake
 
-                if (skip) rs.inStart += d; // keep invariants
+                // if (skip) rs.inStart += d; // unused now
             } else {
                 /* -------- balance decreases -------- */
                 uint128 d = uint128(uint256(-delta)); // |delta| fits 64-bit
@@ -830,7 +819,7 @@ contract WrappedQRL is
 
                 m.stake -= uint64(d);
 
-                if (skip) rs.inStart -= d; // keep invariants
+                // if (skip) rs.inStart -= d; // unused now
             }
         }
     }
@@ -1082,9 +1071,9 @@ contract WrappedQRL is
                     uint128 d = uint128(uint128(-delta[i]));
                     require(ps.inBal >= d, "inBal<delta");
                     ps.inBal -= d;
-                } else if (delta[i] > 0) {
-                    ps.inBal += uint128(delta[i]);
-                }
+                } // else if (delta[i] > 0) { // unreachable
+                //    ps.inBal += uint128(delta[i]); // unreachable
+                // }
 
                 if (ownCut[i] != 0) ps.burned += ownCut[i];
             }

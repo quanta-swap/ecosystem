@@ -8,111 +8,125 @@ pragma solidity ^0.8.24;
 import "lib/forge-std/src/Test.sol";
 import {WrappedQRL} from "../src/_native.sol";
 
-uint64 constant ONE = 1e9;          // 1 token (9-dec)
-uint256 constant WEI_ONE = ONE * 1e9;
+uint64 constant ONE     = 1e9;          // 1 token (9-dec)
+uint256 constant WEI_ONE = ONE * 1e9;   // 1 token in wei (18-dec)
 
 contract WrapperTokenAdmin is Test {
     /* actors */
-    address internal constant CTL  = address(0xC01);  // bootstrap controller
-    address internal constant BO   = address(0xB02);  // random user
+    address internal constant CTL  = address(0xC01); // bootstrap controller
+    address internal constant BO   = address(0xB02); // random user
     address internal constant ALT1 = address(0xA51);
     address internal constant ALT2 = address(0xA52);
     address internal constant ALT3 = address(0xA53);
 
     WrappedQRL internal w;
-    uint64      pid;                     // protocol created in setUp()
+    uint64      pid;
 
-    /*──────────────────── fixture ────────────────────*/
+    /*──────────────────────── fixture ────────────────────────*/
     function setUp() external {
         vm.deal(CTL , 40 ether);
         vm.deal(ALT1, 40 ether);
         vm.deal(ALT2, 40 ether);
         vm.deal(ALT3, 40 ether);
 
-        w = new WrappedQRL();
-
-        // controller boot-straps protocol #1 (lockWin = 1 blk, minStake = 1)
-        pid = w.createProtocol(CTL, 1, ONE);
+        w   = new WrappedQRL();
+        pid = w.createProtocol(CTL, 1, ONE);  // lockWin = 1 blk, minStake = 1
     }
 
     /*═════════════════════════════════════════════════════════════*/
-    /*                  Controller-set manipulation                */
+    /*                     Controller management                   */
     /*═════════════════════════════════════════════════════════════*/
 
-    /// Anyone *but* a controller should be rejected.
+    /// Non-controller callers must be rejected.
     function testAddControllerAuth() external {
         vm.prank(BO);
-        vm.expectRevert();
+        vm.expectRevert();               // default revert on auth fail
         w.addController(pid, ALT1);
     }
 
-    /// Happy-path add: set expands until MAX_CTRL then reverts with "full".
+    /// Happy-path adds until MAX_CTRL, then reverts with "full".
     function testAddControllerUpToCap() external {
-        uint8 max = w.MAX_CTRL();           // getter via instance
+        uint8 max = w.MAX_CTRL();        // public constant getter
 
         vm.startPrank(CTL);
-        // Already have CTL in slot 0 – fill slots 1 … max-1
+        // index 0 already taken by CTL – fill 1 … max-1
         for (uint8 i = 1; i < max; ++i) {
             address a = address(uint160(0xC000 + i));
             w.addController(pid, a);
-            // duplicate add must revert with "dupe"
+
+            // adding the SAME address again must revert with "dupe"
             vm.expectRevert();
             w.addController(pid, a);
         }
 
-        // next add exceeds the cap → "full"
+        // next addition exceeds the cap → "full"
         vm.expectRevert();
         w.addController(pid, ALT1);
         vm.stopPrank();
     }
 
-    /// Removing the last remaining controller must revert with "last".
+    /// Removing the *last* remaining controller is forbidden.
+    /// Also checks that a removed controller really loses its powers.
     function testRemoveLastControllerGuard() external {
-        // First, add ALT1 so CTL can safely leave.
+        /* step 1: add ALT1 so we have two controllers                 */
         vm.prank(CTL);
         w.addController(pid, ALT1);
 
-        // ALT1 removes CTL (allowed) …
+        /* step 2: ALT1 kicks CTL out – should succeed                  */
         vm.prank(ALT1);
         w.removeController(pid, CTL);
 
-        // … but now ALT1 is the *sole* member – removing it should fail.
+        /* NEGATIVE ASSERTION: CTL is no longer able to call controller-gated fn */
+        vm.prank(CTL);
+        vm.expectRevert();
+        w.setMinStake(pid, 2 * ONE);
+
+        /* step 3: ALT1 now sole controller – trying to remove itself should fail */
         vm.prank(ALT1);
         vm.expectRevert();
         w.removeController(pid, ALT1);
     }
 
-    /// swapController: atomic replacement keeps cardinality constant.
+    /// swapController: atomic replacement & old controller loses rights.
     function testSwapController() external {
+        /* Add ALT1 as second controller first */
         vm.prank(CTL);
         w.addController(pid, ALT1);
 
+        /* CTL swaps ALT1 → ALT2 */
         vm.prank(CTL);
-        w.swapController(pid, ALT1, ALT2);  // ALT1 → ALT2
+        w.swapController(pid, ALT1, ALT2);
 
-        // ALT2 is a member, ALT1 is not.
-        ( , , , uint128 inBal,, , ,) = w.protocolInfo(pid);  // dummy read
-        assertTrue(w._isCtrl(pid, ALT2));   // internal mapping is public
-        assertFalse(w._isCtrl(pid, ALT1));
-        // Trying to swap a non-member should revert "missing".
+        /* NEGATIVE ASSERTION: ALT1 can no longer call privileged fn     */
+        vm.prank(ALT1);
+        vm.expectRevert();
+        w.setMinStake(pid, 3 * ONE);
+
+        /* POSITIVE: ALT2 *can* */
+        vm.prank(ALT2);
+        w.setMinStake(pid, 4 * ONE);
+
+        /* swap with non-member must revert "missing"                    */
         vm.prank(CTL);
         vm.expectRevert("missing");
         w.swapController(pid, ALT1, ALT3);
     }
 
     /*═════════════════════════════════════════════════════════════*/
-    /*                        cfg setters                          */
+    /*                          cfg setters                        */
     /*═════════════════════════════════════════════════════════════*/
 
     function testSetMinStake() external {
         uint64 newMin = 5 * ONE;
+
+        /* controller can set */
         vm.prank(CTL);
         w.setMinStake(pid, newMin);
 
-        ( , uint64 minStake,, , , , , ) = w.protocolInfo(pid);
+        (, uint64 minStake, , , , , ,) = w.protocolInfo(pid);
         assertEq(minStake, newMin, "minStake not updated");
 
-        // Non-controller cannot call.
+        /* non-controller rejected */
         vm.prank(BO);
         vm.expectRevert();
         w.setMinStake(pid, ONE);
