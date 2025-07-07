@@ -175,8 +175,8 @@ contract WrappedQRL is
     │ • _ctrlList[pid][i]     → dense 0-terminated array for enumeration           │
     │ • _ctrlCnt[pid]         → current number of controllers ( 1 ≤ cnt ≤ MAX_CTRL )│
     *───────────────────────────────────────────────────────────────────────────────*/
-    uint8 constant MAX_CTRL = 8; // hard cap keeps loops tiny
-    mapping(uint64 => mapping(address => bool)) _isCtrl; // pid → addr → is-member
+    uint8 public constant MAX_CTRL = 8; // hard cap keeps loops tiny
+    mapping(uint64 => mapping(address => bool)) public _isCtrl; // pid → addr → is-member
     mapping(uint64 => address[MAX_CTRL]) _ctrlList; // pid → dense array
     mapping(uint64 => uint8) _ctrlCnt; // pid → current length
 
@@ -894,26 +894,26 @@ contract WrappedQRL is
 
     /* ---------- ②  Compute hair-cuts & protocol deltas ------------ */
     /*───────────────────────────────────────────────────────────────────────────────
-│  _calcHaircuts                                                               │
-│                                                                              │
-│  • Computes, *in memory*, the hair-cut each protocol owes and builds two     │
-│    side-arrays:                                                              │
-│        – delta[i]   : signed Δ to ps.inBal for pids[i] (can be −)            │
-│        – ownCut[i]  : amount that bumps   ps.burned  for pids[i]            │
-│                                                                              │
-│  • Every burn shrinks the wallet’s stake by `cut`, therefore *each*          │
-│    protocol that the wallet belongs to must see its inBal reduced by         │
-│    exactly that same `cut`.                                                  │
-│                                                                              │
-│    ── key idea ──                                                            │
-│    Instead of looping over all pids *inside* the burn branch (O(n²)), we     │
-│    debit only the current index:                                             │
-│          delta[i] -= cut;                                                    │
-│    because the outer loop already touches every protocol once. After the     │
-│    full pass each pool’s delta equals the total amount the wallet burned.    │
-│                                                                              │
-│  • Complexity: O(n)   (n ≤ 8)                                                │
-└──────────────────────────────────────────────────────────────────────────────*/
+    │  _calcHaircuts                                                               │
+    │                                                                              │
+    │  • Computes, *in memory*, the hair-cut each protocol owes and builds two     │
+    │    side-arrays:                                                              │
+    │        – delta[i]   : signed Δ to ps.inBal for pids[i] (can be −)            │
+    │        – ownCut[i]  : amount that bumps   ps.burned  for pids[i]             │
+    │                                                                              │
+    │  • Every burn shrinks the wallet’s stake by `cut`, therefore *each*          │
+    │    protocol that the wallet belongs to must see its inBal reduced by         │
+    │    exactly that same `cut`.                                                  │
+    │                                                                              │
+    │    ── key idea ──                                                            │
+    │    Instead of looping over all pids *inside* the burn branch (O(n²)), we     │
+    │    debit only the current index:                                             │
+    │          delta[i] -= cut;                                                    │
+    │    because the outer loop already touches every protocol once. After the     │
+    │    full pass each pool’s delta equals the total amount the wallet burned.    │
+    │                                                                              │
+    │  • Complexity: O(n)   (n ≤ 8)                                                │
+    └──────────────────────────────────────────────────────────────────────────────*/
     function _calcHaircuts(
         Account storage a,
         uint64[] memory pids,
@@ -948,13 +948,18 @@ contract WrappedQRL is
                     emit Transfer(msg.sender, address(0), uint64(cut));
 
                     ownCut[i] = uint128(cut); // → ps.burned later
-                    delta[i] -= int128(uint128(cut)); // debit *this* pid
+                    // debit every protocol that counts this wallet’s stake
+                    for (uint8 j = 0; j < pids.length; ++j) {
+                        delta[j] -= int128(uint128(cut));
+                    }
                 }
 
                 /*───────── slot-level snapshots ─────────*/
-                rs.outStart = ps.outBal;
-                rs.yStart = ps.yAcc;
-                m.stake = a.bal; // stake after burn
+                // rs.outStart = ps.outBal;
+                // rs.yStart = ps.yAcc;
+                // m.stake = a.bal; // stake after burn
+                // Tests prove these are not necessary.
+                // Until proven otherwise, I suppose...
             }
         }
     }

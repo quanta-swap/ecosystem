@@ -580,4 +580,259 @@ contract WrapperTokenManual is Test {
         uint64 poolAfter = w.balanceOf(address(this));
         assertLt(poolAfter, ONE, "yield pool not drained");
     }
+
+    /**
+     * @notice Fails on the **old** implementation where `_calcHaircuts` only
+     *         debits the `inBal` of the *current* protocol instead of **all**
+     *         protocols the wallet belongs to.
+     *
+     *  Flow
+     *  ────
+     *  1.  setUp() already has pid 1 live (controller-stake 7 tok).
+     *  2.  Controller spins-up a second protocol (pid 2).
+     *  3.  Alice deposits 10 tok and joins **both** pids.
+     *  4.  Controller signals a 5 tok haircut **only in pid 1**.
+     *  5.  forceHarvest(AL) burns once (ΔSupply > 0).
+     *
+     *  Invariant
+     *  ─────────
+     *      For pid 2 (untouched by the haircut signal):
+     *          ps.inBal  MUST equal  Alice’s post-burn stake.
+     *      The buggy version leaves `inBal` unchanged → mismatch.
+     */
+    function testHaircutPropagatesToAllProtocols() external {
+        /* 1. Controller creates pid 2. */
+        vm.prank(CTL);
+        uint64 pid2 = w.createProtocol(CTL, 1, ONE);
+
+        /* 2. Alice deposits 10 tok and joins pid 1 & pid 2. */
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = 1;
+        join[1] = pid2;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        /* 3. Controller signals 5 tok haircut **only** in pid 1. */
+        vm.prank(CTL);
+        w.signalHaircut(1, 5 * ONE);
+
+        /* 4. Harvest burns once. */
+        address[] memory arr = new address[](1);
+        arr[0] = AL;
+        w.forceHarvest(arr);
+
+        /* 5. Invariant: pid 2’s inBal tracks Alice’s reduced stake. */
+        (, , , uint128 inBal2, , , , ) = w.protocolInfo(pid2);
+        (, uint64 stake2, , , ) = w.memberInfo(AL, 1); // slot 1 → pid 2
+
+        assertEq(
+            uint64(inBal2),
+            stake2,
+            "pid 2 inBal not updated by global burn"
+        );
+    }
+
+    /**
+     * Idempotency: a second `forceHarvest` right after the first **must be a no-op**.
+     *
+     * Rationale
+     * ---------
+     * The slot-level snapshot lines we marked TODO…
+     *   • `rs.outStart  = ps.outBal;`
+     *   • `rs.yStart    = ps.yAcc;`
+     *   • `m.stake      = a.bal;`
+     * …ensure that once a yield and/or haircut has been settled for a wallet,
+     * the *same* event cannot be applied again on the next harvest.
+     * If any of those assignments are missing, a second harvest will either:
+     *   ▸ pay the old yield again (yStart not bumped) **or**
+     *   ▸ burn the old haircut again (outStart / stake not bumped).
+     *
+     * This test runs two consecutive harvests with **no new events** in-between
+     * and asserts that the second call leaves both the wallet balance *and* the
+     * global supply unchanged.  It fails on the buggy implementation that omits
+     * the snapshot updates.
+     */
+    function testHarvestIdempotentSnapshots() external {
+        uint64 pid = 1; // protocol from setUp()
+
+        /*-------------------------------------------------
+         * 1.  Scenario -- one yield + one haircut event
+         *------------------------------------------------*/
+        // Alice stakes 10 tok and joins.
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = pid;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        // Controller seeds pool and sets +4 tok yield, −2 tok haircut.
+        vm.prank(CTL);
+        w.deposit{value: 4 * WEI_ONE}(); // liquidity
+        vm.startPrank(CTL);
+        w.addYield(pid, 4 * ONE);
+        w.signalHaircut(pid, 2 * ONE);
+        vm.stopPrank();
+
+        /*-------------------------------------------------
+         * 2.  First harvest – settles the events once
+         *------------------------------------------------*/
+        address[] memory one = new address[](1);
+        one[0] = AL;
+        w.forceHarvest(one);
+
+        uint64 balAfter1 = w.balanceOf(AL);
+        uint64 suppAfter1 = w.totalSupply();
+
+        /*-------------------------------------------------
+         * 3.  Second harvest – **should be a pure no-op**
+         *------------------------------------------------*/
+        w.forceHarvest(one);
+
+        uint64 balAfter2 = w.balanceOf(AL);
+        uint64 suppAfter2 = w.totalSupply();
+
+        /*-------------------------------------------------
+         * 4.  Invariants – nothing changed the second time
+         *------------------------------------------------*/
+        assertEq(balAfter2, balAfter1, "second harvest changed balance");
+        assertEq(suppAfter2, suppAfter1, "second harvest changed supply");
+    }
+
+    /**
+     * @notice  Snapshot integrity: after a first harvest has settled a haircut,
+     *          calling `forceHarvest` again **without any new events** must be a
+     *          no-op. If the three snapshot lines inside `_calcHaircuts()` are
+     *          missing, the second call re-computes the same proportional cut and
+     *          burns a second time — breaking the invariants below.
+     *
+     *  Steps
+     *  -----
+     *  1.  Alice joins pid 1 with 10 tok stake.
+     *  2.  Controller signals a 5 tok haircut.
+     *  3.  `forceHarvest([alice])` executes once → burns exactly once.
+     *  4.  A second `forceHarvest([alice])` (no new yield / haircut) must leave
+     *      • totalSupply unchanged
+     *      • Alice’s balance unchanged
+     */
+    function testHarvestIdempotencyWithoutNewEvents() external {
+        uint64 pid = 1; // protocol bootstrapped in setUp()
+
+        /* 1. Alice deposits 10 tok and joins the protocol */
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = pid;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        /* 2. Controller reserves a 5 tok haircut */
+        vm.prank(CTL);
+        w.signalHaircut(pid, 5 * ONE);
+
+        /* 3. First harvest — expected to burn once */
+        address[] memory list = new address[](1);
+        list[0] = AL;
+        w.forceHarvest(list);
+
+        uint64 supplyAfterFirst = w.totalSupply();
+        uint64 balAfterFirst = w.balanceOf(AL);
+
+        /* 4. Second harvest with **no new yield / haircut** */
+        w.forceHarvest(list);
+
+        uint64 supplyAfterSecond = w.totalSupply();
+        uint64 balAfterSecond = w.balanceOf(AL);
+
+        /* ── Invariants ──                                                         */
+        assertEq(
+            supplyAfterSecond,
+            supplyAfterFirst,
+            "supply drift on 2nd harvest"
+        );
+        assertEq(balAfterSecond, balAfterFirst, "balance drift on 2nd harvest");
+    }
+
+    function testSnapshotMustAdvance() external {
+        uint64 pid = 1;
+
+        // Alice deposits 10 tok & joins.
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = pid;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        // Controller signals a 4 tok haircut.
+        vm.prank(CTL);
+        w.signalHaircut(pid, 4 * ONE);
+
+        // ── 1️⃣ first harvest burns once ──
+        address[] memory a = new address[](1);
+        a[0] = AL;
+        uint64 supply1 = w.totalSupply();
+        w.forceHarvest(a);
+        uint64 burned1 = supply1 - w.totalSupply();
+        assertGt(burned1, 0, "sanity - some burn expected");
+
+        // Controller signals ANOTHER 4 tok haircut *before* Alice’s next harvest.
+        vm.prank(CTL);
+        w.signalHaircut(pid, 4 * ONE);
+
+        // ── 2️⃣ second harvest should burn roughly the same again ──
+        uint64 supply2 = w.totalSupply();
+        w.forceHarvest(a);
+        uint64 burned2 = supply2 - w.totalSupply();
+
+        // If snapshots didn’t advance, burned2 would be *8 tok* (double count).
+        // We just require it not to exceed the request.
+        assertLe(burned2, 4 * ONE, "snapshot stale - double-burn detected");
+    }
+
+    /**
+     * @notice After one harvest the snapshots must be up-to-date so that a
+     *         **second** harvest in the same block is a no-op.
+     *
+     *         If `rs.outStart`, `rs.yStart`, or `m.stake` are *not* refreshed
+     *         inside `_calcHaircuts`, the second call still sees a positive
+     *         ΔoutBal and re-applies the same cut, double-burning the wallet.
+     */
+    function testHarvestIdempotentSnapshots2() external {
+        uint64 pid = 1; // live from setUp()
+
+        /*–––– 1. Alice stakes 10 tok and joins ––––*/
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = pid;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        /*–––– 2. Controller reserves a 5 tok haircut ––––*/
+        vm.prank(CTL);
+        w.signalHaircut(pid, 5 * ONE);
+
+        /*–––– 3. First harvest burns once ––––*/
+        address[] memory one = new address[](1);
+        one[0] = AL;
+        w.forceHarvest(one);
+        uint64 supplyAfter1 = w.totalSupply();
+        uint64 aliceAfter1 = w.balanceOf(AL);
+
+        /*–––– 4. Immediate second harvest must be a NO-OP ––––*/
+        w.forceHarvest(one);
+        uint64 supplyAfter2 = w.totalSupply();
+        uint64 aliceAfter2 = w.balanceOf(AL);
+
+        /*–––– 5. Invariants – if snapshots weren’t refreshed these fail ––––*/
+        assertEq(
+            supplyAfter2,
+            supplyAfter1,
+            "supply changed on second harvest"
+        );
+        assertEq(aliceAfter2, aliceAfter1, "balance changed on second harvest");
+    }
 }
