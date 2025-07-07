@@ -284,4 +284,104 @@ contract WrapperTokenManual is Test {
         assertEq(second, 0, "collectHaircut still had funds");
     }
 
+    /*══════════════════════════════════════════════════════════════════════*/
+    /*        Aggregate yield across EIGHT protocols credits correctly      */
+    /*══════════════════════════════════════════════════════════════════════*/
+    function testAggregateYieldAcrossEightProtocols() external {
+        /*───────── 1. Spin-up eight fresh protocols (pid 2 … 9) ─────────*/
+        uint64[8] memory pids;
+        for (uint8 i; i < 8; ++i) {
+            pids[i] = w.createProtocol(CTL, 1, ONE);
+        }
+
+        /*───────── 2. Alice deposits 8 tok and joins all eight ─────────*/
+        vm.startPrank(AL);
+        w.deposit{value: 8 * WEI_ONE}();
+        uint64[8] memory joinAll;
+        for (uint8 j; j < 8; ++j) joinAll[j] = pids[j];
+        w.setMembership(joinAll, 0);
+        vm.stopPrank();
+
+        /*───────── 3. Controller funds 1 tok yield in each protocol ─────*/
+        vm.startPrank(CTL);
+        w.deposit{value: 8 * WEI_ONE}();          // fuel for the yields
+        for (uint8 k; k < 8; ++k) {
+            w.addYield(pids[k], ONE);
+        }
+        vm.stopPrank();
+
+        /*───────── 4. Harvest Alice and assert Δ = 8 tok ─────────*/
+        uint64 before = w.balanceOf(AL);
+
+        address[] memory list = new address[](1);
+        list[0] = AL;
+        w.forceHarvest(list);
+
+        uint64 afterBal = w.balanceOf(AL);
+        assertEq(afterBal - before, 8 * ONE, "aggregate 8-proto yield mismatch");
+    }
+
+        /**
+     * @notice Two-protocol haircut must:
+     *         • Burn the wallet’s stake **once** (ΔSupply == 10 tok).  
+     *         • Distribute that burn proportionally between protocols
+     *           (each mints > 0, and Σ(minted) == ΔSupply).  
+     *
+     *  Flow
+     *  ────
+     *  1.  setUp() already created pid = 1 and staked 7 tok (CTL).  
+     *  2.  Controller spins up pid = 2.  
+     *  3.  Alice deposits 10 tok and joins both pids.  
+     *  4.  Controller signals a 10 tok haircut in **each** pid.  
+     *  5.  forceHarvest(AL) burns once (10 tok total) and books
+     *      proportional cuts into each `ps.burned`.  
+     *  6.  collectHaircut() on both pids must mint amounts whose sum
+     *      equals the single burn, guaranteeing no double-claim.  
+     */
+    function testHaircutAcrossTwoProtocolsProportionalCollect() external {
+        /* 1. Controller creates a second protocol (pid = 2). */
+        vm.startPrank(CTL);
+        uint64 pid2 = w.createProtocol(CTL, 1, ONE);
+        vm.stopPrank();
+
+        /* 2. Alice deposits 10 tok and joins both protocols. */
+        vm.startPrank(AL);
+        w.deposit{value: 10 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = 1;      // from setUp()
+        join[1] = pid2;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        /* 3. Controller signals full-balance haircuts in both pids. */
+        vm.startPrank(CTL);
+        w.signalHaircut(1,    10 * ONE);
+        w.signalHaircut(pid2, 10 * ONE);
+        vm.stopPrank();
+
+        /* 4. Harvest Alice – burns once. */
+        uint64 supplyBefore = w.totalSupply();
+        address[] memory list = new address[](1);
+        list[0] = AL;
+        w.forceHarvest(list);
+        uint64 supplyAfter = w.totalSupply();
+        uint64 burned = supplyBefore - supplyAfter;   // should be 10 tok
+        assertEq(burned, 10 * ONE, "unexpected burn amount");
+
+        /* 5. Collect from both protocols. */
+        vm.startPrank(CTL);
+        uint64 minted1 = w.collectHaircut(1,    CTL);
+        uint64 minted2 = w.collectHaircut(pid2, CTL);
+        vm.stopPrank();
+
+        /* 6. Invariants */
+        // (i) Each protocol got a positive share.
+        assertGt(minted1, 0, "pid 1 minted zero");
+        assertGt(minted2, 0, "pid 2 minted zero");
+
+        // (ii) No double-count: total minted == total burned.
+        assertEq(minted1 + minted2, burned, "mint != burn");
+    }
+
+
 }
