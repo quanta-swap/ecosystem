@@ -4,13 +4,6 @@ pragma solidity ^0.8.24;
 import {IZRC20} from "./IZRC20.sol"; // adjust the relative path if needed
 import {IZ156FlashBorrower, IZ156FlashLender} from "./IZ156Flash.sol"; // adjust the relative path if needed
 
-// TODO (TESTS):
-// - Test that yield harvest comes before haircut harvest.
-// - Test that the max lock window is 365 days
-
-// TODO (FIXES):
-// - Change decimals and scale to 9
-
 /* ───────────────  Re-entrancy guard  ─────────────── */
 /// @title   ReentrancyGuard
 /// @notice  Minimal, branch-free re-entrancy gate.
