@@ -602,7 +602,7 @@ contract WrappedQRL is
     /**
      * @dev  Monotonically-increasing per-transaction nonce.
      *
-     *       • Incremented once per *external* call to {setMembership}.  
+     *       • Incremented once per *external* call to {setMembership}.
      *       • Guarantees that the “duplicate-PID” guard (_mark[pid] == tag)
      *         only applies **within the same transaction**, never across
      *         different wallets that happen to share a block.
@@ -621,9 +621,9 @@ contract WrappedQRL is
      *                  Bits set to 1 mean “stay”; 0 means “leave”.
      *
      * @dev
-     *     ✔ Re-entrancy-safe (nonReentrant modifier).  
+     *     ✔ Re-entrancy-safe (nonReentrant modifier).
      *     ✔ Duplicate guards are scoped to a **single transaction** via a
-     *       monotonic `_txnNonce` tag – no cross-wallet contention anymore.  
+     *       monotonic `_txnNonce` tag – no cross-wallet contention anymore.
      *     ✔ All arithmetic stays within 128-bit intermediates; no risk of
      *       overflow in the 64-bit token universe.
      *
@@ -644,55 +644,55 @@ contract WrappedQRL is
         uint64[8] calldata addPids,
         uint8 stayMask
     ) external override nonReentrant {
-        _harvest(msg.sender);                    // ① settle yield & haircuts
+        _harvest(msg.sender); // ① settle yield & haircuts
 
         Account storage a = _acct[msg.sender];
-        uint256 tag = ++_txnNonce;               // ← UNIQUE per tx (FIX)
+        uint256 tag = ++_txnNonce; // ← UNIQUE per tx (FIX)
 
         uint256 protLen = _prot.length;
 
         /*────────────────────── 1. Handle current slots ──────────────────────*/
         for (uint8 s; s < MAX_SLOTS; ++s) {
-            if ((a.mask & (1 << s)) == 0) continue;      // empty slot → skip
+            if ((a.mask & (1 << s)) == 0) continue; // empty slot → skip
 
             uint64 pid = _member(a, s).pid;
 
             if ((stayMask & (1 << s)) != 0) {
-                _mark[pid] = tag;                        // mark as “keep”
+                _mark[pid] = tag; // mark as “keep”
             } else {
-                _leaveSlot(a, s);                        // drop membership
+                _leaveSlot(a, s); // drop membership
             }
         }
 
         /*──────────────────────── 2. Mark additions ─────────────────────────*/
         for (uint8 i; i < MAX_SLOTS; ++i) {
             uint64 pid = addPids[i];
-            if (pid == 0) continue;                      // ignore zeros
-            require(pid < protLen, "pid");               // bounds check
-            require(_mark[pid] != tag, "dup");           // per-tx duplicate
-            _mark[pid] = tag;                            // mark for joining
+            if (pid == 0) continue; // ignore zeros
+            require(pid < protLen, "pid"); // bounds check
+            require(_mark[pid] != tag, "dup"); // per-tx duplicate
+            _mark[pid] = tag; // mark for joining
         }
 
         /*───────────────────────── 3. Join new PIDs ─────────────────────────*/
-        uint8 cur = _countBits(a.mask);                  // current slot count
+        uint8 cur = _countBits(a.mask); // current slot count
         for (uint8 i; i < MAX_SLOTS && cur < MAX_SLOTS; ++i) {
             uint64 pid = addPids[i];
             if (pid == 0 || _mark[pid] != tag) continue; // not requested
 
             bool already;
-            for (uint8 s; s < MAX_SLOTS; ++s) {          // O(8) scan
+            for (uint8 s; s < MAX_SLOTS; ++s) {
+                // O(8) scan
                 if ((a.mask & (1 << s)) != 0 && _member(a, s).pid == pid) {
-                    already = true;                      // already joined
+                    already = true; // already joined
                     break;
                 }
             }
             if (!already) {
-                _joinPid(a, pid);                        // join new protocol
+                _joinPid(a, pid); // join new protocol
                 ++cur;
             }
         }
     }
-
 
     /* scratch-pad for duplicate detection */
     mapping(uint64 => uint256) private _mark;
@@ -859,75 +859,262 @@ contract WrappedQRL is
 
     /* harvest / snapshots */
     /**
-     * @notice  Settles yield and haircuts for `who` across every active membership.
+     * @notice Settles all pending yield + haircuts for `who`.
      *
-     * @dev     Execution order:
-     *          1. Yield is paid out **before** any haircut so it reflects the stake
-     *             at the moment the yield accrued.
-     *          2. Haircut then burns the proportional loss and propagates the
-     *             decreased stake into protocol aggregates.
-     *          3. Snapshots are refreshed to anchor the next harvest window.
+     * @dev Flow
+     *      ────
+     *      1. **Pass 1 – aggregate yield only**
+     *         • Walk the ≤ 8 slots, compute each slot’s owed yield (`owe`).
+     *         • Emit `YieldPaid` per slot, but only *sum* into `totalYield`;
+     *           no state is mutated yet.
      *
-     *          All arithmetic stays within 128-bit intermediates; nothing can wrap
-     *          given 64-bit token balances and protocol totals.
+     *      2. **Apply yield once**
+     *         • `_subBal(address(this), totalYield)` debits the pool
+     *           (no memberships ⇒ cheap).
+     *         • `_addBal(who, totalYield)` credits the wallet and triggers a
+     *           single `_propagate(+ …)` plus an internal `_refreshSnap`
+     *           that updates every `Reserved`/`Member` snapshot to the
+     *           post-yield stake (this is crucial for correct haircut math).
+     *
+     *      3. **Pass 2 – per-protocol haircuts**
+     *         • Now that snapshots include the fresh stake, walk the slots
+     *           again, compute proportional `cut`, burn it, update
+     *           `p.burned`, and `_propagate(-…, skipPid)` so only *other*
+     *           protocols see the stake drop.
+     *
+     *      4. **Final snapshot align**
+     *         • One external `_refreshSnap(who)` brings every slot’s
+     *           `inStart/outStart/yStart` to the new steady state.
+     *
+     *      All intermediates fit in 128 bits; nothing can overflow in the
+     *      64-bit token universe.
      */
+    /*═════════════════════════════════════════════════════════════════════*\
+    │                          Harvest helpers                             │
+    \*═════════════════════════════════════════════════════════════════════*/
+
+    /* ---------- ①  Aggregate all yield that has accrued ---------- */
+    function _aggYield(
+        Account storage a,
+        uint64[] memory pids,
+        uint8[] memory slots
+    ) internal returns (uint64 totalYield) {
+        uint64 poolBal = _acct[address(this)].bal; // cached once
+
+        unchecked {
+            // safe: ≤ 8 items
+            for (uint8 i; i < pids.length; ++i) {
+                Member storage m = _member(a, slots[i]);
+                Reserved storage rs = _res[m.resPtr];
+                Protocol storage ps = _prot[pids[i]];
+
+                if (ps.yAcc > rs.yStart) {
+                    uint256 dy = ps.yAcc - rs.yStart;
+                    uint256 owe = (uint256(m.stake) * dy) >> 64;
+                    if (owe > poolBal) owe = poolBal;
+                    if (owe > 0) {
+                        totalYield += uint64(owe);
+                        poolBal -= uint64(owe);
+                        emit YieldPaid(pids[i], uint64(owe));
+                    }
+                }
+            }
+        }
+    }
+
+    /* ---------- ②  Compute hair-cuts & protocol deltas ------------ */
+    function _calcHaircuts(
+        Account storage a,
+        uint64[] memory pids,
+        uint8[] memory slots,
+        int128[] memory delta, // OUT: net Δ to ps.inBal  (could be −)
+        uint128[] memory ownCut // OUT: amount burnt for that protocol
+    ) internal {
+        unchecked {
+            for (uint8 i; i < pids.length; ++i) {
+                uint8 s = slots[i];
+                Member storage m = _member(a, s);
+                Reserved storage rs = _res[m.resPtr];
+                Protocol storage ps = _prot[pids[i]];
+
+                uint256 cut;
+                if (ps.outBal > rs.outStart) {
+                    uint256 d = ps.outBal - rs.outStart;
+                    uint256 base = rs.inStart > rs.outStart
+                        ? rs.inStart - rs.outStart
+                        : 0;
+                    if (base > 0) {
+                        cut = (uint256(m.stake) * d) / base;
+                        if (cut > a.bal) cut = a.bal;
+                    }
+                }
+
+                if (cut != 0) {
+                    /* Burn from wallet & supply once */
+                    a.bal -= uint64(cut);
+                    _tot -= uint64(cut);
+                    emit Transfer(msg.sender, address(0), uint64(cut));
+
+                    ownCut[i] = uint128(cut); // remember for ps.burned
+
+                    /* Every protocol loses `cut`, add back for this pid later */
+                    for (uint8 j; j < pids.length; ++j)
+                        delta[j] -= int128(uint128(cut));
+                    delta[i] += int128(uint128(cut));
+                }
+
+                /* slot-level snapshots (protocol snapshots done later) */
+                rs.outStart = ps.outBal;
+                rs.yStart = ps.yAcc;
+                m.stake = a.bal;
+            }
+        }
+    }
+
+    /*═════════════════════════════════════════════════════════════════════*\
+    │                           Optimised harvest                          │
+    \*═════════════════════════════════════════════════════════════════════*/
     function _harvest(address who) internal {
         Account storage a = _acct[who];
-
-        // Fast-exit: zero-balance wallets only need a snapshot refresh.
         if (a.bal == 0) {
             _refreshSnap(who);
             return;
         }
 
-        // Iterate through at most MAX_SLOTS (compile-time 8) – tight & gas-cheap.
+        /* -------- enumerate active memberships (≤ 8) -------- */
+        uint8 act;
+        {
+            uint8 m = a.mask;
+            for (uint8 s; s < MAX_SLOTS; ++s) if ((m & (1 << s)) != 0) ++act;
+        }
+        if (act == 0) {
+            _refreshSnap(who);
+            return;
+        }
+
+        uint64[] memory pids = new uint64[](act);
+        uint8[] memory slots = new uint8[](act);
+        {
+            uint8 idx;
+            for (uint8 s; s < MAX_SLOTS; ++s)
+                if ((a.mask & (1 << s)) != 0) {
+                    pids[idx] = _member(a, s).pid;
+                    slots[idx] = s;
+                    ++idx;
+                }
+        }
+
+        /* ---------- ①  Aggregate & pay yield once ---------- */
+        uint64 totalYield = _aggYield(a, pids, slots);
+        if (totalYield != 0) {
+            _subBal(address(this), totalYield); // no memberships ⇒ cheap
+            _addBal(who, totalYield); // one propagate(+)
+        }
+
+        /* ---------- ②  Compute hair-cuts in-memory ---------- */
+        int128[] memory delta = new int128[](act);
+        uint128[] memory ownCut = new uint128[](act);
+        _calcHaircuts(a, pids, slots, delta, ownCut);
+
+        /* ---------- ③  Flush protocol deltas once ---------- */
+        unchecked {
+            for (uint8 i; i < act; ++i) {
+                if (delta[i] == 0 && ownCut[i] == 0) continue;
+
+                Protocol storage ps = _prot[pids[i]];
+
+                if (delta[i] < 0) {
+                    uint128 d = uint128(uint128(-delta[i]));
+                    require(ps.inBal >= d, "inBal<delta");
+                    ps.inBal -= d;
+                } else if (delta[i] > 0) {
+                    ps.inBal += uint128(delta[i]);
+                }
+
+                if (ownCut[i] != 0) ps.burned += ownCut[i];
+            }
+        }
+
+        /* ---------- ④  Final snapshot align ---------- */
+        _refreshSnap(who);
+    }
+
+    function _slotOfPid(
+        Account storage a,
+        uint64 pid
+    ) private view returns (uint8 slot) {
+        for (slot = 0; slot < MAX_SLOTS; ++slot)
+            if ((a.mask & (1 << slot)) != 0 && _member(a, slot).pid == pid)
+                return slot;
+        revert("pid-not-found");
+    }
+
+    /*═════════════════════════════════════════════════════════════════════════*\
+    │                           Membership Introspection                       │
+    \*═════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @notice  Enumerate every protocol the wallet currently belongs to and
+     *          return both the PID list **and** the in-memory copies of their
+     *          `Protocol` state.
+     *
+     * @param who  Target wallet.
+     *
+     * @return pids   Dense uint64[] listing the protocol IDs (same order as slots
+     *                are stored – up to 8, never padded with zeros).
+     * @return info   Parallel `Protocol[]` – a fresh memory copy of each
+     *                protocol’s aggregate struct at call-time.
+     *
+     * @dev     • `external view` – read-only, no gas refunded needed.
+     *          • Runs in O(active-slots) ≤ 8, so the temporary memory copy is
+     *            negligible.
+     *          • Copying a `Protocol` struct from storage to memory requires
+     *            field-by-field assignment; Solidity cannot do a direct cast.
+     */
+    function membershipProtocols(
+        address who
+    ) external view returns (uint64[] memory pids, Protocol[] memory info) {
+        Account storage a = _acct[who]; // ← constant time SLOAD
+
+        /*────────────────── Phase 1 – count active slots ──────────────────*/
+        uint8 count;
+        uint8 mask = a.mask;
         for (uint8 s; s < MAX_SLOTS; ++s) {
-            if ((a.mask & (1 << s)) == 0) continue; // empty slot → skip
+            if ((mask & (1 << s)) != 0) ++count; // up to 8 iterations
+        }
 
-            Member storage m = _member(a, s);
-            Protocol storage p = _prot[m.pid];
-            Reserved storage rs = _res[m.resPtr];
+        /* Early-exit: no memberships → return empty arrays */
+        if (count == 0) {
+            return (new uint64[](0), new Protocol[](0));
+        }
 
-            /*───────────────────────── 1. Yield ─────────────────────────*/
-            if (p.yAcc > rs.yStart && a.bal > 0) {
-                uint256 dy = p.yAcc - rs.yStart; // Δ-accumulator (128-bit)
-                uint256 owe = (uint256(m.stake) * dy) >> 64; // proportional share
-                uint64 pool = _acct[address(this)].bal; // tokens held by pool
-                if (owe > pool) owe = pool; // cap to pool balance
-                if (owe > 0) {
-                    _subBal(address(this), uint64(owe)); // debit pool
-                    _addBal(who, uint64(owe)); // credit wallet
-                    emit YieldPaid(m.pid, uint64(owe));
-                }
-            }
+        /*────────────────── Phase 2 – allocate & populate ─────────────────*/
+        pids = new uint64[](count); // dense arrays, sized once
+        info = new Protocol[](count);
 
-            /*──────────────────────── 2. Haircut ────────────────────────*/
-            if (p.outBal > rs.outStart) {
-                uint256 delta = p.outBal - rs.outStart; // total haircut outstanding
-                uint256 base = rs.inStart > rs.outStart
-                    ? rs.inStart - rs.outStart
-                    : 0; // live stake base
-                uint256 cut = base > 0 ? (uint256(m.stake) * delta) / base : 0; // member’s share
-                if (cut > a.bal) cut = a.bal; // never over-burn
-                if (cut > 0) {
-                    a.bal -= uint64(cut);
-                    p.inBal -= uint128(cut);
-                    p.burned += uint128(cut);
-                    _tot -= uint64(cut);
+        uint8 idx;
+        for (uint8 s; s < MAX_SLOTS && idx < count; ++s) {
+            if ((mask & (1 << s)) == 0) continue; // unused slot
 
-                    emit Transfer(who, address(0), uint64(cut));
+            /* Slot → PID */
+            uint64 pid = _member(a, s).pid;
+            pids[idx] = pid;
 
-                    // Propagate the reduced stake into all protocols except the one
-                    // already reflected via `p.inBal` to avoid double-counting.
-                    _propagate(who, -int256(cut), m.pid);
-                }
-            }
+            /* Copy `Protocol` storage → memory (field-by-field) */
+            Protocol storage ps = _prot[pid];
+            Protocol memory pm;
 
-            /*──────────────────────── 3. Refresh ────────────────────────*/
-            rs.inStart = p.inBal;
-            rs.outStart = p.outBal;
-            rs.yStart = p.yAcc;
-            m.stake = a.bal; // new member stake
+            pm.ctrl = ps.ctrl;
+            pm.minStake = ps.minStake;
+            pm.lockWin = ps.lockWin;
+            pm.inBal = ps.inBal;
+            pm.outBal = ps.outBal;
+            pm.burned = ps.burned;
+            pm.collected = ps.collected;
+            pm.yAcc = ps.yAcc;
+
+            info[idx] = pm; // store the memory copy
+            ++idx;
         }
     }
 
