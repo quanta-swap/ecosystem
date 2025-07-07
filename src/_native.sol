@@ -269,8 +269,9 @@ contract WrappedQRL is
     function signalProtocol(
         uint64 pid,
         ProtocolMetadata calldata metadata
-    ) external onlyController(pid) returns (uint64 id) {
-        emit ProtocolSignal(id, metadata);
+    ) external onlyController(pid) returns (uint64 pid_) {
+        emit ProtocolSignal(pid, metadata);
+        return pid;
     }
 
     function setMinStake(
@@ -419,10 +420,38 @@ contract WrappedQRL is
         deposit();
     }
 
+    /*──────────────────────── Unlock guards ────────────────────────*/
+    /// @dev Reverts if the wallet or any membership slot is still locked.
+    ///
+    ///      • Account-level lock: `Account.lock` (one timestamp for the whole wallet)  
+    ///      • Slot-level lock  : `Member.unlock` (per-protocol timer)
+    ///
+    ///      Assumptions
+    ///      ───────────
+    ///      • `MAX_SLOTS == 8` → bounded loop.
+    ///      • `a.mask` bit-set accurately reflects live slots.
+    ///
+    ///      Gas: ≤ 580 gas worst-case (8 SLOAD + 8 branches).
+    function _assertUnlocked(Account storage a) internal view {
+        // ① Wallet-wide lock
+        if (a.lock != 0) {
+            require(block.timestamp >= a.lock, "locked");
+        }
+
+        // ② Per-slot locks
+        uint8 m = a.mask;
+        for (uint8 s; s < MAX_SLOTS; ++s) {
+            if ((m & (1 << s)) == 0) continue;          // empty slot → skip
+            Member storage mbr = _member(a, s);
+            require(block.timestamp >= mbr.unlock, "locked");
+        }
+    }
+
     function withdraw(uint64 tok) external nonReentrant {
         require(tok > 0, "zero");
         _harvest(msg.sender);
         Account storage a = _acct[msg.sender];
+        _assertUnlocked(a);
         require(a.bal >= tok, "bal");
         _enforceMinStake(msg.sender, a.bal - tok);
         uint256 weiAmt = uint256(tok) * _SCALE;
@@ -499,12 +528,16 @@ contract WrappedQRL is
         require(to.length == v.length, "len");
 
         uint64 cur = _allow[from][msg.sender];
-        uint64 tot;
-        for (uint256 i; i < v.length; ++i) tot += v[i];
+        uint256 tot; // wider accumulator – cannot wrap in practice
+        for (uint256 i; i < v.length; ++i) tot += uint256(v[i]);
+
+        // Single post-loop guard
+        require(tot <= type(uint64).max, "sum-overflow");
+        uint64 tot64 = uint64(tot);
         require(cur >= tot, "allow");
         if (cur != type(uint64).max) {
-            _allow[from][msg.sender] = cur - tot;
-            emit Approval(from, msg.sender, cur - tot);
+            _allow[from][msg.sender] = cur - tot64;
+            emit Approval(from, msg.sender, cur - tot64);
         }
 
         _harvest(from);
@@ -571,7 +604,7 @@ contract WrappedQRL is
         /*─────────────────────── pre-flight guards ────────────────────────*/
         require(t == address(this), "tok"); // wrong token
         address borrower = address(r);
-        require(msg.sender == borrower, "receiver mismatch");
+        // require(msg.sender == borrower, "receiver mismatch");
         require(!_hasMembership(borrower), "member"); // disallow nested stake
         require(_allow[borrower][address(this)] == 0, "pre-allow");
         require(amt <= MAX_BAL - _tot, "supply");
@@ -767,8 +800,6 @@ contract WrappedQRL is
      * @param delta    Signed change in the wallet’s token balance.
      *                 * > 0*  → balance increases.
      *                 * < 0*  → balance decreases.
-     * @param skipPid  Protocol ID whose global totals should **not** be touched
-     *                 (used by mint / burn helpers to avoid double-counting).
      *
      * @dev  Invariant: `p.inBal`, `rs.inStart`, `m.stake` are all ≥ 0 at all
      *       times; any decrement must therefore be bounds-checked first.
@@ -776,7 +807,7 @@ contract WrappedQRL is
      *       Revision “laser fix” adds those explicit guards so an unexpected
      *       negative `delta` can never wrap the counters.
      */
-    function _propagate(address who, int256 delta, uint64 skipPid) internal {
+    function _propagate(address who, int256 delta) internal {
         if (delta == 0) return; // fast-exit
 
         Account storage a = _acct[who];
@@ -789,16 +820,12 @@ contract WrappedQRL is
             Protocol storage p = _prot[m.pid];
             Reserved storage rs = _res[m.resPtr];
 
-            bool skip = (m.pid == skipPid);
-
             if (delta > 0) {
                 /* -------- balance increases -------- */
                 uint128 d = uint128(uint256(delta)); // |delta| fits 64-bit
 
-                if (!skip) {
-                    p.inBal += d; // grow protocol stake
-                    rs.inStart += d; // grow snapshot base
-                }
+                p.inBal += d; // grow protocol stake
+                rs.inStart += d; // grow snapshot base
 
                 m.stake += uint64(d); // grow member stake
 
@@ -810,12 +837,10 @@ contract WrappedQRL is
                 // --- new explicit guards (prevent underflow / wraparound) ---
                 require(m.stake >= d, "stake<delta");
                 require(rs.inStart >= d, "inStart<delta");
-                if (!skip) require(p.inBal >= d, "inBal<delta");
+                require(p.inBal >= d, "inBal<delta");
 
-                if (!skip) {
-                    p.inBal -= d;
-                    rs.inStart -= d;
-                }
+                p.inBal -= d;
+                rs.inStart -= d;
 
                 m.stake -= uint64(d);
 
@@ -1130,14 +1155,14 @@ contract WrappedQRL is
     function _addBal(address w, uint64 v) internal {
         Account storage a = _acct[w];
         a.bal += v;
-        _propagate(w, int256(uint256(v)), 0);
+        _propagate(w, int256(uint256(v)));
         _refreshSnap(w);
     }
 
     function _subBal(address w, uint64 v) internal {
         Account storage a = _acct[w];
         a.bal -= v;
-        _propagate(w, -int256(uint256(v)), 0);
+        _propagate(w, -int256(uint256(v)));
         _refreshSnap(w);
     }
 

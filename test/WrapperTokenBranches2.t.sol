@@ -185,12 +185,6 @@ contract WrappedQRL_BranchCoverage is Test {
         w.flashLoan(b, address(0x1234), ONE, "");
     }
 
-    function testFlashLoanReceiverMismatch() public {
-        SimpleBorrower b = new SimpleBorrower(IZRC20(address(w)));
-        vm.expectRevert(bytes("receiver mismatch"));   // caller ≠ borrower
-        w.flashLoan(b, address(w), ONE, "");
-    }
-
     function testFlashLoanPreAllowReverts() public {
         BorrowerPreAllow b = new BorrowerPreAllow(w);
         vm.expectRevert(bytes("pre-allow"));

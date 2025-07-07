@@ -881,7 +881,7 @@ contract WrapperTokenManual is Test {
         uint64[8] memory join;
         join[0] = pid;
         w.setMembership(join, 0);
-        w.approve(BO, 10 * ONE);          // grant allowance to Bob
+        w.approve(BO, 10 * ONE); // grant allowance to Bob
         vm.stopPrank();
 
         /* Controller reserves a 6 tok haircut. */
@@ -907,23 +907,24 @@ contract WrapperTokenManual is Test {
      */
     function testSoloStakerHarvestsFullYield() external {
         /* 0️⃣  Spin-up an empty protocol (pid = 2) */
-        uint64 pid = w.createProtocol(CTL, 1, ONE);     // lockWin = 1 blk
+        uint64 pid = w.createProtocol(CTL, 1, ONE); // lockWin = 1 blk
 
         /* 1️⃣  Alice stakes 2 tok and joins – she’s the sole member */
         vm.startPrank(AL);
-        w.deposit{value: 2 * WEI_ONE}();                // mint 2 tok
-        uint64[8] memory join; join[0] = pid;
+        w.deposit{value: 2 * WEI_ONE}(); // mint 2 tok
+        uint64[8] memory join;
+        join[0] = pid;
         w.setMembership(join, 0);
         vm.stopPrank();
 
         /* 2️⃣  Controller funds +1 tok yield (needs a token to burn) */
         vm.prank(CTL);
-        w.deposit{value: WEI_ONE}();                    // fuel CTL’s balance
+        w.deposit{value: WEI_ONE}(); // fuel CTL’s balance
         vm.prank(CTL);
-        w.addYield(pid, ONE);                           // contribute yield
+        w.addYield(pid, ONE); // contribute yield
 
         /* 📸  Snapshots before harvest */
-        uint64 balBefore    = w.balanceOf(AL);
+        uint64 balBefore = w.balanceOf(AL);
         uint64 supplyBefore = w.totalSupply();
 
         /* 3️⃣  Force-harvest Alice */
@@ -932,7 +933,7 @@ contract WrapperTokenManual is Test {
         w.forceHarvest(list);
 
         /* ✅  Assertions */
-        uint64 balAfter    = w.balanceOf(AL);
+        uint64 balAfter = w.balanceOf(AL);
         uint64 supplyAfter = w.totalSupply();
 
         // (a) Alice got the full 1 token
@@ -950,4 +951,121 @@ contract WrapperTokenManual is Test {
         );
     }
 
+    /*══════════════════════════════════════════════════════════════════════*\
+│  Withdraw-time lock guards                                           │
+\*══════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @dev Account-level lock must block `withdraw()` until the deadline
+     *      passes, after which the call succeeds and native QRL is paid out.
+     *
+     *      Flow
+     *      ----
+     *      1. Alice deposits 2 tok.
+     *      2. Alice sets an account-level lock that ends +1 day in the future.
+     *      3. Alice tries to withdraw → MUST revert with `"locked"`.
+     *      4. We warp > 1 day, retry the withdraw → MUST succeed.
+     *
+     *      Invariants
+     *      ----------
+     *      • First call reverts with reason `"locked"`.
+     *      • Second call reduces both `balanceOf(AL)` and `totalSupply`
+     *        by EXACTLY 2 tok (pure burn-and-pay).
+     */
+    function testWithdrawBlockedByAccountLock() external {
+        /* 1️⃣  Alice deposits 2 tok */
+        vm.startPrank(AL);
+        w.deposit{value: 2 * WEI_ONE}();
+
+        /* 2️⃣  Alice locks herself for +1 day */
+        uint56 until = uint56(block.timestamp + 1 days);
+        w.lock(until);
+
+        /* 3️⃣  Immediate withdraw MUST revert */
+        vm.expectRevert("locked");
+        w.withdraw(2 * ONE);
+        vm.stopPrank();
+
+        /* 4️⃣  After the deadline the withdraw MUST succeed */
+        vm.warp(until + 1); // advance past the lock
+        uint64 suppBefore = w.totalSupply();
+        uint64 balBefore = w.balanceOf(AL);
+
+        vm.prank(AL);
+        w.withdraw(2 * ONE);
+
+        assertEq(
+            w.totalSupply(),
+            suppBefore - 2 * ONE,
+            "supply not reduced by 2 tok"
+        );
+        assertEq(
+            w.balanceOf(AL),
+            balBefore - 2 * ONE,
+            "balance not reduced by 2 tok"
+        );
+    }
+
+    /**
+     * @dev Slot-level (per-protocol) lock must likewise block `withdraw()`
+     *      until the slot’s `unlock` timestamp has elapsed.
+     *
+     *      Set-up
+     *      ------
+     *      • Controller spins up a fresh protocol with `lockWin = 3 days`.
+     *      • Alice deposits 3 tok and joins — her slot’s `unlock` is now
+     *        `timestamp + 3 days`.
+     *
+     *      Assertions
+     *      ----------
+     *      • Withdraw before 3 days → revert `"locked"`.
+     *      • Withdraw after    3 days → succeeds and burns 1 tok.
+     *      • Alice’s residual balance (2 tok) still meets `minStake`.
+     */
+    function testWithdrawBlockedBySlotLock() external {
+        /* Controller spins-up protocol (pid = 2) with 3-day lock window */
+        vm.startPrank(CTL);
+        uint64 pid = w.createProtocol(CTL, 3 days, ONE); // minStake = 1 tok
+        vm.stopPrank();
+
+        /* Alice deposits 3 tok and joins the protocol */
+        vm.startPrank(AL);
+        w.deposit{value: 3 * WEI_ONE}();
+        uint64[8] memory join;
+        join[0] = pid;
+        w.setMembership(join, 0);
+        vm.stopPrank();
+
+        /* Snapshot totals before any withdraw attempt */
+        uint64 supply0 = w.totalSupply();
+        uint64 alice0 = w.balanceOf(AL);
+
+        /* ↯  Attempt to withdraw 1 tok immediately → MUST revert */
+        vm.prank(AL);
+        vm.expectRevert("locked");
+        w.withdraw(ONE);
+
+        /* Fast-forward beyond the 3-day slot lock */
+        vm.warp(block.timestamp + 3 days + 1);
+
+        /* ✅  Withdraw 1 tok now allowed */
+        vm.prank(AL);
+        w.withdraw(ONE);
+
+        /* Post-condition checks */
+        assertEq(
+            w.totalSupply(),
+            supply0 - ONE,
+            "totalSupply not reduced by 1 tok"
+        );
+        assertEq(
+            w.balanceOf(AL),
+            alice0 - ONE,
+            "Alice balance not reduced by 1 tok"
+        );
+
+        /* Residual stake (2 tok) ≥ minStake = 1 tok ⇒ still a valid member */
+        (, uint64[8] memory pids, ) = w.accountInfo(AL);
+        assertEq(pids[0], pid, "Alice lost membership unexpectedly");
+    }
 }

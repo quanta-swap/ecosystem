@@ -118,7 +118,7 @@ contract WrapperTokenAux is Test {
 
         /*───────── 2. Controller path emits event ────────*/
         vm.expectEmit(true, false, false, true);
-        emit WrappedQRL.ProtocolSignal(0, dummy);      // id == 0 per impl quirk
+        emit WrappedQRL.ProtocolSignal(pid, dummy);      // id == 0 per impl quirk
 
         vm.prank(CTRL);
         w.signalProtocol(pid, dummy);                  // should not revert

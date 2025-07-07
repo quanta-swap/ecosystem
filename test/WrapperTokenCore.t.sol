@@ -117,6 +117,7 @@ contract WrappedQRL_Test is Test {
 
         /* withdraw below min-stake must revert */
         vm.startPrank(alice);
+        vm.warp(block.timestamp + 1 days);
         vm.expectRevert("minStake");
         w.withdraw(ONE / 2);
         vm.stopPrank();
@@ -220,6 +221,7 @@ contract WrappedQRL_Test is Test {
         w.setMembership(add, 0);
 
         vm.expectRevert("minStake");
+        vm.warp(block.timestamp + 1 days);
         w.withdraw(ONE);                                // would zero stake
         vm.stopPrank();
     }
