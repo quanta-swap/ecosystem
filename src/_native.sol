@@ -888,15 +888,38 @@ contract WrappedQRL is
                 }
             }
         }
+
+        _acct[address(this)].bal = poolBal;
     }
 
     /* ---------- ②  Compute hair-cuts & protocol deltas ------------ */
+    /*───────────────────────────────────────────────────────────────────────────────
+│  _calcHaircuts                                                               │
+│                                                                              │
+│  • Computes, *in memory*, the hair-cut each protocol owes and builds two     │
+│    side-arrays:                                                              │
+│        – delta[i]   : signed Δ to ps.inBal for pids[i] (can be −)            │
+│        – ownCut[i]  : amount that bumps   ps.burned  for pids[i]            │
+│                                                                              │
+│  • Every burn shrinks the wallet’s stake by `cut`, therefore *each*          │
+│    protocol that the wallet belongs to must see its inBal reduced by         │
+│    exactly that same `cut`.                                                  │
+│                                                                              │
+│    ── key idea ──                                                            │
+│    Instead of looping over all pids *inside* the burn branch (O(n²)), we     │
+│    debit only the current index:                                             │
+│          delta[i] -= cut;                                                    │
+│    because the outer loop already touches every protocol once. After the     │
+│    full pass each pool’s delta equals the total amount the wallet burned.    │
+│                                                                              │
+│  • Complexity: O(n)   (n ≤ 8)                                                │
+└──────────────────────────────────────────────────────────────────────────────*/
     function _calcHaircuts(
         Account storage a,
         uint64[] memory pids,
         uint8[] memory slots,
-        int128[] memory delta, // OUT: net Δ to ps.inBal  (could be −)
-        uint128[] memory ownCut // OUT: amount burnt for that protocol
+        int128[] memory delta, // OUT: Δ to ps.inBal (signed, 128-bit)
+        uint128[] memory ownCut // OUT: amount that bumps ps.burned
     ) internal {
         unchecked {
             for (uint8 i; i < pids.length; ++i) {
@@ -905,6 +928,7 @@ contract WrappedQRL is
                 Reserved storage rs = _res[m.resPtr];
                 Protocol storage ps = _prot[pids[i]];
 
+                /*───────── proportional cut calculation ─────────*/
                 uint256 cut;
                 if (ps.outBal > rs.outStart) {
                     uint256 d = ps.outBal - rs.outStart;
@@ -913,28 +937,24 @@ contract WrappedQRL is
                         : 0;
                     if (base > 0) {
                         cut = (uint256(m.stake) * d) / base;
-                        if (cut > a.bal) cut = a.bal;
+                        if (cut > a.bal) cut = a.bal; // never over-draw
                     }
                 }
 
+                /*───────── apply burn once ─────────*/
                 if (cut != 0) {
-                    /* Burn from wallet & supply once */
-                    a.bal -= uint64(cut);
-                    _tot -= uint64(cut);
+                    a.bal -= uint64(cut); // wallet balance
+                    _tot -= uint64(cut); // global supply
                     emit Transfer(msg.sender, address(0), uint64(cut));
 
-                    ownCut[i] = uint128(cut); // remember for ps.burned
-
-                    /* Every protocol loses `cut`, add back for this pid later */
-                    for (uint8 j; j < pids.length; ++j)
-                        delta[j] -= int128(uint128(cut));
-                    delta[i] += int128(uint128(cut));
+                    ownCut[i] = uint128(cut); // → ps.burned later
+                    delta[i] -= int128(uint128(cut)); // debit *this* pid
                 }
 
-                /* slot-level snapshots (protocol snapshots done later) */
+                /*───────── slot-level snapshots ─────────*/
                 rs.outStart = ps.outBal;
                 rs.yStart = ps.yAcc;
-                m.stake = a.bal;
+                m.stake = a.bal; // stake after burn
             }
         }
     }
@@ -1037,7 +1057,7 @@ contract WrappedQRL is
         /* ---------- ①  Aggregate & pay yield once ---------- */
         uint64 totalYield = _aggYield(a, pids, slots);
         if (totalYield != 0) {
-            _subBal(address(this), totalYield); // no memberships ⇒ cheap
+            /* pool already debited inside _aggYield() */
             _addBal(who, totalYield); // one propagate(+)
         }
 
