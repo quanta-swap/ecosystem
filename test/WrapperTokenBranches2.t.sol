@@ -7,8 +7,8 @@ import "../src/IZ156Flash.sol";
 import "../src/IZRC20.sol";
 
 /*──────── Constants ───────*/
-uint64  constant ONE      = 1e8;          // 8-dec token unit
-uint256 constant WEI_ONE  = ONE * 1e10;   // wei per token (scale)
+uint64  constant ONE      = 1e9;          // 8-dec token unit
+uint256 constant WEI_ONE  = ONE * 1e9;   // wei per token (scale)
 
 /*────────────────── Helper flash-loan receivers ──────────────────*/
 contract SimpleBorrower is IZ156FlashBorrower {
@@ -152,11 +152,29 @@ contract WrappedQRL_BranchCoverage is Test {
     }
 
     /*──────── Re-entrancy guard ───────*/
+    /// @notice Flash-loan re-entrancy guard regression test.
+    /// @dev    Expects the loan to revert with the custom `Reentrancy()` error
+    ///         when a borrower tries to initiate a nested flash-loan.
     function testFlashLoanReentrancyGuard() public {
-        ReentrantBorrower b = new ReentrantBorrower(w);
-        vm.expectRevert(bytes("re-enter"));
-        vm.prank(address(b));
-        w.flashLoan(b, address(w), ONE, "");
+        /*───────────────────────── Setup ─────────────────────────*/
+        ReentrantBorrower borrower = new ReentrantBorrower(w); // `w` is the flash-loan provider
+
+        /*────────────────────── Expect revert ────────────────────*/
+        //
+        // • `vm.expectRevert(bytes4)` accepts an error **selector**.
+        // • The selector is the first 4 bytes of `keccak256("Reentrancy()")`.
+        // • Using a selector is cheaper than encoding the entire ABI-encoded
+        //   error data and fully captures the revert condition.
+        //
+        vm.expectRevert(ReentrancyGuard.Reentrancy.selector);
+
+        /*───────────────────── Trigger revert ─────────────────────*/
+        //
+        // The re-entrant borrower calls `flashLoan` from **within** its own
+        // callback, tripping the guard in the provider contract.
+        //
+        vm.prank(address(borrower));
+        w.flashLoan(borrower, address(w), ONE, "");
     }
 
     /*──────── flashLoan exotic rejects ───────*/

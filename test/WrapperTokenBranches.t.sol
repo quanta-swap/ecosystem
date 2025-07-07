@@ -5,8 +5,8 @@ import "lib/forge-std/src/Test.sol";
 import "../src/_native.sol";
 
 /*──────── Constants ───────*/
-uint64  constant ONE      = 1e8;           // 1 token (8-dec)
-uint256 constant WEI_ONE  = ONE * 1e10;    // 1 token in wei
+uint64  constant ONE      = 1e9;           // 1 token (8-dec)
+uint256 constant WEI_ONE  = ONE * 1e9;    // 1 token in wei
 
 contract WrappedQRLBranches is Test {
     address constant CTRL = address(0xC0FE);
@@ -152,7 +152,8 @@ contract WrappedQRLBranches is Test {
         vm.prank(CTRL);
         w.signalHaircut(pid, ONE);                   // schedule
 
-        vm.roll(block.number + 2);                   // out of lock
+        // vm.roll(block.number + 2);                   // out of lock
+        vm.warp(block.timestamp + 1 hours);
         vm.prank(CTRL);
         w.transfer(CTRL, 0);                         // burn executes
 

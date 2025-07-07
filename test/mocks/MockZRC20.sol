@@ -4,10 +4,10 @@ pragma solidity ^0.8.24;
 import {IZRC20} from "../../src/IZRC20.sol";
 
 contract MockZRC20 is IZRC20 {
-    string  public name;
-    string  public symbol;
-    uint8   public constant decimals = 8;        // pick whatever
-    uint64  public totalSupply;
+    string public name;
+    string public symbol;
+    uint8 public constant decimals = 8; // pick whatever
+    uint64 public totalSupply;
 
     mapping(address => uint64) public balanceOf;
     mapping(address => mapping(address => uint64)) public allowance;
@@ -19,7 +19,7 @@ contract MockZRC20 is IZRC20 {
 
     function mint(address to, uint64 amt) external {
         balanceOf[to] += amt;
-        totalSupply    += amt;
+        totalSupply += amt;
         emit Transfer(address(0), to, amt);
     }
 
@@ -54,5 +54,15 @@ contract MockZRC20 is IZRC20 {
         }
         emit Transfer(f, t, amt);
     }
-    
+
+    function transferBatch(
+        address[] calldata dst,
+        uint64[] calldata wad
+    ) external override returns (bool success) {}
+
+    function transferFromBatch(
+        address src,
+        address[] calldata dst,
+        uint64[] calldata wad
+    ) external override returns (bool success) {}
 }

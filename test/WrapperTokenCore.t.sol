@@ -7,8 +7,8 @@ import {IZRC20} from "../src/IZRC20.sol";
 import {WrappedQRL} from "../src/_native.sol";
 
 /*───────────────────────── Helpers ─────────────────────────*/
-uint64 constant ONE = 1e8;               // 1 token (8-dec)
-uint256 constant WEI_ONE = ONE * 1e10;   // 1 token in wei (scale = 1e10)
+uint64 constant ONE = 1e9;               // 1 token (8-dec)
+uint256 constant WEI_ONE = ONE * 1e9;   // 1 token in wei (scale = 1e10)
 
 /* mock borrower for the flash-loan path */
 contract FlashBorrower is IZ156FlashBorrower {
@@ -122,7 +122,7 @@ contract WrappedQRL_Test is Test {
         vm.stopPrank();
 
         /* wait out lock window and leave */
-        vm.roll(block.number + 2);
+        vm.warp(block.timestamp + 2 hours);
         uint64[8] memory none;                    // all zeros
         vm.prank(alice);
         w.setMembership(none, 0);
@@ -135,7 +135,7 @@ contract WrappedQRL_Test is Test {
         uint64 pid = _bootstrapProtocol();
 
         /* Alice joins with 2 tokens – roll to avoid “dup” */
-        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 1 hours);
         vm.startPrank(alice);
         w.deposit{value: WEI_ONE * 2}();
         uint64[8] memory arr; arr[0] = pid;
@@ -148,7 +148,7 @@ contract WrappedQRL_Test is Test {
         vm.stopPrank();
 
         /* advance 1 block so Alice is past lock-window */
-        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 1 hours);
 
         /* harvest – record balance */
         vm.startPrank(alice);
@@ -161,7 +161,7 @@ contract WrappedQRL_Test is Test {
         w.signalHaircut(pid, ONE);
 
         /* advance a block & harvest again – balance must drop */
-        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 1 hours);
         vm.prank(alice);
         w.transfer(alice, 0);
         assertLt(w.balanceOf(alice), balBefore);  // haircut applied

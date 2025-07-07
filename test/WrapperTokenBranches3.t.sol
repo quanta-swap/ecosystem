@@ -5,8 +5,8 @@ import "lib/forge-std/src/Test.sol";
 import "../src/_native.sol";
 
 /*──────── Constants ───────*/
-uint64  constant ONE      = 1e8;          // 8-dec token unit
-uint256 constant WEI_ONE  = ONE * 1e10;   // wei per token (scale)
+uint64  constant ONE      = 1e9;          // 8-dec token unit
+uint256 constant WEI_ONE  = ONE * 1e9;   // wei per token (scale)
 
 /*────────────────── Additional Branch Suite ──────────────────*/
 contract WrappedQRL_BranchCoverage2 is Test {

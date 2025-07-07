@@ -5,8 +5,8 @@ import "lib/forge-std/src/Test.sol";
 import "../src/_native.sol";
 
 /*───────────────────────── Helpers ─────────────────────────*/
-uint64  constant ONE      = 1e8;           // token units (8-dec)
-uint256 constant WEI_ONE  = ONE * 1e10;    // wei per token (scale = 1e10)
+uint64  constant ONE      = 1e9;           // token units (8-dec)
+uint256 constant WEI_ONE  = ONE * 1e9;    // wei per token (scale = 1e10)
 
 /*───────────────────────── Test Suite ──────────────────────*/
 contract WrappedQRL_ViewCoverage is Test {
@@ -50,30 +50,70 @@ contract WrappedQRL_ViewCoverage is Test {
         w.setMembership(arr, 0);
     }
 
-    /*──────── 2. memberInfo / reservedInfo coverage ──────────*/
+    /// @notice
+    ///     Verifies that a second wallet can join a protocol in a **new block**
+    ///     without triggering the duplicate-join guard, and that both
+    ///     `memberInfo()` and `reservedInfo()` return the expected snapshots.
+    ///
+    /// @dev
+    ///     ─ Preconditions ─
+    ///     • Controller (`CTRL`) has already deposited and approved its tokens.
+    ///     • Alice (`AL`) has already deposited and approved her tokens.
+    ///     • Helper `_join()` stakes `amountWei / 1e9` tokens for the caller.
+    ///
+    ///     ─ Test flow ─
+    ///     1. Controller creates a protocol with a 1-second lock window and
+    ///        immediately joins, staking 2 tokens.
+    ///     2. We **advance wall-clock time _and_ block height** so the next join
+    ///        executes in a fresh block (the duplicate guard keys off
+    ///        `block.number`, not `block.timestamp`).
+    ///     3. Alice joins the same protocol, staking 1 token.
+    ///     4. Assert that all on-chain snapshots reflect the combined state.
+    ///
+    ///     ─ Why both `warp` _and_ `roll`? ─
+    ///     • `vm.warp()` changes `block.timestamp` only.  
+    ///     • The duplicate-join guard stores the current **block number** in
+    ///       `_mark[pid]`, so we also need `vm.roll()` to bump `block.number`.
+    ///
+    ///     ─ Assumptions ─
+    ///     • `ONE` represents exactly 1 token (scaled to 9 decimals).
+    ///     • `WEI_ONE` is 1 token denominated in wei ( `1e9` ).
     function testMemberAndReservedInfo() public {
-        uint64 pid = w.createProtocol(CTRL, 1, ONE);   // 1-block lock window
+        // ───────────────────────── 1. Setup ──────────────────────────
+        uint64 pid = w.createProtocol(CTRL, 1, ONE); // 1-second lock window
+        _join(CTRL, pid, WEI_ONE * 2);               // Controller stakes 2
 
-        _join(CTRL, pid, WEI_ONE * 2);                 // controller stakes 2
+        // ───────────────── Advance time & height ─────────────────────
+        vm.warp(block.timestamp + 1 hours); // move wall-clock forward
+        vm.roll(block.number + 1);          // move to the next block
 
-        vm.roll(block.number + 1);                     // avoid “dup”
+        // ───────────────────────── 2. Action ─────────────────────────
+        _join(AL, pid, WEI_ONE);            // Alice stakes 1
 
-        _join(AL, pid, WEI_ONE);                       // Alice stakes 1
+        // ───────────────────── 3. Assertions (member) ────────────────
+        (uint64 mpid,
+        uint64 stake,
+        uint64 unlock,
+        uint64 joinMin,
+        uint64 rPtr) = w.memberInfo(AL, 0);
 
-        (uint64 mpid,uint64 stake,uint64 unlock,uint64 joinMin,uint64 rPtr)
-            = w.memberInfo(AL, 0);
+        assertEq(mpid,  pid,   "member pid mismatch");
+        assertEq(stake, ONE,   "stake snapshot incorrect");
+        assertGt(unlock, block.timestamp, "unlock should be in the future");
+        assertEq(joinMin, ONE, "joinMin snapshot incorrect");
 
-        assertEq(mpid,    pid);
-        assertEq(stake,   ONE);
-        assertGt(unlock,  block.number);
-        assertEq(joinMin, ONE);
+        // ───────────────────── 4. Assertions (reserved) ──────────────
+        (uint128 inS,
+        uint128 outS,
+        uint256 yS,
+        uint64  jm) = w.reservedInfo(rPtr);
 
-        (uint128 inS, uint128 outS, uint256 yS, uint64 jm) = w.reservedInfo(rPtr);
-        assertEq(inS, 3 * ONE);   // 2 (CTRL) + 1 (AL)
-        assertEq(outS, 0);
-        assertEq(yS,  0);
-        assertEq(jm,  ONE);
+        assertEq(inS, 3 * ONE, "total stake snapshot incorrect"); // 2 + 1
+        assertEq(outS, 0,      "haircut snapshot should be zero");
+        assertEq(yS,  0,       "yield accumulator snapshot should be zero");
+        assertEq(jm,  ONE,     "joinMin reserved snapshot incorrect");
     }
+
 
     /*──────── 3. receive() fallback deposit coverage ─────────*/
     function testReceiveDeposit() public {

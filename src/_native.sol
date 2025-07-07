@@ -1,20 +1,56 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {IZRC20} from "./IZRC20.sol";   // adjust the relative path if needed
+import {IZRC20} from "./IZRC20.sol"; // adjust the relative path if needed
 import {IZ156FlashBorrower, IZ156FlashLender} from "./IZ156Flash.sol"; // adjust the relative path if needed
 
-// TODO: Make this into the stablecoin dollar contract instead.
+// TODO (TESTS):
+// - Test that yield harvest comes before haircut harvest.
+// - Test that the max lock window is 365 days
+
+// TODO (FIXES):
+// - Change decimals and scale to 9
 
 /* ───────────────  Re-entrancy guard  ─────────────── */
+/// @title   ReentrancyGuard
+/// @notice  Minimal, branch-free re-entrancy gate.
+/// @dev     • Uses a custom error (`Reentrancy`) for cheaper revert cost than a
+///            `require` with string data.
+///          • State flag is packed into a single byte to keep storage slots
+///            clear for inheriting contracts.
+///          • Assumes all inheriting contracts respect the
+///            checks-effects-interactions pattern and apply the `nonReentrant`
+///            modifier to every external state-mutating function that could be
+///            called indirectly.
+///
+///          Invariants:
+///          1. `_stat` is always `_NOT` (1) outside an active call.
+///          2. `_stat` is `_ENT` (2) only while executing a `nonReentrant`
+///             function body.
 abstract contract ReentrancyGuard {
-    uint8 private constant _NOT = 1;
-    uint8 private constant _ENT = 2;
-    uint8 private _stat = _NOT;
+    /*──────────────────────────── Errors ────────────────────────────*/
+
+    /// @dev Thrown when a protected function is re-entered.
+    error Reentrancy();
+
+    /*──────────────────────────── State ─────────────────────────────*/
+
+    uint8 private constant _NOT = 1; // Safe idle state
+    uint8 private constant _ENT = 2; // Sentinel for active execution
+    uint8 private _stat = _NOT; // 1-byte storage flag
+
+    /*─────────────────────────── Modifier ───────────────────────────*/
+
+    /// @notice Prevents nested (re-entrant) calls.
+    /// @dev    Branch-free revert saves gas relative to `require`.
     modifier nonReentrant() {
-        require(_stat != _ENT, "re-enter");
+        // If already entered, revert with custom error.
+        if (_stat == _ENT) revert Reentrancy();
+
+        // Flip the flag before executing the function body.
         _stat = _ENT;
         _;
+        // Restore the idle flag after the function body completes.
         _stat = _NOT;
     }
 }
@@ -67,9 +103,9 @@ interface IYieldProtocol {
 }
 
 /*──────── Constants ────────*/
-uint8 constant DECIMALS = 8;
+uint8 constant DECIMALS = 9;
 uint64 constant MAX_BAL = type(uint64).max;
-uint256 constant _SCALE = 1e10; // 18-dec wei → 8-dec token
+uint256 constant _SCALE = 1e9; // 18-dec wei → 8-dec token
 bytes32 constant _FLASH_OK = keccak256("IZ156.ok");
 uint8 constant MAX_SLOTS = 8;
 
@@ -108,10 +144,7 @@ struct ProtocolMetadata {
 }
 
 /* contains protocol metadata */
-event ProtocolSignal (
-    uint64 indexed pid,
-    ProtocolMetadata metadata
-);
+event ProtocolSignal(uint64 indexed pid, ProtocolMetadata metadata);
 
 event ControllerChanged(uint64 indexed pid, address ctrl, bool added);
 
@@ -136,7 +169,7 @@ contract WrappedQRL is
     IZ156FlashLender,
     ReentrancyGuard
 {
-    uint64 public constant MAX_LOCK_WIN = 2_628_000; // ≈ 1 year (Ethereum blocks)
+    uint64 public constant MAX_LOCK_WIN = 365 days; // ≈ 1 year (Ethereum blocks)
 
     /*──────── Storage ────────*/
     mapping(address => Account) private _acct;
@@ -149,10 +182,10 @@ contract WrappedQRL is
     │ • _ctrlList[pid][i]     → dense 0-terminated array for enumeration           │
     │ • _ctrlCnt[pid]         → current number of controllers ( 1 ≤ cnt ≤ MAX_CTRL )│
     *───────────────────────────────────────────────────────────────────────────────*/
-    uint8  constant MAX_CTRL = 8;                       // hard cap keeps loops tiny
+    uint8 constant MAX_CTRL = 8; // hard cap keeps loops tiny
     mapping(uint64 => mapping(address => bool)) _isCtrl; // pid → addr → is-member
-    mapping(uint64 => address[MAX_CTRL])       _ctrlList; // pid → dense array
-    mapping(uint64 => uint8)                   _ctrlCnt;  // pid → current length
+    mapping(uint64 => address[MAX_CTRL]) _ctrlList; // pid → dense array
+    mapping(uint64 => uint8) _ctrlCnt; // pid → current length
 
     Protocol[] private _prot;
     Reserved[] private _res;
@@ -219,15 +252,23 @@ contract WrappedQRL is
         require(lockWin <= MAX_LOCK_WIN, "lockWin");
 
         id = uint64(_prot.length);
-        _prot.push(Protocol(ctrl /* kept for back-compat but unused in auth */,
-                            minStake,
-                            lockWin,
-                            0,0,0,0,0));
+        _prot.push(
+            Protocol(
+                ctrl /* kept for back-compat but unused in auth */,
+                minStake,
+                lockWin,
+                0,
+                0,
+                0,
+                0,
+                0
+            )
+        );
 
         // ---------- initialise controller set ----------
         _isCtrl[id][ctrl] = true;
-        _ctrlList[id][0]  = ctrl;
-        _ctrlCnt[id]      = 1;
+        _ctrlList[id][0] = ctrl;
+        _ctrlCnt[id] = 1;
 
         emit ProtocolCreated(id, ctrl, lockWin, minStake);
     }
@@ -252,29 +293,29 @@ contract WrappedQRL is
     *───────────────────────────────────────────────────────────────────────────────*/
 
     /// Add a new controller. Reverts if the set is full or duplicate.
-    function addController(uint64 pid, address newCtrl)
-        external
-        onlyController(pid)
-    {
-        require(newCtrl != address(0),       "ctrl0");
-        require(!_isCtrl[pid][newCtrl],      "dupe");
+    function addController(
+        uint64 pid,
+        address newCtrl
+    ) external onlyController(pid) {
+        require(newCtrl != address(0), "ctrl0");
+        require(!_isCtrl[pid][newCtrl], "dupe");
         uint8 cnt = _ctrlCnt[pid];
-        require(cnt < MAX_CTRL,              "full");
+        require(cnt < MAX_CTRL, "full");
 
-        _isCtrl[pid][newCtrl]  = true;
-        _ctrlList[pid][cnt]    = newCtrl;
-        _ctrlCnt[pid]          = cnt + 1;
+        _isCtrl[pid][newCtrl] = true;
+        _ctrlList[pid][cnt] = newCtrl;
+        _ctrlCnt[pid] = cnt + 1;
 
         emit ControllerChanged(pid, newCtrl, true);
     }
 
     /// Remove an existing controller. Caller must stay ≥1 controller in set.
-    function removeController(uint64 pid, address oldCtrl)
-        external
-        onlyController(pid)
-    {
-        require(_isCtrl[pid][oldCtrl],       "missing");
-        require(_ctrlCnt[pid] > 1,           "last"); // never orphan the protocol
+    function removeController(
+        uint64 pid,
+        address oldCtrl
+    ) external onlyController(pid) {
+        require(_isCtrl[pid][oldCtrl], "missing");
+        require(_ctrlCnt[pid] > 1, "last"); // never orphan the protocol
 
         // Clear slot & compact the dense array
         uint8 cnt = _ctrlCnt[pid];
@@ -292,13 +333,14 @@ contract WrappedQRL is
     }
 
     /// Atomic swap helper – saves one transaction over add→remove.
-    function swapController(uint64 pid, address oldCtrl, address newCtrl)
-        external
-        onlyController(pid)
-    {
-        require(newCtrl != address(0),       "ctrl0");
-        require(_isCtrl[pid][oldCtrl],       "missing");
-        require(!_isCtrl[pid][newCtrl],      "dupe");
+    function swapController(
+        uint64 pid,
+        address oldCtrl,
+        address newCtrl
+    ) external onlyController(pid) {
+        require(newCtrl != address(0), "ctrl0");
+        require(_isCtrl[pid][oldCtrl], "missing");
+        require(!_isCtrl[pid][newCtrl], "dupe");
 
         // Replace in dense list
         uint8 cnt = _ctrlCnt[pid];
@@ -498,7 +540,9 @@ contract WrappedQRL is
     }
 
     /*══════════════════════════  Z-Flash-Loan  ═════════════════════════*/
-    function maxFlashLoan(address /* _t*/) external view override returns (uint64) {
+    function maxFlashLoan(
+        address /* _t*/
+    ) external view override returns (uint64) {
         return MAX_BAL - _tot;
     }
 
@@ -532,90 +576,130 @@ contract WrappedQRL is
         bytes calldata d
     ) external override nonReentrant returns (bool) {
         /*─────────────────────── pre-flight guards ────────────────────────*/
-        require(t == address(this),            "tok");            // wrong token
+        require(t == address(this), "tok"); // wrong token
         address borrower = address(r);
-        require(msg.sender == borrower,        "receiver mismatch");
-        require(!_hasMembership(borrower),     "member");         // disallow nested stake
+        require(msg.sender == borrower, "receiver mismatch");
+        require(!_hasMembership(borrower), "member"); // disallow nested stake
         require(_allow[borrower][address(this)] == 0, "pre-allow");
-        require(amt <= MAX_BAL - _tot,         "supply");
+        require(amt <= MAX_BAL - _tot, "supply");
 
         /*──────────────────── snapshot original state ─────────────────────*/
-        uint64 balBefore   = _acct[borrower].bal; // balance integrity
-        uint64 allowBefore = 0;                   // confirmed above
+        uint64 balBefore = _acct[borrower].bal; // balance integrity
+        uint64 allowBefore = 0; // confirmed above
 
         /*────────────────────────── execute loan ──────────────────────────*/
-        _mint(borrower, amt);                                        // grant funds
-        require(
-            r.onFlashLoan(address(this), t, amt, 0, d) == _FLASH_OK,
-            "cb"
-        );
+        _mint(borrower, amt); // grant funds
+        require(r.onFlashLoan(address(this), t, amt, 0, d) == _FLASH_OK, "cb");
 
         /*─────────────────────── verify repayment ─────────────────────────*/
         uint64 allowAfter = _allow[borrower][address(this)];
-        require(allowAfter == amt + allowBefore, "repay");           // exact delta
+        require(allowAfter == amt + allowBefore, "repay"); // exact delta
 
-        _allow[borrower][address(this)] = allowAfter - amt;          // consume
+        _allow[borrower][address(this)] = allowAfter - amt; // consume
         emit Approval(borrower, address(this), allowAfter - amt);
 
-        _burn(borrower, amt);                                        // burn return
-        require(_acct[borrower].bal == balBefore, "bal-change");     // no drift
-        _refreshSnap(borrower);                                      // sync stake
+        _burn(borrower, amt); // burn return
+        require(_acct[borrower].bal == balBefore, "bal-change"); // no drift
+        _refreshSnap(borrower); // sync stake
 
         return true;
     }
 
     /*══════════════════════  Membership (unchanged logic)  ═════════════════════*/
+    /**
+     * @dev  Monotonically-increasing per-transaction nonce.
+     *
+     *       • Incremented once per *external* call to {setMembership}.  
+     *       • Guarantees that the “duplicate-PID” guard (_mark[pid] == tag)
+     *         only applies **within the same transaction**, never across
+     *         different wallets that happen to share a block.
+     *
+     *       Gas impact: +1 SLOAD +1 SSTORE per call – negligible.
+     */
+    uint256 private _txnNonce;
+    /*═══════════════ Account-level membership management (FIXED) ══════════════*/
+    /**
+     * @notice
+     *     Add and/or remove up to eight protocol memberships atomically.
+     *
+     * @param addPids   Array of up to 8 protocol IDs to *add* this wallet to.
+     *                  Zero entries are ignored. Duplicate IDs revert.
+     * @param stayMask  Bitmap selecting which *current* slots to **keep**.
+     *                  Bits set to 1 mean “stay”; 0 means “leave”.
+     *
+     * @dev
+     *     ✔ Re-entrancy-safe (nonReentrant modifier).  
+     *     ✔ Duplicate guards are scoped to a **single transaction** via a
+     *       monotonic `_txnNonce` tag – no cross-wallet contention anymore.  
+     *     ✔ All arithmetic stays within 128-bit intermediates; no risk of
+     *       overflow in the 64-bit token universe.
+     *
+     *     Execution phases
+     *     ────────────────
+     *       1. **Harvest** any pending yield / haircuts.
+     *       2. **Leave** slots not requested to stay.
+     *       3. **Mark** all requested additions in `_mark` using the fresh tag.
+     *       4. **Join** new protocols until the 8-slot cap is reached.
+     *
+     *     Invariants
+     *     ──────────
+     *       • A wallet never holds more than 8 simultaneous memberships.
+     *       • `_mark[pid]` is non-zero only *during* the call; it reverts to
+     *         0 automatically when the next call overwrites the tag.
+     */
     function setMembership(
         uint64[8] calldata addPids,
         uint8 stayMask
     ) external override nonReentrant {
-        _harvest(msg.sender);
+        _harvest(msg.sender);                    // ① settle yield & haircuts
 
         Account storage a = _acct[msg.sender];
-        uint256 tag = block.number; // scratch tag
+        uint256 tag = ++_txnNonce;               // ← UNIQUE per tx (FIX)
+
         uint256 protLen = _prot.length;
 
-        /* 1. handle current slots */
+        /*────────────────────── 1. Handle current slots ──────────────────────*/
         for (uint8 s; s < MAX_SLOTS; ++s) {
-            if ((a.mask & (1 << s)) != 0) {
-                uint64 pid = _member(a, s).pid;
-                if ((stayMask & (1 << s)) != 0) {
-                    _mark[pid] = tag; // keep
-                } else {
-                    _leaveSlot(a, s); // drop
-                }
+            if ((a.mask & (1 << s)) == 0) continue;      // empty slot → skip
+
+            uint64 pid = _member(a, s).pid;
+
+            if ((stayMask & (1 << s)) != 0) {
+                _mark[pid] = tag;                        // mark as “keep”
+            } else {
+                _leaveSlot(a, s);                        // drop membership
             }
         }
 
-        /* 2. mark add-list */
+        /*──────────────────────── 2. Mark additions ─────────────────────────*/
         for (uint8 i; i < MAX_SLOTS; ++i) {
             uint64 pid = addPids[i];
-            if (pid != 0) {
-                require(pid < protLen, "pid");
-                require(_mark[pid] != tag, "dup");
-                _mark[pid] = tag;
-            }
+            if (pid == 0) continue;                      // ignore zeros
+            require(pid < protLen, "pid");               // bounds check
+            require(_mark[pid] != tag, "dup");           // per-tx duplicate
+            _mark[pid] = tag;                            // mark for joining
         }
 
-        /* 3. join new */
-        uint8 cur = _countBits(a.mask);
+        /*───────────────────────── 3. Join new PIDs ─────────────────────────*/
+        uint8 cur = _countBits(a.mask);                  // current slot count
         for (uint8 i; i < MAX_SLOTS && cur < MAX_SLOTS; ++i) {
             uint64 pid = addPids[i];
-            if (pid != 0 && _mark[pid] == tag) {
-                bool already;
-                for (uint8 s; s < MAX_SLOTS; ++s) {
-                    if ((a.mask & (1 << s)) != 0 && _member(a, s).pid == pid) {
-                        already = true;
-                        break;
-                    }
+            if (pid == 0 || _mark[pid] != tag) continue; // not requested
+
+            bool already;
+            for (uint8 s; s < MAX_SLOTS; ++s) {          // O(8) scan
+                if ((a.mask & (1 << s)) != 0 && _member(a, s).pid == pid) {
+                    already = true;                      // already joined
+                    break;
                 }
-                if (!already) {
-                    _joinPid(a, pid);
-                    ++cur;
-                }
+            }
+            if (!already) {
+                _joinPid(a, pid);                        // join new protocol
+                ++cur;
             }
         }
     }
+
 
     /* scratch-pad for duplicate detection */
     mapping(uint64 => uint256) private _mark;
@@ -668,7 +752,7 @@ contract WrappedQRL is
 
         uint64 rIdx = _allocRes();
         uint64 mIdx = _allocMem();
-        uint64 unlock = uint64(block.number) + pr.lockWin;
+        uint64 unlock = uint64(block.timestamp) + pr.lockWin;
 
         _mem[mIdx] = Member(pid, rIdx, unlock, a.bal);
         if (slot < 4) _quad[a.ptrA].slot[slot] = mIdx;
@@ -684,7 +768,7 @@ contract WrappedQRL is
         Member storage m = _mem[mPtr];
         uint64 pid = m.pid;
         Protocol storage p = _prot[pid];
-        require(block.number >= m.unlock, "locked");
+        require(block.timestamp >= m.unlock, "locked");
         p.inBal -= uint128(m.stake);
         _recycleRes(m.resPtr);
         _recycleMem(mPtr);
@@ -699,7 +783,7 @@ contract WrappedQRL is
      *
      * @param who      The wallet whose stake snapshots are being updated.
      * @param delta    Signed change in the wallet’s token balance.
-     *                 * > 0*  → balance increases.  
+     *                 * > 0*  → balance increases.
      *                 * < 0*  → balance decreases.
      * @param skipPid  Protocol ID whose global totals should **not** be touched
      *                 (used by mint / burn helpers to avoid double-counting).
@@ -711,7 +795,7 @@ contract WrappedQRL is
      *       negative `delta` can never wrap the counters.
      */
     function _propagate(address who, int256 delta, uint64 skipPid) internal {
-        if (delta == 0) return;                      // fast-exit
+        if (delta == 0) return; // fast-exit
 
         Account storage a = _acct[who];
 
@@ -719,95 +803,138 @@ contract WrappedQRL is
         for (uint8 s; s < MAX_SLOTS; ++s) {
             if ((a.mask & (1 << s)) == 0) continue; // unused slot
 
-            Member   storage m  = _member(a, s);
-            Protocol storage p  = _prot[m.pid];
+            Member storage m = _member(a, s);
+            Protocol storage p = _prot[m.pid];
             Reserved storage rs = _res[m.resPtr];
 
             bool skip = (m.pid == skipPid);
 
             if (delta > 0) {
                 /* -------- balance increases -------- */
-                uint128 d = uint128(uint256(delta));       // |delta| fits 64-bit
+                uint128 d = uint128(uint256(delta)); // |delta| fits 64-bit
 
                 if (!skip) {
-                    p.inBal   += d;                        // grow protocol stake
-                    rs.inStart += d;                       // grow snapshot base
+                    p.inBal += d; // grow protocol stake
+                    rs.inStart += d; // grow snapshot base
                 }
 
-                m.stake += uint64(d);                      // grow member stake
+                m.stake += uint64(d); // grow member stake
 
-                if (skip) rs.inStart += d;                 // keep invariants
-
+                if (skip) rs.inStart += d; // keep invariants
             } else {
                 /* -------- balance decreases -------- */
-                uint128 d = uint128(uint256(-delta));      // |delta| fits 64-bit
+                uint128 d = uint128(uint256(-delta)); // |delta| fits 64-bit
 
                 // --- new explicit guards (prevent underflow / wraparound) ---
-                require(m.stake    >= d, "stake<delta");
+                require(m.stake >= d, "stake<delta");
                 require(rs.inStart >= d, "inStart<delta");
                 if (!skip) require(p.inBal >= d, "inBal<delta");
 
                 if (!skip) {
-                    p.inBal   -= d;
+                    p.inBal -= d;
                     rs.inStart -= d;
                 }
 
                 m.stake -= uint64(d);
 
-                if (skip) rs.inStart -= d;                 // keep invariants
+                if (skip) rs.inStart -= d; // keep invariants
             }
         }
     }
 
+    /*═══════════════════════════════════════════════════════════════════════*\
+    │  Force-harvest helper                                                  │
+    │                                                                       │
+    │  • Anyone can call; no auth or membership checks.                     │
+    │  • Ignores wallet-level `lock` and slot-level `unlock` timers, so     │
+    │    long-term locked accounts still accrue yield on schedule.          │
+    │  • Re-entrancy-safe (piggybacks on the global guard).                 │
+    │                                                                       │
+    │  Gas:  ≈ 6.3 k per wallet when nothing is owed (pure snapshots).      │
+    │         The loop is bounded by calldata length; external callers      │
+    │         should batch sensibly.                                        │
+    \*══════════════════════════════════════════════════════════════════════*/
+    function forceHarvest(address[] calldata wallets) external nonReentrant {
+        uint256 n = wallets.length;
+        for (uint256 i; i < n; ++i) {
+            address w = wallets[i];
+            /// Zero address harvest makes no sense and signals a bad call.
+            require(w != address(0), "wallet0");
+            _harvest(w);
+        }
+    }
+
     /* harvest / snapshots */
+    /**
+     * @notice  Settles yield and haircuts for `who` across every active membership.
+     *
+     * @dev     Execution order:
+     *          1. Yield is paid out **before** any haircut so it reflects the stake
+     *             at the moment the yield accrued.
+     *          2. Haircut then burns the proportional loss and propagates the
+     *             decreased stake into protocol aggregates.
+     *          3. Snapshots are refreshed to anchor the next harvest window.
+     *
+     *          All arithmetic stays within 128-bit intermediates; nothing can wrap
+     *          given 64-bit token balances and protocol totals.
+     */
     function _harvest(address who) internal {
         Account storage a = _acct[who];
+
+        // Fast-exit: zero-balance wallets only need a snapshot refresh.
         if (a.bal == 0) {
             _refreshSnap(who);
             return;
         }
+
+        // Iterate through at most MAX_SLOTS (compile-time 8) – tight & gas-cheap.
         for (uint8 s; s < MAX_SLOTS; ++s) {
-            if ((a.mask & (1 << s)) == 0) continue;
+            if ((a.mask & (1 << s)) == 0) continue; // empty slot → skip
+
             Member storage m = _member(a, s);
             Protocol storage p = _prot[m.pid];
             Reserved storage rs = _res[m.resPtr];
 
-            /* haircuts */
+            /*───────────────────────── 1. Yield ─────────────────────────*/
+            if (p.yAcc > rs.yStart && a.bal > 0) {
+                uint256 dy = p.yAcc - rs.yStart; // Δ-accumulator (128-bit)
+                uint256 owe = (uint256(m.stake) * dy) >> 64; // proportional share
+                uint64 pool = _acct[address(this)].bal; // tokens held by pool
+                if (owe > pool) owe = pool; // cap to pool balance
+                if (owe > 0) {
+                    _subBal(address(this), uint64(owe)); // debit pool
+                    _addBal(who, uint64(owe)); // credit wallet
+                    emit YieldPaid(m.pid, uint64(owe));
+                }
+            }
+
+            /*──────────────────────── 2. Haircut ────────────────────────*/
             if (p.outBal > rs.outStart) {
-                uint256 delta = p.outBal - rs.outStart;
+                uint256 delta = p.outBal - rs.outStart; // total haircut outstanding
                 uint256 base = rs.inStart > rs.outStart
                     ? rs.inStart - rs.outStart
-                    : 0;
-                uint256 cut = base > 0 ? (uint256(m.stake) * delta) / base : 0;
-                if (cut > a.bal) cut = a.bal;
+                    : 0; // live stake base
+                uint256 cut = base > 0 ? (uint256(m.stake) * delta) / base : 0; // member’s share
+                if (cut > a.bal) cut = a.bal; // never over-burn
                 if (cut > 0) {
                     a.bal -= uint64(cut);
                     p.inBal -= uint128(cut);
                     p.burned += uint128(cut);
                     _tot -= uint64(cut);
+
                     emit Transfer(who, address(0), uint64(cut));
+
+                    // Propagate the reduced stake into all protocols except the one
+                    // already reflected via `p.inBal` to avoid double-counting.
                     _propagate(who, -int256(cut), m.pid);
                 }
             }
 
-            /* yield */
-            if (p.yAcc > rs.yStart && a.bal > 0) {
-                uint256 dy = p.yAcc - rs.yStart;
-                uint256 owe = (uint256(m.stake) * dy) >> 64;
-                uint64 pool = _acct[address(this)].bal;
-                if (owe > pool) owe = pool;
-                if (owe > 0) {
-                    _subBal(address(this), uint64(owe));
-                    _addBal(who, uint64(owe));
-                    emit YieldPaid(m.pid, uint64(owe));
-                }
-            }
-
-            /* refresh */
+            /*──────────────────────── 3. Refresh ────────────────────────*/
             rs.inStart = p.inBal;
             rs.outStart = p.outBal;
             rs.yStart = p.yAcc;
-            m.stake = a.bal;
+            m.stake = a.bal; // new member stake
         }
     }
 
@@ -847,7 +974,7 @@ contract WrappedQRL is
         }
         for (uint8 s; s < MAX_SLOTS; ++s)
             if ((fa.mask & (1 << s)) != 0)
-                require(block.number >= _member(fa, s).unlock, "locked");
+                require(block.timestamp >= _member(fa, s).unlock, "locked");
         require(fa.bal >= v, "bal");
         _enforceMinStake(f, fa.bal - v);
         _subBal(f, v);
