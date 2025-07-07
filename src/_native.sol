@@ -153,6 +153,52 @@ struct Account {
     uint56 lock; // if 0, no lockup
 }
 
+/*───────────────────────────────────────────────────────────────────────────────*\
+│  Wrapped QRL-Z — “𝘛𝘩𝘦 𝘓𝘪𝘮𝘪𝘵 𝘰𝘧 𝘘”                                                │
+│                                                                               │
+│  Lore                                                                         │
+│  ───                                                                          │
+│  • Q-day is coming—nobody knows when, only that RSA and ECDSA will be dust.   │
+│    The Quantum-Resistant Ledger (QRL) bets on hashes to outlive the blast.    │
+│  • Wrapped QRL-Z locks native QRL inside a self-custodial vault and mints a   │
+│    64-bit ZRC-20 twin.  No multisig guardians, no admin keys, no DAO veto.    │
+│  • Yield is socialised at protocol level: controllers add rewards, reserve    │
+│    haircuts when things go sour, and the maths pays stakers first, burns next.│
+│  • Every number that matters fits in 64 bits—total supply included.  The code │
+│    panics long before an overflow, making “too-big-to-fail” a compile-time    │
+│    impossibility.                                                             │
+│  • Zero-fee flash loans exist because they’re free in Trad-Fi too—what matters│
+│    is payback certainty, enforced here with allowance-delta accounting and a  │
+│    single keccak handshake.                                                   │
+│  • Re-entrancy is barred by a one-byte flag, branch-free.                     │
+│                                                                               │
+│  Guarantees (reader’s checklist)                                              │
+│  ────────────────────────────────────────────────                             │
+│  1.  ∑(balances) == totalSupply  (strict-equality, 64-bit)                    │
+│  2.  Native backing: 1 WQRL-Z ↔ 1 QRL (9-dec)                                 │
+│  3.  Harvest is idempotent—run it twice, state is identical.                  │
+│  4.  Controllers can *reserve* haircuts but never seize unlocked stake.       │
+│  5.  A wallet can never join > 8 protocols, so every loop is O(8) gas-wise.   │
+│                                                                               │
+│  Quick-start                                                                  │
+│  ──────────                                                                   │
+│    // Wrap native QRL                                                         │
+│    w.deposit{value: 100e18}();          // mint 100 WQRL-Z                    │
+│                                                                               │
+│    // Create a 30-day yield protocol with 1 token min-stake                   │
+│    uint64 pid = w.createProtocol(ctrl, 30 days, 1e9);                         │
+│                                                                               │
+│    // Stake and join                                                          │
+│    w.setMembership([pid,0,0,0,0,0,0,0], 0);                                   │
+│                                                                               │
+│    // Fund yield (controller only)                                            │
+│    w.addYield(pid, 10e9);                // +10 tokens to pool                │
+│                                                                               │
+│    // Harvest anyone                                                          │
+│    w.forceHarvest([wallet]);                                                  │
+│                                                                               │
+│  Read the tests before trusting a word of this comment.                       │
+\*───────────────────────────────────────────────────────────────────────────────*/
 contract WrappedQRL is
     IYieldProtocol,
     IZRC20,
@@ -214,6 +260,7 @@ contract WrappedQRL is
     event AccountLocked(address wallet, uint56 endsAt);
 
     function lock(uint56 endsAt) external nonReentrant {
+        require(endsAt > block.timestamp, "past");
         Account storage a = _acct[msg.sender];
         a.lock = endsAt;
         emit AccountLocked(msg.sender, endsAt);
@@ -1138,13 +1185,7 @@ contract WrappedQRL is
         require(t != address(0), "to0");
         Account storage fa = _acct[f];
         // require the account is unlocked
-        if (fa.lock != 0) {
-            require(block.timestamp >= fa.lock, "locked");
-            fa.lock = 0;
-        }
-        for (uint8 s; s < MAX_SLOTS; ++s)
-            if ((fa.mask & (1 << s)) != 0)
-                require(block.timestamp >= _member(fa, s).unlock, "locked");
+        _assertUnlocked(fa);
         require(fa.bal >= v, "bal");
         _enforceMinStake(f, fa.bal - v);
         _subBal(f, v);
