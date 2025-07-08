@@ -208,7 +208,7 @@ contract WrappedQRL is
     /* contains protocol metadata */
     event ProtocolSignal(uint64 indexed pid, ProtocolMetadata metadata);
 
-    uint64 public constant MAX_LOCK_WIN = 365 days; // ≈ 1 year (Ethereum blocks)
+    uint64 public constant MAX_LOCK_WIN = 365 days; // ≈ 1 year
 
     /*──────── Storage ────────*/
     mapping(address => Account) private _acct;
@@ -470,7 +470,7 @@ contract WrappedQRL is
     /*──────────────────────── Unlock guards ────────────────────────*/
     /// @dev Reverts if the wallet or any membership slot is still locked.
     ///
-    ///      • Account-level lock: `Account.lock` (one timestamp for the whole wallet)  
+    ///      • Account-level lock: `Account.lock` (one timestamp for the whole wallet)
     ///      • Slot-level lock  : `Member.unlock` (per-protocol timer)
     ///
     ///      Assumptions
@@ -488,7 +488,7 @@ contract WrappedQRL is
         // ② Per-slot locks
         uint8 m = a.mask;
         for (uint8 s; s < MAX_SLOTS; ++s) {
-            if ((m & (1 << s)) == 0) continue;          // empty slot → skip
+            if ((m & (1 << s)) == 0) continue; // empty slot → skip
             Member storage mbr = _member(a, s);
             require(block.timestamp >= mbr.unlock, "locked");
         }
@@ -613,12 +613,15 @@ contract WrappedQRL is
     }
 
     /*══════════════════════════  Z-Flash-Loan  ═════════════════════════*/
+
+    // PSYCHOWOLF SETTINGS
     function maxFlashLoan(
         address /* _t*/
     ) external view override returns (uint64) {
         return MAX_BAL - _tot;
     }
 
+    // PSYCHOWOLF SETTINGS
     function flashFee(
         address /*_t*/,
         uint64
