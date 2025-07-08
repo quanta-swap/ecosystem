@@ -394,6 +394,9 @@ contract StandardUtilityToken is IZRC20 {
 /*═══════════════════════════════════════════════════════════════════════*\
 │                        UtilityTokenDeployer (factory)                   │
 \*═══════════════════════════════════════════════════════════════════════*/
+
+event Deployed(address indexed which);
+
 contract UtilityTokenDeployer {
     /**
      * @notice Deploy a new {StandardUtilityToken} with a fixed supply.
@@ -429,5 +432,6 @@ contract UtilityTokenDeployer {
             root
         );
         addr = address(token);
+        emit Deployed(addr);
     }
 }

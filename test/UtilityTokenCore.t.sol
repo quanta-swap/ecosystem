@@ -890,6 +890,26 @@ contract StandardUtilityTokenTest is Test {
         dep.create("X", "X", 1, 9, 0, AL); // lockTime_ == 0 bubbles up
     }
 
+    function testCreateEmitsDeployedEvent() public {
+        UtilityTokenDeployer dep = new UtilityTokenDeployer();
+
+        // We only care that the *event* is emitted, not the exact address,
+        // so we ignore the (indexed) topic value and just match the signature.
+        vm.expectEmit(false /* topic1 */, false, false, true /* data */);
+        emit Deployed(address(0)); // placeholder; topic value ignored
+
+        address token = dep.create(
+            "Utility",
+            "UTK",
+            1_000_000,
+            9,
+            1 hours,
+            address(this)
+        );
+
+        assertTrue(token != address(0), "token addr is zero");
+    }
+
     /*───────────────── helpers ─────────────────*/
 
     /**
