@@ -711,11 +711,8 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
      */
     function _mint(address to, uint64 v) internal {
         _checkCap(v); // total-supply guard
-
-        // NEW: per-account guard
         uint64 bal = _accounts[to].balance;
-
-        _accounts[to].balance = bal + v; // now safe
+        _accounts[to].balance = bal + v;
         _tot += v;
         emit Transfer(address(0), to, v);
     }
@@ -734,7 +731,6 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     function _burn(address from, uint64 v) internal {
         Account storage acc = _accounts[from];
         if (acc.balance < v) revert InsufficientBalance(acc.balance, v);
-
         unchecked {
             acc.balance -= v;
             _tot -= v;

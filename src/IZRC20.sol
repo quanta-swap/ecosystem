@@ -41,7 +41,7 @@ interface IZRC20 {
     └────────────────────────────*/
     function name()        external view returns (string memory);
     function symbol()      external view returns (string memory);
-    function decimals()    external pure returns (uint8); // SHOULD return 8-18
+    function decimals()    external view returns (uint8); // SHOULD return 8-18
 
     /*───────────────────────────────
     │  ZRC-20 Read-only Functions   │
