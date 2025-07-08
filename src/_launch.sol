@@ -10,6 +10,7 @@ struct RocketConfig {
     uint64 totalOfferingSupply;
     uint32 percentToLiquidity;
     uint32 percentOfLiquidityBurned;
+    uint32 percentOfLiquidityCreator;
     uint64 liquidityLockedUpTime;
     uint64 liquidityDeployTime;
 }

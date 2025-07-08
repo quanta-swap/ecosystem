@@ -86,12 +86,25 @@ contract StandardUtilityToken is IZRC20 {
     }
 
     /*═══════════════  Locker administration  ══════════════*/
+    /**
+     * @notice Add or remove a locker authorised to lock the caller’s tokens.
+     * @dev    Emits a {LockerSet} event.
+     * @param  locker   Address to approve or revoke.
+     * @param  approved Pass true to grant rights, false to revoke.
+     * @custom:error ZeroAddress locker is the zero address.
+     */
     function setLocker(address locker, bool approved) external {
         if (locker == address(0)) revert ZeroAddress(locker);
         _locker[msg.sender][locker] = approved;
         emit LockerSet(msg.sender, locker, approved);
     }
 
+    /**
+     * @notice Query whether a locker is authorised for a given holder.
+     * @param  holder  Token holder being checked.
+     * @param  locker  Potential locker address.
+     * @return authorised True if locker may call {lock} on behalf of holder.
+     */
     function isLocker(
         address holder,
         address locker
@@ -100,6 +113,17 @@ contract StandardUtilityToken is IZRC20 {
     }
 
     /*════════════════  Lock routine  ═════════════════*/
+
+    /**
+     * @notice Lock `amount` tokens in `holder`’s account for the current epoch.
+     * @dev    • Only authorised lockers may call.  
+     *         • A new epoch automatically resets previous locks.  
+     *         • Emits a {TokensLocked} event.
+     * @param  holder  Account whose tokens will be locked.
+     * @param  amount  Number of tokens to lock (must not exceed unlocked balance).
+     * @custom:error UnauthorizedLocker  Caller is not an approved locker for holder.
+     * @custom:error InsufficientUnlocked Unlocked balance is less than amount.
+     */
     function lock(address holder, uint64 amount) external {
         if (!_locker[holder][msg.sender])
             revert UnauthorizedLocker(holder, msg.sender);
@@ -121,23 +145,28 @@ contract StandardUtilityToken is IZRC20 {
     }
 
     /*═════════════ ERC-20 view getters ═════════════*/
+
+    /**
+     * @notice Fixed total token supply.
+     */
     function totalSupply() external view override returns (uint64) {
         return _tot;
     }
-    function balanceOf(address a) external view override returns (uint64) {
-        return _acct[a].balance;
+    /**
+     * @notice Total balance (locked + unlocked) of an account.
+     * @param  account Address to query.
+     * @return balance Current balance of the account.
+     */
+    function balanceOf(address account) external view override returns (uint64 balance) {
+        return _acct[account].balance;
     }
     /**
-     * @notice Current tokens that are still locked for `holder`.
-     * @dev    The lock counter is scoped to the sender’s current
-     *         epoch window. If the stored epoch is stale, the
-     *         lock has implicitly expired and the function
-     *         returns `0`.
-     * @param  holder  Address to query.
-     * @return amount  Locked tokens that cannot be transferred
-     *                 until the next epoch starts.
+     * @notice Tokens still locked for the current epoch.
+     * @dev    If the stored window is stale, returns 0.
+     * @param  holder Address to query.
+     * @return locked Amount that remains locked until the epoch ends.
      */
-    function balanceOfLocked(address holder) external view returns (uint64 amount) {
+    function balanceOfLocked(address holder) external view returns (uint64 locked) {
         Account storage acc = _acct[holder];
 
         // Re‐compute the epoch that governs this lock
@@ -147,18 +176,37 @@ contract StandardUtilityToken is IZRC20 {
         // has expired (treated as 0); otherwise return acc.locked
         return (epoch == acc.window) ? acc.locked : 0;
     }
+
+    /**
+     * @notice Remaining allowance from owner to spender.
+     * @param  owner    Address that granted the allowance.
+     * @param  spender  Address that can spend the tokens.
+     * @return rem      Remaining allowance amount.
+     */
     function allowance(
-        address o,
-        address s
-    ) external view override returns (uint64) {
-        return _allow[o][s];
+        address owner,
+        address spender
+    ) external view override returns (uint64 rem) {
+        return _allow[owner][spender];
     }
+
+    /**
+     * @notice Human-readable token name.
+     */
     function name() external view override returns (string memory) {
         return _name;
     }
+
+    /**
+     * @notice Token symbol.
+     */
     function symbol() external view override returns (string memory) {
         return _symbol;
     }
+
+    /**
+     * @notice Number of display decimals.
+     */
     function decimals() external view override returns (uint8) {
         return _decimals;
     }
@@ -166,30 +214,71 @@ contract StandardUtilityToken is IZRC20 {
     /*──────── allowances ────────*/
     mapping(address => mapping(address => uint64)) private _allow;
 
-    function approve(address s, uint64 v) external override returns (bool) {
-        if (s == address(0)) revert ZeroAddress(s);
-        _allow[msg.sender][s] = v;
-        emit Approval(msg.sender, s, v);
+    /**
+     * @notice Set or overwrite an allowance.
+     * @dev    Emits an {Approval} event.
+     * @param  spender Address that will be allowed to spend.
+     * @param  value   Allowance amount (use max uint64 for unlimited).
+     * @return ok      Always true on success.
+     * @custom:error ZeroAddress spender is the zero address.
+     */
+    function approve(address spender, uint64 value) external override returns (bool ok) {
+        if (spender == address(0)) revert ZeroAddress(spender);
+        _allow[msg.sender][spender] = value;
+        emit Approval(msg.sender, spender, value);
         return true;
     }
 
     /*──────── transfers ────────*/
-    function transfer(address to, uint64 v) external override returns (bool) {
-        _xfer(msg.sender, to, v);
+
+    /**
+     * @notice Transfer tokens from caller to another address.
+     * @dev    Emits a {Transfer} event.
+     * @param  to     Recipient address.
+     * @param  value  Amount to transfer.
+     * @return ok     Always true on success.
+     * @custom:error InsufficientUnlocked Unlocked balance is less than value.
+     * @custom:error ZeroAddress         Recipient is the zero address.
+     */
+    function transfer(address to, uint64 value) external override returns (bool ok) {
+        _xfer(msg.sender, to, value);
         return true;
     }
 
+    /**
+     * @notice Transfer tokens using an existing allowance.
+     * @dev    Emits {Transfer} and possibly {Approval}.
+     * @param  from   Source address.
+     * @param  to     Destination address.
+     * @param  value  Amount to transfer.
+     * @return ok     Always true on success.
+     * @custom:error InsufficientAllowance Allowance is less than value.
+     * @custom:error InsufficientUnlocked  Source unlocked balance is insufficient.
+     * @custom:error ZeroAddress           Recipient is the zero address.
+     */
     function transferFrom(
-        address f,
-        address t,
-        uint64 v
+        address from,
+        address to,
+        uint64 value
     ) external override returns (bool) {
-        _spendAllowance(f, v);
-        _xfer(f, t, v);
+        _spendAllowance(from, value);
+        _xfer(from, to, value);
         return true;
     }
 
     /*════════════ batch helpers ════════════*/
+
+    /**
+     * @notice Send many transfers from the caller in one transaction.
+     * @dev    Emits one {Transfer} per recipient.
+     * @param  to  List of recipient addresses.
+     * @param  v   List of token amounts (must match `to` length).
+     * @return ok  Always true on success.
+     * @custom:error LengthMismatch        Arrays have different lengths.
+     * @custom:error SumOverflow           Aggregate exceeds uint64 max.
+     * @custom:error InsufficientUnlocked  Caller’s unlocked balance is insufficient.
+     * @custom:error ZeroAddress           One of the recipients is the zero address.
+     */
     function transferBatch(
         address[] calldata to,
         uint64[] calldata v
@@ -218,6 +307,19 @@ contract StandardUtilityToken is IZRC20 {
         return true;
     }
 
+    /**
+     * @notice Execute multiple allowance-based transfers in one call.
+     * @dev    Emits one {Transfer} per recipient and possibly {Approval}.
+     * @param  from  Source address.
+     * @param  to    List of recipient addresses.
+     * @param  v     List of token amounts (must match `to` length).
+     * @return ok    Always true on success.
+     * @custom:error LengthMismatch        Arrays have different lengths.
+     * @custom:error SumOverflow           Aggregate exceeds uint64 max.
+     * @custom:error InsufficientAllowance Allowance is less than aggregate.
+     * @custom:error InsufficientUnlocked  Source unlocked balance is insufficient.
+     * @custom:error ZeroAddress           One of the recipients is the zero address.
+     */
     function transferFromBatch(
         address from,
         address[] calldata to,
@@ -294,11 +396,19 @@ contract StandardUtilityToken is IZRC20 {
 \*═══════════════════════════════════════════════════════════════════════*/
 contract UtilityTokenDeployer {
     /**
-     * @notice Deploy a new `StandardUtilityToken`.
-     * @dev    Reverts with `ZeroAddress` if `root` is zero; bubbles any error
-     *         from the token constructor (e.g. `LockTimeZero`).
-     *
-     * @return addr  Address of the deployed token.
+     * @notice Deploy a new {StandardUtilityToken} with a fixed supply.
+     * @dev    • All tokens are minted to `root`.  
+     *         • Bubbles any constructor error, e.g. {LockTimeZero}.  
+     *         • Emits the token’s own {Transfer} event during deployment.
+     * @param  name_      Token name.
+     * @param  symbol_    Token symbol.
+     * @param  supply64   Fixed supply (≤ 2⁶⁴−1).
+     * @param  decimals_  Display decimals.
+     * @param  lockTime_  Epoch duration in seconds (must be > 0).
+     * @param  root       Address that will receive the full supply.
+     * @return addr       Address of the deployed token.
+     * @custom:error ZeroAddress  root is the zero address.
+     * @custom:error LockTimeZero lockTime_ is zero (propagated from token).
      */
     function create(
         string calldata name_,
