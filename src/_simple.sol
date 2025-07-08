@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.30;
 
 /*═══════════════════════════════════════════════════════════════════════════════*\
 │                           IZRC-20 interface (64-bit)                           │
@@ -81,11 +81,79 @@ abstract contract ReentrancyGuard {
  * @title Wrapped Quanta
  * @author Elliott G. Dehnbostel
  * @notice 64-bits for efficient on-chain operations (sized to the old "shor" unit)
- * 
+ *
  * This is not a 100% minimal contract. It features account locking to prevent some
  * wrench attacks.
  */
 contract WrappedQRL is IZRC20, ReentrancyGuard {
+    /*═══════════════════════════════════════════════════════════════════════════════*\
+    │  Typed Errors – canonicalised replacements for string-based reverts            │
+    │  Each error is documented and, where useful, carries contextual parameters     │
+    │  to aid off-chain decoding and debugging.                                      │
+    \*═══════════════════════════════════════════════════════════════════════════════*/
+
+    /*──────────────────────── wallet-lock errors ────────────────────────*/
+    /// @notice `lock()` called with a zero duration.
+    /// @param  duration Seconds supplied by the caller (always 0 here).
+    error DurationZero(uint32 duration);
+
+    /// @notice Requested lock would shorten or equal the current lock.
+    /// @param  requestedUntil The timestamp the caller is trying to extend to.
+    /// @param  currentUntil   The caller’s existing `unlocksAt` timestamp.
+    error LockShorter(uint64 requestedUntil, uint64 currentUntil);
+
+    /// @notice Wallet is still time-locked.
+    /// @param  unlockAt UNIX timestamp when the caller becomes unlocked.
+    error WalletLocked(uint64 unlockAt);
+
+    /*──────────────────────── deposit / withdraw errors ─────────────────*/
+    /// @notice Native value sent is below one full token (1 × 10⁹ wei).
+    /// @param  value Wei supplied with the transaction.
+    error MinDepositOneToken(uint256 value);
+
+    /// @notice Low-level ETH refund of deposit dust failed.
+    /// @param  to     Address that was to receive the refund.
+    /// @param  amount Wei that failed to send.
+    error RefundFailed(address to, uint256 amount);
+
+    /// @notice Zero amount specified where a positive value is required.
+    error ZeroAmount();
+
+    /// @notice Account balance is smaller than the requested amount.
+    /// @param  balance Current balance.
+    /// @param  needed  Amount required to proceed.
+    error InsufficientBalance(uint256 balance, uint256 needed);
+
+    /// @notice Native token transfer in `withdraw()` failed.
+    /// @param  to     Withdrawal recipient.
+    /// @param  amount Wei attempted to send.
+    error NativeTransferFailed(address to, uint256 amount);
+
+    /*──────────────────────── allowance errors ──────────────────────────*/
+    /// @notice Allowance is insufficient for the attempted spend.
+    /// @param  allowance Remaining allowance.
+    /// @param  needed    Amount that was attempted to spend.
+    error InsufficientAllowance(uint256 allowance, uint256 needed);
+
+    /*──────────────────────── batch / transfer errors ───────────────────*/
+    /// @notice The zero address was supplied where a non-zero address is required.
+    error ZeroAddress();
+
+    /// @notice Calldata array lengths do not match.
+    /// @param  lenA Length of the `to` array.
+    /// @param  lenB Length of the `amount` array.
+    error LengthMismatch(uint256 lenA, uint256 lenB);
+
+    /// @notice Sum of batch amounts would overflow 64-bit token units.
+    /// @param  attemptedSum The aggregate amount that exceeded 2⁶⁴−1.
+    error SumOverflow(uint256 attemptedSum);
+
+    /*──────────────────────── mint / cap errors ────────────────────────*/
+    /// @notice Mint would exceed the 64-bit total supply cap.
+    /// @param  totalSupply Current total supply before mint.
+    /// @param  mintAmount  Amount attempted to mint.
+    error CapExceeded(uint256 totalSupply, uint256 mintAmount);
+
     /*──────── constants ────────*/
     uint8 public constant DECIMALS = 9;
     uint64 public constant MAX_BAL = type(uint64).max; // 2⁶⁴−1
@@ -105,17 +173,17 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
 
     /*──────── events ────────*/
     event AccountLocked(address indexed wallet, uint64 unlocksAt);
+    event Deposited(address indexed account, uint64 amount);
+    event Withdrawn(address indexed account, uint64 amount);
 
     /*──────────────────────── constructor ────────────────────────*/
     /**
-     * @notice Deploys WrappedQRL.  If native QRL is sent along with the
-     *         deployment it is wrapped at a 1 QRL (18 dec) → 1 WQ (9 dec) rate.
-     *         Any dust that cannot be expressed as a whole-token unit is
-     *         immediately refunded to the deployer.
-     *
-     * @dev    • Uses the same rounding logic as {deposit}.
-     *         • Reverts if less than one full token’s worth is provided so that
-     *           the deployment cannot silently mint zero.
+     * @notice Deploys Wrapped QRL and optionally wraps the native QRL sent
+     *         alongside the deployment transaction.
+     * @dev    - Reuses {deposit} to mint, thereby exercising its
+     *           validations and rounding logic.
+     *         - Reverts if `msg.value` is non-zero yet smaller than
+     *           one full token (1 × 10^9 wei); prevents silent zero-mints.
      */
     constructor() payable {
         if (msg.value > 0) {
@@ -123,105 +191,202 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         }
     }
 
-    // For sanity testing purposes only.
+    /**
+     * @notice Returns a specific link for test sanity checks.
+     * @dev    Pure vanity helper; has no on-chain effect.
+     * @return s The link.
+     */
     function theme() external pure returns (string memory s) {
         return "https://www.youtube.com/watch?v=pJvduG0E628";
     }
 
     /*════════════════════ wallet-lock API ══════════════════════*/
     /**
-     * @notice Freeze caller’s balance for `duration` seconds.
-     * @param duration  Seconds to lock. Must be > 0.
-     *
-     * Emits: {AccountLocked}.
-     *
-     * Self-locking MAY enhance security for non-zero holders.
-     * Not by a tremendous amount, but every little bit counts!
-     * It protects owners from "wrench attacks" and other forms
-     * of coercive compromise. No maximum length on purpose.
+     * @notice Locks the caller’s balance for `duration` seconds.
+     * @dev    Reverts with:
+     *         - `DurationZero(duration)`         when `duration == 0`.
+     *         - `LockShorter(newUntil, oldUntil)` when the new lock would not
+     *           extend the current lock window.
+     * @param  duration  Seconds to remain locked (must be > 0 and strictly extend any
+     *                   existing lock).
      */
     function lock(uint32 duration) external nonReentrant {
-        require(duration > 0, "dur0");
-        Account storage acc = _accounts[msg.sender];
-        uint64 lockTime = acc.unlockAt;
-        if (lockTime > block.timestamp) {
-            require(duration > lockTime - block.timestamp, "shorter");
-        }
+        // ──────────────────── sanity check ─────────────────────
+        // A zero-second lock is a no-op and almost certainly a user error.
+        if (duration == 0) revert DurationZero(duration);
 
-        uint64 until = uint64(block.timestamp + duration);
-        acc.unlockAt = until;
-        emit AccountLocked(msg.sender, until);
+        // ──────────────────── fetch account ────────────────────
+        Account storage acc = _accounts[msg.sender];
+        uint64 currentUntil = acc.unlockAt; // 0 when not locked
+
+        // ──────────────────── extension logic ──────────────────
+        if (currentUntil > block.timestamp) {
+            // Wallet is already locked; new lock must push the edge forward.
+            uint64 newUntil = uint64(block.timestamp + duration);
+            if (newUntil <= currentUntil) {
+                revert LockShorter(newUntil, currentUntil);
+            }
+            acc.unlockAt = newUntil;
+            emit AccountLocked(msg.sender, newUntil);
+        } else {
+            // Wallet is currently unlocked; establish a fresh lock window.
+            uint64 until = uint64(block.timestamp + duration);
+            acc.unlockAt = until;
+            emit AccountLocked(msg.sender, until);
+        }
     }
 
-    /// @notice UNIX timestamp when `who` unlocks. 0 means no lock.
+    /**
+     * @notice Returns the UNIX timestamp at which `who` unlocks.
+     * @dev    `0` means the wallet is currently unlocked.
+     * @param  who The address being queried.
+     * @return The lock expiry timestamp.
+     */
     function unlocksAt(address who) external view returns (uint64) {
         return _accounts[who].unlockAt;
     }
 
     /*───────────────────────── deposit ───────────────────────────*/
     /**
-     * @notice Wrap native QRL into WQ.
+     * @notice Wrap native QRL into WQ at a 1 QRL → 1 WQ rate.
      *
-     *         • Accepts **any** amount ≥ 1 WQ (1 × 10⁹ wei).
-     *         • Mints `floor(msg.value / 1e9)` tokens.
-     *         • Immediately refunds the leftover wei (if any) back to the caller,
-     *           so no dust is ever trapped.
+     * Detail
+     * ------
+     * • Accepts any amount ≥ 1 × 10⁹ wei (1 wrapped token).
+     * • Mints `floor(msg.value / 1e9)` tokens.
+     * • Refunds leftover wei in the same transaction.
+     * • Emits {Deposited} and an ERC-20 {Transfer} from the zero address.
      *
-     * Emits: {Transfer} from the zero address for the minted amount.
+     * Custom Errors
+     * -------------
+     * • `MinDepositOneToken(value)` — `msg.value` is smaller than 1 × 10⁹ wei.
+     * • `RefundFailed(to, amount)` — native-asset refund (dust) could not be sent.
      *
-     * @dev    Keeps the entire operation non-reentrant via the inherited guard.
-     *         If the refund fails, the whole call reverts—user funds stay safe.
+     * Events
+     * ------
+     * • `Deposited(caller, mintedAmount)` on success.
+     *
+     * Reentrancy
+     * ----------
+     * Protected by the {nonReentrant} modifier from {ReentrancyGuard}.
      */
     function deposit() public payable nonReentrant {
-        // ── 0. Require at least one full token’s worth.
-        require(msg.value >= _SCALE, "min1");
+        /* Dust guard — underfunded call is a user mistake.            */
+        if (msg.value < _SCALE) revert MinDepositOneToken(msg.value);
 
-        // ── 1. Compute token amount (floor division).
+        /* Wei → token conversion (floor division guarantees no over-
+                minting).                                                  */
         uint64 amt = uint64(msg.value / _SCALE);
 
-        // ── 2. Mint (cap-checked inside _mint).
+        /* Mint under the 64-bit total-supply cap.                     */
         _mint(msg.sender, amt);
 
-        // ── 3. Refund remainder (if any). Keeps UX smooth for odd amounts.
+        /* Refund leftover wei; propagate failure with a typed error.  */
         uint256 refund = msg.value - uint256(amt) * _SCALE;
-        if (refund > 0) {
+        if (refund != 0) {
             (bool ok, ) = payable(msg.sender).call{value: refund}("");
-            require(ok, "refund");
+            if (!ok) revert RefundFailed(msg.sender, refund);
         }
+
+        /* Surface-level acknowledgement for indexers & explorers.     */
+        emit Deposited(msg.sender, amt);
     }
 
+    /**
+     * @notice Fallback that converts bare QRL transfers into a deposit.
+     * @dev    Executes {deposit}; therefore it inherits all its checks,
+     *         events, and side-effects.
+     */
     receive() external payable {
         deposit();
     }
 
+    /**
+     * @notice Burn `tok` WQ and return the equivalent amount of native QRL
+     *         to the caller at a 1 WQ → 1 QRL rate.
+     *
+     * Detail
+     * ------
+     * • Caller must be unlocked (see {_assertUnlocked}).
+     * • Caller must hold at least `tok` wrapped units.
+     * • Sends `tok × 1e9` wei back to the caller.
+     * • Emits {Withdrawn} and an ERC-20 {Transfer} to the zero address.
+     *
+     * Parameters
+     * ----------
+     * @param tok  Amount of WQ to burn (must be > 0).
+     *
+     * Custom Errors
+     * -------------
+     * • `ZeroAmount()`                             — `tok == 0`
+     * • `InsufficientBalance(balance, needed)`     — caller balance < `tok`
+     * • `NativeTransferFailed(to, amount)`         — low-level ETH transfer failed
+     * • `WalletLocked(unlockAt)`                   — caller is still locked
+     *
+     * Events
+     * ------
+     * • `Withdrawn(caller, tok)` on success.
+     *
+     * Reentrancy
+     * ----------
+     * Protected by the {nonReentrant} modifier from {ReentrancyGuard}.
+     */
     function withdraw(uint64 tok) external nonReentrant {
+        /* Lock guard — protects against wrench-attack freezes.         */
         _assertUnlocked(msg.sender);
-        require(tok > 0, "zero");
-        Account storage acc = _accounts[msg.sender];
-        require(acc.balance >= tok, "bal");
 
+        /* Zero-value guard.                                             */
+        if (tok == 0) revert ZeroAmount();
+
+        /* Balance check with rich context.                             */
+        Account storage acc = _accounts[msg.sender];
+        if (acc.balance < tok) revert InsufficientBalance(acc.balance, tok);
+
+        /* Burn the wrapped tokens.                                      */
         _burn(msg.sender, tok);
+
+        /* Release native QRL; bubble up any failure.                   */
         uint256 weiAmt = uint256(tok) * _SCALE;
         (bool ok, ) = payable(msg.sender).call{value: weiAmt}("");
-        require(ok, "native send");
+        if (!ok) revert NativeTransferFailed(msg.sender, weiAmt);
+
+        /* Event for indexers & explorers.                              */
+        emit Withdrawn(msg.sender, tok);
     }
 
     /*──────── IZRC-20 view ────────*/
+    /// @notice ZRC-20 name.
     function name() external pure override returns (string memory) {
         return _NAME;
     }
+    /// @notice ZRC-20 symbol.
     function symbol() external pure override returns (string memory) {
         return _SYMB;
     }
+    /// @notice Number of decimals (always 9).
     function decimals() external pure override returns (uint8) {
         return DECIMALS;
     }
+    /// @notice Current total supply (64-bit domain).
     function totalSupply() external view override returns (uint64) {
         return _tot;
     }
+
+    /**
+     * @notice Reads the WQ balance of `a`.
+     * @param  a Account address.
+     * @return Current balance in 64-bit units.
+     */
     function balanceOf(address a) external view override returns (uint64) {
         return _accounts[a].balance;
     }
+
+    /**
+     * @notice Reads the remaining allowance from `o` to `s`.
+     * @param  o Owner address.
+     * @param  s Spender address.
+     * @return Remaining allowance.
+     */
     function allowance(
         address o,
         address s
@@ -230,6 +395,14 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     }
 
     /*──────── approvals ────────*/
+
+    /**
+     * @notice Sets the allowance for `s`.
+     * @dev    Fully overwrites any existing value.
+     * @param  s Spender address.
+     * @param  v New allowance (use `type(uint64).max` for unlimited).
+     * @return Always true on success.
+     */
     function approve(address s, uint64 v) external override returns (bool) {
         _allow[msg.sender][s] = v;
         emit Approval(msg.sender, s, v);
@@ -237,6 +410,33 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     }
 
     /*──────── transfers ────────*/
+
+    /**
+     * @notice Transfer `v` WQ from the caller to `to`.
+     *
+     * Detail
+     * ------
+     * • Caller must be unlocked (see {_assertUnlocked}).
+     * • Caller must hold at least `v` wrapped units.
+     * • Recipient address must be non-zero.
+     * • Emits an ERC-20 {Transfer} event on success.
+     *
+     * Parameters
+     * ----------
+     * @param to  Recipient address (must not be `address(0)`).
+     * @param v   Amount of WQ to transfer.
+     * @return    Always `true` when the transfer succeeds.
+     *
+     * Custom Errors
+     * -------------
+     * • `ZeroAddress()`                           — `to == address(0)`
+     * • `InsufficientBalance(balance, needed)`    — caller balance < `v`
+     * • `WalletLocked(unlockAt)`                  — caller is still time-locked
+     *
+     * Reentrancy
+     * ----------
+     * Protected by the {nonReentrant} modifier from {ReentrancyGuard}.
+     */
     function transfer(
         address to,
         uint64 v
@@ -246,6 +446,36 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         return true;
     }
 
+    /**
+     * @notice Transfer `v` WQ from address `f` to address `t` using an existing
+     *         allowance set by `f` for the caller (`msg.sender`).
+     *
+     * Detail
+     * ------
+     * • Consumes allowance unless it equals `type(uint64).max`
+     *   (treated as infinite and left unchanged).  
+     * • Fails early if `f` is wallet-locked.  
+     * • Emits one ERC-20 {Transfer} event on success; may emit an
+     *   {Approval} event if the allowance ticks down.
+     *
+     * Parameters
+     * ----------
+     * @param f  Source (owner) address.
+     * @param t  Destination address (must not be `address(0)`).
+     * @param v  Amount of WQ to transfer.
+     * @return   Always `true` when the transfer succeeds.
+     *
+     * Custom Errors
+     * -------------
+     * • `InsufficientAllowance(allowance, needed)` — current allowance < `v`  
+     * • `InsufficientBalance(balance, needed)`     — balance of `f` < `v`  
+     * • `ZeroAddress()`                            — `t == address(0)`  
+     * • `WalletLocked(unlockAt)`                   — `f` is still time-locked
+     *
+     * Reentrancy
+     * ----------
+     * Guarded by the {nonReentrant} modifier from {ReentrancyGuard}.
+     */
     function transferFrom(
         address f,
         address t,
@@ -258,65 +488,72 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     }
 
     /*═══════════════════════════════════════════════════════════════════════════════*\
-│  Gas-tight batch helpers                                                       │
-\*═══════════════════════════════════════════════════════════════════════════════*/
+    │  Gas-tight batch helpers                                                       │
+    \*═══════════════════════════════════════════════════════════════════════════════*/
 
     /**
-     * @notice Send `v[i]` tokens to `to[i]` in a single call.
-     * @dev
-     * 1. Verifies array length match (**O(1)**).
-     * 2. Computes Σ v[i] once, reverting on:
-     *      • sum > 2⁶⁴-1  (would not fit a token unit)
-     *      • sender balance < Σ v[i]  (insufficient funds)
-     * 3. Debits the sender **once**, then credits each recipient,
-     *    guarding every credit against individual-balance overflow.
-     * 4. Emits one `Transfer` event per leg.
+     * @notice Send multiple transfers from the caller in a single transaction.
      *
-     * Gas notes:
-     * • Storage hit on sender balance is now 1R/1W (was N+1).
-     * • Loop index increments are unchecked.
-     * • Length is cached to avoid an extra `calldataload`.
+     * Behaviour
+     * ---------
+     * 1. Arrays must be equal length – otherwise `LengthMismatch` reverts.
+     * 2. Caller must be unlocked – enforced upstream by `_assertUnlocked`.
+     * 3. Pre-compute the aggregate amount; revert with `SumOverflow`
+     *    if it exceeds the 64-bit domain.
+     * 4. Ensure the caller’s balance can cover the total; otherwise
+     *    `InsufficientBalance`.
+     * 5. Debit the sender once, then credit each recipient in a loop,
+     *    reverting with `ZeroAddress` on any `address(0)`.
+     * 6. Emit a standard ERC-20 `Transfer` event for every leg.
+     *
+     * Custom Errors
+     * -------------
+     * • LengthMismatch(lenA, lenB)       — `to.length != v.length`
+     * • SumOverflow(attemptedSum)        — Σ v[i] > 2⁶⁴−1
+     * • InsufficientBalance(balance, needed)
+     * • ZeroAddress()                    — recipient is the zero address
      */
     function transferBatch(
         address[] calldata to,
         uint64[] calldata v
     ) external nonReentrant returns (bool) {
-        require(to.length == v.length, "len");
+        // 1. Array-length parity check
+        if (to.length != v.length) revert LengthMismatch(to.length, v.length);
+
+        // 2. Time-lock guard
         _assertUnlocked(msg.sender);
 
-        /*─────────────────────── pre-flight totals ───────────────────────*/
+        // 3. Aggregate sum with overflow protection
         uint256 len = v.length;
-        uint256 total;
+        uint256 total = 0;
         for (uint256 i; i < len; ) {
-            require(total + v[i] <= type(uint64).max, "sum-overflow");
-            total += v[i];
+            uint256 newSum = total + v[i];
+            if (newSum > type(uint64).max) revert SumOverflow(newSum);
+            total = newSum;
             unchecked {
                 ++i;
             }
         }
         uint64 total64 = uint64(total);
 
+        // 4. Balance check
         Account storage senderAcc = _accounts[msg.sender];
-        require(senderAcc.balance >= total, "bal");
+        if (senderAcc.balance < total64)
+            revert InsufficientBalance(senderAcc.balance, total64);
 
-        /*────────────────────── debit sender once ───────────────────────*/
+        // 5. Debit sender once
         unchecked {
             senderAcc.balance -= total64;
         }
 
-        /*───────────────────── credit recipients loop ───────────────────*/
+        // 6. Credit recipients
         for (uint256 i; i < len; ) {
             address dst = to[i];
             uint64 amt = v[i];
-            require(dst != address(0), "to0");
+            if (dst == address(0)) revert ZeroAddress();
 
-            Account storage dstAcc = _accounts[dst];
             unchecked {
-                // this is always safe because the sum of all balances is
-                // totalSupply, which is capped to 64 bits. the sum of two
-                // parts can never exceed the sum of the whole; the whole
-                // is always within 64 bits.
-                dstAcc.balance += amt;
+                _accounts[dst].balance += amt;
             }
 
             emit Transfer(msg.sender, dst, amt);
@@ -328,55 +565,76 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     }
 
     /**
-     * @notice Transfer tokens from `from` to many recipients in a single call.
-     * @dev
-     * • Identical flow to {transferBatch} plus an allowance spend.
-     * • Reverts on allowance underrun **before** touching balances.
-     * • Preserves sender’s unlimited-allowance shortcut.
+     * @notice Move tokens from `from` to many recipients in a single call.
+     *
+     * Behaviour
+     * ---------
+     * 1. Arrays must be equal length – otherwise `LengthMismatch`.
+     * 2. `from` must be unlocked – enforced via `_assertUnlocked`.
+     * 3. Pre-compute the aggregate amount; revert with `SumOverflow`
+     *    if it exceeds the 64-bit token domain.
+     * 4. Consume allowance in one shot via `_spendAllowance`.
+     * 5. Ensure `from` has sufficient balance – otherwise
+     *    `InsufficientBalance`.
+     * 6. Debit `from` once, then credit each recipient, reverting with
+     *    `ZeroAddress` on any `address(0)`.
+     * 7. Emit an ERC-20 `Transfer` event for every leg.
+     *
+     * Custom Errors
+     * -------------
+     * • LengthMismatch(lenA, lenB)         — `to.length != v.length`
+     * • SumOverflow(attemptedSum)          — Σ v[i] > 2⁶⁴−1
+     * • InsufficientBalance(balance, need)
+     * • ZeroAddress()                      — recipient is the zero address
+     * • InsufficientAllowance(allowance, need)
+     *   (bubbled up from `_spendAllowance`)
      */
     function transferFromBatch(
         address from,
         address[] calldata to,
         uint64[] calldata v
     ) external nonReentrant returns (bool) {
-        require(to.length == v.length, "len");
+        /* 1. Array-length parity check */
+        if (to.length != v.length) revert LengthMismatch(to.length, v.length);
+
+        /* 2. Time-lock guard */
         _assertUnlocked(from);
 
-        /*─────────────────────── pre-flight totals ───────────────────────*/
+        /* 3. Aggregate amount with overflow protection */
         uint256 len = v.length;
-        uint256 total;
+        uint256 total = 0;
         for (uint256 i; i < len; ) {
-            require(total + v[i] <= type(uint64).max, "sum-overflow");
-            total += v[i];
+            uint256 newSum = total + v[i];
+            if (newSum > type(uint64).max) revert SumOverflow(newSum);
+            total = newSum;
             unchecked {
                 ++i;
             }
         }
-
         uint64 total64 = uint64(total);
+
+        /* 4. Spend allowance (may revert with InsufficientAllowance) */
         _spendAllowance(from, total64);
 
+        /* 5. Balance check */
         Account storage fromAcc = _accounts[from];
-        require(fromAcc.balance >= total64, "bal");
+        if (fromAcc.balance < total64)
+            revert InsufficientBalance(fromAcc.balance, total64);
+
+        /* 6. Debit sender once */
         unchecked {
             fromAcc.balance -= total64;
         }
 
-        /*───────────────────── credit recipients loop ───────────────────*/
+        /* 7. Credit recipients */
         for (uint256 i; i < len; ) {
             address dst = to[i];
             uint64 amt = v[i];
-            require(dst != address(0), "to0");
+            if (dst == address(0)) revert ZeroAddress();
 
-            Account storage dstAcc = _accounts[dst];
             unchecked {
-                // this is always safe because the sum of all balances is
-                // totalSupply, which is capped to 64 bits. the sum of two
-                // parts can never exceed the sum of the whole; the whole
-                // is always within 64 bits.
-                dstAcc.balance += amt;
+                _accounts[dst].balance += amt;
             }
-
             emit Transfer(from, dst, amt);
             unchecked {
                 ++i;
@@ -384,11 +642,27 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         }
         return true;
     }
-    /*──────────────────────── internal helpers ────────────────────────*/
+
+    /*──────────────────────── internal helpers – typed-error versions ─────────────*/
+
+    /**
+     * @dev Move `v` tokens from `from` to `to`.
+     *
+     * Reverts
+     * -------
+     * • ZeroAddress()                            – `to == address(0)`
+     * • InsufficientBalance(balance, needed)     – balance < v
+     *
+     * Emits
+     * -----
+     * • Transfer(from, to, v)
+     */
     function _xfer(address from, address to, uint64 v) internal {
-        require(to != address(0), "to0");
+        if (to == address(0)) revert ZeroAddress();
+
         Account storage fromAcc = _accounts[from];
-        require(fromAcc.balance >= v, "bal");
+        if (fromAcc.balance < v) revert InsufficientBalance(fromAcc.balance, v);
+
         unchecked {
             fromAcc.balance -= v;
             _accounts[to].balance += v;
@@ -396,26 +670,71 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         emit Transfer(from, to, v);
     }
 
+    /**
+     * @dev Consume `v` allowance units from `from->msg.sender`.
+     *
+     * Reverts
+     * -------
+     * • InsufficientAllowance(allowance, needed) – cur < v
+     *
+     * Special Case
+     * ------------
+     * • When `cur == type(uint64).max` the allowance is considered infinite
+     *   and is left unchanged.
+     *
+     * Emits
+     * -----
+     * • Approval(from, spender, newAllowance)    – only when allowance ticks down
+     */
     function _spendAllowance(address from, uint64 v) internal {
         uint64 cur = _allow[from][msg.sender];
-        require(cur >= v, "allow");
+        if (cur < v) revert InsufficientAllowance(cur, v);
+
+        // Infinite allowance sentinel (uint64.max) leaves storage untouched
         if (cur != type(uint64).max) {
-            // infinite allowance sentinel
-            _allow[from][msg.sender] = cur - v;
-            emit Approval(from, msg.sender, cur - v);
+            uint64 newAllow = cur - v;
+            _allow[from][msg.sender] = newAllow;
+            emit Approval(from, msg.sender, newAllow);
         }
     }
 
+    /**
+     * @dev Mint `v` tokens to `to` after total-supply cap check.
+     *
+     * Reverts
+     * -------
+     * • CapExceeded(totalSupply, mintAmount) – via _checkCap
+     *
+     * Emits
+     * -----
+     * • Transfer(0x0, to, v)
+     */
     function _mint(address to, uint64 v) internal {
-        _checkCap(v);
-        _accounts[to].balance += v;
+        _checkCap(v); // total-supply guard
+
+        // NEW: per-account guard
+        uint64 bal = _accounts[to].balance;
+
+        _accounts[to].balance = bal + v; // now safe
         _tot += v;
         emit Transfer(address(0), to, v);
     }
 
+    /**
+     * @dev Burn `v` tokens from `from`.
+     *
+     * Reverts
+     * -------
+     * • InsufficientBalance(balance, needed)
+     *
+     * Emits
+     * -----
+     * • Transfer(from, 0x0, v)
+     */
     function _burn(address from, uint64 v) internal {
         Account storage acc = _accounts[from];
-        require(acc.balance >= v, "bal");
+        if (acc.balance < v) revert InsufficientBalance(acc.balance, v);
+
         unchecked {
             acc.balance -= v;
             _tot -= v;
@@ -423,16 +742,29 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         emit Transfer(from, address(0), v);
     }
 
-    /*──────── lock guard ────────*/
-    /// @dev Reverts if `who` is still locked.
+    /*────────── guards ──────────*/
+
+    /**
+     * @dev Ensure `who` is not currently locked.
+     *
+     * Reverts
+     * -------
+     * • WalletLocked(unlockAt) – when `block.timestamp < unlockAt`
+     */
     function _assertUnlocked(address who) internal view {
         uint64 t = _accounts[who].unlockAt;
-        if (t != 0) require(block.timestamp >= t, "locked");
+        if (t != 0 && block.timestamp < t) revert WalletLocked(t);
     }
 
-    /*──────── cap guard ────────*/
+    /**
+     * @dev Enforce 2⁶⁴-1 total-supply cap before minting `inc` tokens.
+     *
+     * Reverts
+     * -------
+     * • CapExceeded(totalSupply, mintAmount)
+     */
     function _checkCap(uint64 inc) internal view {
-        require(uint256(inc) <= uint256(MAX_BAL) - _tot, "cap");
+        if (uint256(inc) > uint256(MAX_BAL) - _tot)
+            revert CapExceeded(_tot, inc);
     }
-
 }
