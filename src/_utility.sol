@@ -432,6 +432,12 @@ contract UtilityTokenDeployer {
             root
         );
         addr = address(token);
+        deployed[addr] = true;
         emit Deployed(addr);
+    }
+
+    mapping(address => bool) deployed;
+    function verify(address coin) external view returns (bool isDeployed) {
+        return deployed[coin];
     }
 }

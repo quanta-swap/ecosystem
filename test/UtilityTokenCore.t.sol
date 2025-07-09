@@ -910,6 +910,41 @@ contract StandardUtilityTokenTest is Test {
         assertTrue(token != address(0), "token addr is zero");
     }
 
+    /*────────────────── verify() tests ──────────────────*/
+
+    /// @notice After a token is created via the factory, `verify` must
+    ///         return true for its address.
+    function testVerifyReturnsTrueForDeployedToken() public {
+        UtilityTokenDeployer dep = new UtilityTokenDeployer();
+
+        // Deploy a fresh token
+        address token = dep.create(
+            "Verify-Me",
+            "VM",
+            123_456 * uint64(ONE_TOKEN),
+            9,
+            LOCK_TIME,
+            AL // root / initial holder
+        );
+        assertTrue(token != address(0), "token should not be zero");
+
+        // The factory should now recognise the address
+        bool ok = dep.verify(token);
+        assertTrue(ok, "verify() should return true for deployed token");
+    }
+
+    /// @notice Any arbitrary or random address that was *not* produced by
+    ///         the factory must cause `verify` to return false.
+    function testVerifyReturnsFalseForUnknownAddress() public {
+        UtilityTokenDeployer dep = new UtilityTokenDeployer();
+
+        // Use an address that can never be a Create2 result from the factory
+        address bogus = address(0xDEAD_BEEF);
+
+        bool ok = dep.verify(bogus);
+        assertFalse(ok, "verify() should be false for non-factory addresses");
+    }
+
     /*───────────────── helpers ─────────────────*/
 
     /**
