@@ -33,7 +33,8 @@ contract StandardUtilityTokenTest is Test {
             SUPPLY64,
             9,
             LOCK_TIME,
-            address(this)
+            address(this),
+            "google.com"
         );
 
         vm.deal(AL, 100 ether);
@@ -47,6 +48,63 @@ contract StandardUtilityTokenTest is Test {
     }
 
     /*───────────────────────────── Unit tests ─────────────────────────────*/
+
+    /*────────────────── constructor event tests ──────────────────*/
+
+    /**
+     * @notice Deploying the token **must** emit a single ERC-20 `Transfer`
+     *         signalling the mint of the fixed supply.
+     * @dev    • The constructor credits `root`’s balance but emits the
+     *           event with `to = msg.sender` (the deployer).
+     *         • We expect the event *before* the `new` statement so that
+     *           Foundry matches it during contract creation.
+     *         • Post-deploy, we sanity-check the recipient’s balance.
+     */
+    function testConstructorEmitsInitialTransfer() public {
+        /* 1️⃣  Expect the Transfer event exactly once. */
+        vm.expectEmit(
+            true /* indexed from */,
+            true /* indexed to */,
+            false,
+            true
+        );
+        emit IZRC20.Transfer(address(0), address(1), SUPPLY64);
+
+        /* 2️⃣  Deploy a fresh token (constructor will fire the event). */
+        StandardUtilityToken tok = new StandardUtilityToken(
+            "Ctor-Event",
+            "CTOR",
+            SUPPLY64,
+            9,
+            LOCK_TIME,
+            address(1), // root == deployer for simple parity
+            "ipfs://theme-banner"
+        );
+
+        /* 3️⃣  Sanity-check that the deployer received the supply. */
+        assertEq(
+            tok.balanceOf(address(1)),
+            SUPPLY64,
+            "mint balance mismatch"
+        );
+    }
+
+    /*────────────────── theme() tests ──────────────────*/
+
+    /**
+     * @notice `theme()` must return the exact hard-coded YouTube URL.
+     * @dev    Ensures future refactors don’t accidentally change or remove it.
+     *         • Deploy a fresh factory.
+     *         • Call `theme()` and compare against the literal string.
+     *         • Uses `assertEq(string,string)` from forge-std.
+     */
+    function testThemeReturnsExpectedURL() public {
+        UtilityTokenDeployer dep = new UtilityTokenDeployer();
+
+        string memory expected = "https://www.youtube.com/watch?v=kpnW68Q8ltc";
+
+        assertEq(dep.theme(), expected, "theme URL mismatch");
+    }
 
     /*───────────────────────────── setLocker tests ─────────────────────────────*/
 
@@ -861,7 +919,8 @@ contract StandardUtilityTokenTest is Test {
             supply64,
             decs,
             LOCK_TIME,
-            root
+            root,
+            "google.com"
         );
         assertTrue(tokAddr != address(0), "factory returned zero address");
 
@@ -880,14 +939,14 @@ contract StandardUtilityTokenTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(ZeroAddress.selector, address(0))
         );
-        dep.create("X", "X", 1, 9, LOCK_TIME, address(0));
+        dep.create("X", "X", 1, 9, LOCK_TIME, address(0), "google.com");
     }
 
     function testDeployerLockTimeZeroRevert() public {
         UtilityTokenDeployer dep = new UtilityTokenDeployer();
 
         vm.expectRevert(abi.encodeWithSelector(LockTimeZero.selector));
-        dep.create("X", "X", 1, 9, 0, AL); // lockTime_ == 0 bubbles up
+        dep.create("X", "X", 1, 9, 0, AL, "google.com"); // lockTime_ == 0 bubbles up
     }
 
     function testCreateEmitsDeployedEvent() public {
@@ -904,10 +963,42 @@ contract StandardUtilityTokenTest is Test {
             1_000_000,
             9,
             1 hours,
-            address(this)
+            address(this),
+            "google.com"
         );
 
         assertTrue(token != address(0), "token addr is zero");
+    }
+
+    /*────────────────── theme (deployed token) tests ──────────────────*/
+
+    /**
+     * @notice The factory must pass the `theme_` string through to the
+     *         new token so that its `theme()` getter returns the same value.
+     * @dev    • Deploy a token via the factory with a distinctive theme URL.
+     *         • Cast the returned address to StandardUtilityToken.
+     *         • Assert that `theme()` equals the original string.
+     */
+    function testDeployerTokenThemePropagates() public {
+        UtilityTokenDeployer dep = new UtilityTokenDeployer();
+
+        string
+            memory themeStr = "https://ipfs.example.org/ipfs/QmThemeBannerHash";
+
+        // Deploy via factory
+        address tokAddr = dep.create(
+            "Theme-Coin",
+            "THM",
+            10_000 * uint64(ONE_TOKEN),
+            9,
+            LOCK_TIME,
+            AL, // root holder
+            themeStr // ← theme argument under test
+        );
+
+        // Verify the getter on the deployed token
+        StandardUtilityToken tok = StandardUtilityToken(tokAddr);
+        assertEq(tok.theme(), themeStr, "deployed token theme mismatch");
     }
 
     /*────────────────── verify() tests ──────────────────*/
@@ -924,7 +1015,8 @@ contract StandardUtilityTokenTest is Test {
             123_456 * uint64(ONE_TOKEN),
             9,
             LOCK_TIME,
-            AL // root / initial holder
+            AL, // root / initial holder,
+            "google.com"
         );
         assertTrue(token != address(0), "token should not be zero");
 

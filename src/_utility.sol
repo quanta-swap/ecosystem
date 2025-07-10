@@ -40,11 +40,38 @@ event TokensLocked(
 /*═══════════════════════════════════════════════════════════════════════*\
 │  StandardUtilityToken – fixed-supply IZRC-20 with epoch-locking ACL     │
 \*═══════════════════════════════════════════════════════════════════════*/
+/**
+ * @title Standard Utility Token
+ * @author Elliott G. Dehnbostel (quantaswap@gmail.com)
+ *         Protocol Research Engineer, Official Finance LLC.
+ * @notice Creates a twice-audited utility token with sane implementation.
+ * 
+ * This contract represents a minimal approach to capturing value on-chain.
+ * It is highly-limited BY DESIGN; all of the necessary elements are there,
+ * and value creation is decentralized. This contract gives holders ability
+ * to add value to their holding by creating on- and off-chain services with
+ * or without the permission of its original creator. That is BY DESIGN!
+ * 
+ * The sole "extra" feature in this contract is a `theme` function which is
+ * there to allow for on-chain connection to relevant off-chain resources,
+ * such as a website link. It can not be changed after deployment. It's here
+ * to prevent interception of web searches by scammers seeking to impersonate
+ * the token creator, and to allow for a single source of social truth. Use it
+ * wisely, as it is there BY DESIGN to help all holders of the token.
+ * 
+ * - There are no fees on transfers beyond any gas fee.
+ * - There is no such thing as a formal burn mechanism.
+ * - It is efficient, storing balances in just 64-bits.
+ * - Supply is fixed forever.. more can not be created.
+ * - Window is fixed forever.. it will not ever change.
+ * - There is no verifications of the theme whatsoever.
+ */
 contract StandardUtilityToken is IZRC20 {
     /*──────── metadata ────────*/
     uint8 private _decimals;
     string private _name;
     string private _symbol;
+    string private _theme; // should be a relevant link
 
     /*──────── global constant ────────*/
     /// Seconds per lock window (immutable, > 0).
@@ -71,18 +98,20 @@ contract StandardUtilityToken is IZRC20 {
         uint64 supply64,
         uint8 decs,
         uint32 lockTime_,
-        address root
+        address root,
+        string memory theme_
     ) {
         if (lockTime_ == 0) revert LockTimeZero();
 
         _name = name_;
         _symbol = symbol_;
         _decimals = decs;
+        _theme = theme_;
         lockTime = lockTime_;
 
         _tot = supply64;
         _acct[root].balance = supply64;
-        emit Transfer(address(0), msg.sender, supply64);
+        emit Transfer(address(0), root, supply64);
     }
 
     /*═══════════════  Locker administration  ══════════════*/
@@ -209,6 +238,10 @@ contract StandardUtilityToken is IZRC20 {
      */
     function decimals() external view override returns (uint8) {
         return _decimals;
+    }
+
+    function theme() external view returns (string memory) {
+        return _theme;
     }
 
     /*──────── allowances ────────*/
@@ -397,6 +430,12 @@ contract StandardUtilityToken is IZRC20 {
 
 event Deployed(address indexed which);
 
+/**
+ * @title Utility Token Deployer
+ * @author Ellott G. Dehnbostel (quantaswap@gmail.com)
+ *         Protocol Research Engineer, Official Finance LLC. 
+ * @notice Allows users to deploy verifiably twice-audited utility tokens.
+ */
 contract UtilityTokenDeployer {
     /**
      * @notice Deploy a new {StandardUtilityToken} with a fixed supply.
@@ -419,7 +458,8 @@ contract UtilityTokenDeployer {
         uint64 supply64,
         uint8 decimals_,
         uint32 lockTime_,
-        address root
+        address root,
+        string memory theme_
     ) external returns (address addr) {
         if (root == address(0)) revert ZeroAddress(root);
 
@@ -429,7 +469,8 @@ contract UtilityTokenDeployer {
             supply64,
             decimals_,
             lockTime_,
-            root
+            root,
+            theme_
         );
         addr = address(token);
         deployed[addr] = true;
@@ -439,5 +480,9 @@ contract UtilityTokenDeployer {
     mapping(address => bool) deployed;
     function verify(address coin) external view returns (bool isDeployed) {
         return deployed[coin];
+    }
+
+    function theme() external pure returns (string memory) {
+        return "https://www.youtube.com/watch?v=kpnW68Q8ltc";
     }
 }
