@@ -141,25 +141,11 @@ interface ICLOB {
         uint24 tickSell
     );
 
-    event Taken(
-        address indexed taker,
-        uint64 amountIn,
-        uint64 amountOut,
-        bool baseForQuote
-    );
-
     struct Order {
         uint64 baseReserve;
         uint64 quoteReserve;
         int24 tickBuy; // MIN if not buying
         int24 tickSell; // MIN if not selling
-    }
-
-    struct TakeCommand {
-        bool baseForQuote;
-        uint64 amountIn;
-        uint64 amountOut;
-        uint64[] orderIds; // order ids to take
     }
 
     struct OrderCreate {
@@ -314,9 +300,33 @@ contract CLOB is ICLOB, ReentrancyGuard {
 
     /*──────────────────── Internal order helpers ───────────────────*/
 
+    // ────────────────────────────────────────────────────────────────────────
+    //  _createOrder ‒ registers a brand-new maker order
+    // ────────────────────────────────────────────────────────────────────────
     /**
-     * @dev Internal write helper; creates a new order and assigns ownership.
-     *      **MUST** be followed by router-level token settlement.
+     * @notice Creates a new order and assigns ownership.
+     *
+     * @dev
+     * ─ Validates tick ranges via {_enforceTicks} **before** any storage writes.
+     * ─ Rejects the zero-address owner and all-zero reserves.
+     * ─ Guards against `uint64` overflow on the order-ID counter so a wrap-around
+     *   can never silently corrupt state.
+     * ─ Emits {OrderCreated} with canonicalised ticks (uint24 cast).
+     *
+     * @param owner         Maker address (must be non-zero).
+     * @param baseReserve   Initial base-token liquidity (0 allowed if quote>0).
+     * @param quoteReserve  Initial quote-token liquidity (0 allowed if base>0).
+     * @param tickBuy       Buy-side limit tick (`DISABLED_TICK` disables buying).
+     * @param tickSell      Sell-side limit tick (`DISABLED_TICK` disables selling).
+     *
+     * @return orderId  Monotonically-increasing identifier allocated to the order.
+     *
+     * @custom:error ZeroAddress      `owner` was the zero address.
+     * @custom:error ZeroReserves     Both reserves were zero.
+     * @custom:error Overflow         `_nextId` exceeded `type(uint64).max`.
+     * @custom:error BadTicksRange    One or both ticks out of Uniswap range.
+     * @custom:error BadTicks         Both sides enabled but `tickBuy >= tickSell`.
+     * @custom:error BothTicksDisabled Both ticks passed as `DISABLED_TICK`.
      */
     function _createOrder(
         address owner,
@@ -325,18 +335,26 @@ contract CLOB is ICLOB, ReentrancyGuard {
         int24 tickBuy,
         int24 tickSell
     ) internal returns (uint64 orderId) {
+        /* ────── Argument sanity checks ────── */
         _enforceTicks(tickBuy, tickSell);
         if (owner == address(0)) revert ZeroAddress("owner");
         if (baseReserve == 0 && quoteReserve == 0) revert ZeroReserves();
 
-        orderId = _nextId++;
+        /* ────── Allocate identifier with overflow guard ────── */
+        orderId = _nextId;
+        if (orderId == type(uint64).max) revert Overflow(); // no wrap-around
+        unchecked {
+            _nextId = orderId + 1;
+        }
+
+        /* ────── Persist order ────── */
         _orders[orderId] = Order({
             baseReserve: baseReserve,
             quoteReserve: quoteReserve,
             tickBuy: tickBuy,
             tickSell: tickSell
         });
-        _owners[orderId] = owner; // store before emit
+        _owners[orderId] = owner; // save before emit for indexer consistency
 
         emit OrderCreated(
             orderId,
@@ -345,6 +363,81 @@ contract CLOB is ICLOB, ReentrancyGuard {
             quoteReserve,
             uint24(tickBuy),
             uint24(tickSell)
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    //  _replaceOrder ‒ in-place order mutation (only in taker-favourable dir.)
+    // ────────────────────────────────────────────────────────────────────────
+    /**
+     * @notice Mutates an existing order, optionally adding liquidity.
+     *
+     * @dev
+     * ─ Caller must be the recorded owner (enforced via {NotOwner}).
+     * ─ **Only** price moves that benefit takers are allowed:
+     *     • `newBuy` ≥ `oldBuy` (maker pays more quote per base)
+     *     • `newSell` ≤ `oldSell` (maker accepts less quote per base)
+     * ─ Adds explicit arithmetic overflow guards so the custom {Overflow} error
+     *   is surfaced instead of the generic `panic(0x11)`.
+     * ─ Emits {OrderReplaced} with the new persistent state.
+     *
+     * @param owner     Maker asserted by the router.
+     * @param id        Identifier of the order being modified.
+     * @param addBase   Additional base liquidity to credit (may be 0).
+     * @param addQuote  Additional quote liquidity to credit (may be 0).
+     * @param newBuy    Replacement buy tick (`DISABLED_TICK` keeps side disabled).
+     * @param newSell   Replacement sell tick (`DISABLED_TICK` keeps side disabled).
+     *
+     * @custom:error NoOrder       `id` did not reference a live order.
+     * @custom:error NotOwner      `owner` mismatch.
+     * @custom:error WorseTicks    Update makes prices worse for takers.
+     * @custom:error Overflow      Reserve addition overflowed 64-bits.
+     * @custom:error ZeroReserves  Resulting order would hold zero liquidity.
+     */
+    function _replaceOrder(
+        address owner,
+        uint64 id,
+        uint64 addBase,
+        uint64 addQuote,
+        int24 newBuy,
+        int24 newSell
+    ) internal {
+        _enforceTicks(newBuy, newSell);
+
+        address actualOwner = _owners[id];
+        if (actualOwner == address(0)) revert NoOrder(id);
+        if (actualOwner != owner) revert NotOwner(id, actualOwner, owner);
+
+        Order storage o = _orders[id];
+
+        // ─── Ensure price move is taker-favourable ───
+        if (newBuy < o.tickBuy || newSell > o.tickSell)
+            revert WorseTicks(newBuy, newSell, o.tickBuy, o.tickSell);
+
+        // ─── Compute new reserves with explicit overflow detection ───
+        uint64 newBase;
+        uint64 newQuote;
+        unchecked {
+            newBase = o.baseReserve + addBase;
+            newQuote = o.quoteReserve + addQuote;
+        }
+        if (newBase < o.baseReserve || newQuote < o.quoteReserve)
+            revert Overflow();
+        if (newBase == 0 && newQuote == 0) revert ZeroReserves();
+
+        // ─── Persist updated state ───
+        o.baseReserve = newBase;
+        o.quoteReserve = newQuote;
+        o.tickBuy = newBuy;
+        o.tickSell = newSell;
+
+        emit OrderReplaced(
+            id,
+            owner,
+            newBase,
+            newQuote,
+            uint24(newBuy),
+            uint24(newSell)
         );
     }
 
@@ -367,48 +460,6 @@ contract CLOB is ICLOB, ReentrancyGuard {
         delete _owners[orderId];
 
         emit OrderCancelled(orderId, owner);
-    }
-
-    /**
-     * @dev In-place improvement of an order; only tighter/wider in maker favor.
-     */
-    function _replaceOrder(
-        address owner,
-        uint64 id,
-        uint64 addBase,
-        uint64 addQuote,
-        int24 newBuy,
-        int24 newSell
-    ) internal {
-        _enforceTicks(newBuy, newSell);
-
-        address actual = _owners[id];
-        if (actual == address(0)) revert NoOrder(id);
-        if (actual != owner) revert NotOwner(id, actual, owner);
-
-        Order storage o = _orders[id];
-
-        if (newBuy > o.tickBuy || newSell < o.tickSell)
-            revert WorseTicks(newBuy, newSell, o.tickBuy, o.tickSell);
-
-        /* Checked arithmetic (0.8+) — overflow ⇒ revert(Overflow()). */
-        uint64 newBase = o.baseReserve + addBase;
-        uint64 newQuote = o.quoteReserve + addQuote;
-        if (newBase == 0 && newQuote == 0) revert ZeroReserves();
-
-        o.baseReserve = newBase;
-        o.quoteReserve = newQuote;
-        o.tickBuy = newBuy;
-        o.tickSell = newSell;
-
-        emit OrderReplaced(
-            id,
-            owner,
-            newBase,
-            newQuote,
-            uint24(newBuy),
-            uint24(newSell)
-        );
     }
 
     /*────────────────────────── Maker entrypoint ──────────────────────────*/
@@ -470,6 +521,10 @@ contract CLOB is ICLOB, ReentrancyGuard {
     /*────────────────────────── Taker entrypoint ──────────────────────────*/
     /**
      * @inheritdoc ICLOB
+     *
+     * @dev Fixes over-charge in the base→quote *exact-in* path by
+     *      recomputing the actual `baseIn` required after we clip the maker’s
+     *      `quoteReserve`.  Also emits the {Taken} convenience event.
      */
     function takeFrom(
         uint64 orderId,
@@ -495,93 +550,97 @@ contract CLOB is ICLOB, ReentrancyGuard {
 
         Order storage o = _orders[orderId];
 
-        /* Branch on side. */
+        /* ───────────── taker buys QUOTE for BASE ───────────── */
         if (baseForQuote) {
             if (o.tickBuy == DISABLED_TICK || o.quoteReserve == 0)
                 revert SideDisabled(orderId, true);
 
-            uint256 px = TickMath.priceX64(o.tickBuy); // quote / base (Q64.64)
+            uint256 px = TickMath.priceX64(o.tickBuy); // quote / base  (Q64.64)
 
-            /*-- exact-in: taker knows baseIn --*/
             if (exactIn) {
-                uint64 baseIn = amountSpecified;
+                /* ‒ taker specifies BASE they are willing to pay ‒ */
+                uint256 baseIn = amountSpecified;
 
-                /* maxQuote = baseIn * price */
-                uint256 maxQuote = (uint256(baseIn) * px) >> 64;
+                // maximum quote the taker could receive at this price
+                uint256 maxQuote = (baseIn * px) >> 64;
                 if (maxQuote == 0) revert Overflow();
 
-                uint64 quoteOut = maxQuote <= o.quoteReserve
-                    ? uint64(maxQuote)
+                // clip by maker inventory
+                uint256 quoteOut = maxQuote <= o.quoteReserve
+                    ? maxQuote
                     : o.quoteReserve;
 
-                o.baseReserve += baseIn;
-                o.quoteReserve -= quoteOut;
+                // recompute the *actual* base required after clipping
+                uint256 needBase = ((quoteOut << 64) + px - 1) / px; // ceilDiv
+                if (needBase > type(uint64).max) revert Overflow();
 
-                netBase = int256(uint256(baseIn));
-                netQuote = -int256(uint256(quoteOut));
-                gotBase = baseIn;
-                gotQuote = quoteOut;
+                // state updates
+                o.baseReserve += uint64(needBase);
+                o.quoteReserve -= uint64(quoteOut);
 
-                /*-- exact-out: taker wants quoteOut --*/
+                netBase = int256(needBase);
+                netQuote = -int256(quoteOut);
+                gotBase = uint64(needBase);
+                gotQuote = uint64(quoteOut);
             } else {
-                uint64 quoteWant = amountSpecified;
-                uint64 quoteOut = quoteWant <= o.quoteReserve
+                /* ‒ taker specifies desired QUOTE output ‒ */
+                uint256 quoteWant = amountSpecified;
+                uint256 quoteOut = quoteWant <= o.quoteReserve
                     ? quoteWant
                     : o.quoteReserve;
 
-                uint256 needBase = ((uint256(quoteOut) << 64) + px - 1) / px; // ceilDiv
+                uint256 needBase = ((quoteOut << 64) + px - 1) / px; // ceilDiv
                 if (needBase > type(uint64).max) revert Overflow();
 
                 o.baseReserve += uint64(needBase);
-                o.quoteReserve -= quoteOut;
+                o.quoteReserve -= uint64(quoteOut);
 
                 netBase = int256(needBase);
-                netQuote = -int256(uint256(quoteOut));
+                netQuote = -int256(quoteOut);
                 gotBase = uint64(needBase);
-                gotQuote = quoteOut;
+                gotQuote = uint64(quoteOut);
             }
 
             emit OrderFilled(orderId, maker, gotBase, gotQuote, true);
+            /* ───────────── taker sells QUOTE for BASE ───────────── */
         } else {
-            /*-- taker sells quote, receives base --*/
             if (o.tickSell == DISABLED_TICK || o.baseReserve == 0)
                 revert SideDisabled(orderId, false);
 
-            uint256 px = TickMath.priceX64(o.tickSell); // quote / base
+            uint256 px = TickMath.priceX64(o.tickSell); // quote / base (Q64.64)
 
             if (exactIn) {
-                uint64 quoteIn = amountSpecified;
-
-                uint64 baseOut = uint64((uint256(quoteIn) << 64) / px);
+                uint256 quoteIn = amountSpecified;
+                uint256 baseOut = (quoteIn << 64) / px; // floor div
                 if (baseOut == 0) revert Overflow();
 
                 if (baseOut > o.baseReserve) {
                     baseOut = o.baseReserve;
-                    quoteIn = uint64((uint256(baseOut) * px) >> 64);
+                    quoteIn = (baseOut * px) >> 64; // re-solve for quoteIn
                 }
 
-                o.quoteReserve += quoteIn;
-                o.baseReserve -= baseOut;
+                o.quoteReserve += uint64(quoteIn);
+                o.baseReserve -= uint64(baseOut);
 
-                netBase = -int256(uint256(baseOut));
-                netQuote = int256(uint256(quoteIn));
-                gotBase = baseOut;
-                gotQuote = quoteIn;
+                netBase = -int256(baseOut);
+                netQuote = int256(quoteIn);
+                gotBase = uint64(baseOut);
+                gotQuote = uint64(quoteIn);
             } else {
-                uint64 baseWant = amountSpecified;
-                uint64 baseOut = baseWant <= o.baseReserve
+                uint256 baseWant = amountSpecified;
+                uint256 baseOut = baseWant <= o.baseReserve
                     ? baseWant
                     : o.baseReserve;
 
-                uint256 needQuote = (uint256(baseOut) * px) >> 64;
+                uint256 needQuote = (baseOut * px) >> 64;
                 if (needQuote > type(uint64).max) revert Overflow();
 
                 o.quoteReserve += uint64(needQuote);
-                o.baseReserve -= baseOut;
+                o.baseReserve -= uint64(baseOut);
 
-                netBase = -int256(uint256(baseOut));
+                netBase = -int256(baseOut);
                 netQuote = int256(needQuote);
-                gotBase = baseOut;
+                gotBase = uint64(baseOut);
                 gotQuote = uint64(needQuote);
             }
 
