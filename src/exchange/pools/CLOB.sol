@@ -1,13 +1,110 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "../../IZRC20.sol";
+import {IZRC20} from "../../IZRC20.sol";
 
-/*─────────────────── minimal ReentrancyGuard ───────────────────*/
+/*╔════════════════════════ Custom errors ═══════════════════════════════╗*\
+│ Gas-efficient and self-documenting revert reasons. Every param carries │
+│ debugging context so off-chain indexers / UI surfaces can display the │
+│ exact failure cause without string-parsing.                           │
+\*╚══════════════════════════════════════════════════════════════════════╝*/
+
+/**
+ * @notice Caller is not the router authorised for this order-book instance.
+ * @param caller The account that attempted the restricted call.
+ * @param expected The router address stored in the contract.
+ */
+error RouterOnly(address caller, address expected);
+
+/**
+ * @notice A function received the zero address where non-zero was required.
+ * @param slot Human-readable description of the argument (e.g. "assetA").
+ */
+error ZeroAddress(string slot);
+
+/**
+ * @notice Assets supplied to the constructor are identical.
+ * @param asset The duplicate ERC-20 address.
+ */
+error SameAsset(address asset);
+
+/**
+ * @notice Order-creation attempted with zero liquidity on both sides.
+ */
+error ZeroReserves();
+
+/**
+ * @notice Tick range is invalid (`tickBuy >= tickSell`).
+ * @param tickBuy  Lower tick supplied.
+ * @param tickSell Upper tick supplied.
+ */
+error BadTicks(int24 tickBuy, int24 tickSell);
+
+/**
+ * @notice Tick values are out of valid range.
+ * @param tickBuy  Lower tick supplied.
+ * @param tickSell Upper tick supplied.
+ */
+error BadTicksRange(int24 tickBuy, int24 tickSell);
+
+/**
+ * @notice Tick replacement widens the spread instead of narrowing it.
+ * @param newBuy   New lower tick.
+ * @param newSell  New upper tick.
+ * @param oldBuy   Previous lower tick.
+ * @param oldSell  Previous upper tick.
+ */
+error WorseTicks(int24 newBuy, int24 newSell, int24 oldBuy, int24 oldSell);
+
+/**
+ * @notice Function restricted to the order’s owner.
+ * @param orderId   The order being accessed.
+ * @param expected  Owner stored in contract.
+ * @param caller    Transaction origin attempting the action.
+ */
+error NotOwner(uint64 orderId, address expected, address caller);
+
+/**
+ * @notice Referenced orderId does not exist.
+ * @param orderId The missing order identifier.
+ */
+error NoOrder(uint64 orderId);
+
+/**
+ * @notice Arithmetic overflow or result does not fit in 64-bits.
+ */
+error Overflow();
+
+/**
+ * @notice Attempted to trade on a side that the maker disabled.
+ * @param orderId     The maker order in question.
+ * @param baseForQuote `true` if taker tried base→quote, `false` otherwise.
+ */
+error SideDisabled(uint64 orderId, bool baseForQuote);
+
+/**
+ * @notice Attempted a swap with `amountSpecified == 0`.
+ */
+error ZeroAmount();
+
+/**
+ * @notice A command in a batch was invalid (e.g. both cancel and create empty).
+ */
+error BadCommand(uint256 index);
+
+/**
+ * @notice Both tickBuy and tickSell are disabled; order would be inert.
+ * @param tickBuy  Lower tick supplied (disabled sentinel).
+ * @param tickSell Upper tick supplied (disabled sentinel).
+ */
+error BothTicksDisabled(int24 tickBuy, int24 tickSell);
+
+/*╔══════════════════ Minimal ReentrancyGuard (1.4 kGas) ════════════════╗*/
 abstract contract ReentrancyGuard {
     uint256 private constant _NOT_ENTERED = 1;
     uint256 private constant _ENTERED = 2;
     uint256 private _status = _NOT_ENTERED;
+
     modifier nonReentrant() {
         require(_status != _ENTERED, "reentrant");
         _status = _ENTERED;
@@ -15,7 +112,9 @@ abstract contract ReentrancyGuard {
         _status = _NOT_ENTERED;
     }
 }
+/*╚═════════════════════════════════════════════════════════════════════╝*/
 
+/*─────────────────────── ICLOB interface (trimmed) ────────────────────*/
 interface ICLOB {
     event OrderCreated(
         uint64 indexed orderId,
@@ -141,53 +240,66 @@ interface ICLOB {
         returns (uint256[] memory buyPricesX64, uint256[] memory sellPricesX64);
 }
 
+/*╔══════════════════           CLOB core          ═════════════════════╗*/
 contract CLOB is ICLOB, ReentrancyGuard {
+    /*────────────────── Immutable configuration ──────────────────*/
     IZRC20 private immutable _base;
     IZRC20 private immutable _quote;
     IZRC20 private immutable _discountToken;
-    address private immutable _master;
+    address private immutable _router;
 
-    mapping(uint64 => ICLOB.Order) private _orders;
+    /*──────────────────   Internal state mappings   ───────────────*/
+    mapping(uint64 => Order) private _orders;
     mapping(uint64 => address) private _owners;
-    uint64 private _nextOrderId = 1;
+    uint64 private _nextId = 1;
 
+    /* Sentinel tick meaning “side disabled”.  Chosen as int24 min
+       so it never collides with Uniswap’s legal range [MIN_TICK, MAX_TICK]. */
+    int24 internal constant DISABLED_TICK = type(int24).min;
+
+    /*───────── Constructor ─────────*/
+    /**
+     * @param assetA  ERC-20 address (unordered).
+     * @param assetB  ERC-20 address (unordered).
+     * @param discountToken ERC-20 used by router for fee discounts.
+     * @param router  Trusted router that settles net deltas.
+     */
     constructor(
         IZRC20 assetA,
         IZRC20 assetB,
         IZRC20 discountToken,
-        address master
+        address router
     ) {
-        require(
-            address(assetA) != address(0) &&
-                address(assetB) != address(0) &&
-                address(discountToken) != address(0) &&
-                master != address(0),
-            "zero addr"
-        );
-        require(address(assetA) != address(assetB), "same asset");
-        // sort the assets
+        if (address(assetA) == address(0)) revert ZeroAddress("assetA");
+        if (address(assetB) == address(0)) revert ZeroAddress("assetB");
+        if (address(discountToken) == address(0))
+            revert ZeroAddress("discountToken");
+        if (router == address(0)) revert ZeroAddress("router");
+        if (address(assetA) == address(assetB))
+            revert SameAsset(address(assetA));
+
+        /* Canonicalise ordering so (token0,token1) is deterministic. */
         if (address(assetA) > address(assetB)) {
             (assetA, assetB) = (assetB, assetA);
         }
         _base = assetA;
         _quote = assetB;
         _discountToken = discountToken;
-        _master = master;
+        _router = router;
     }
 
+    /*──────────────────────────── View helpers ───────────────────────────*/
     function getBase() external view override returns (IZRC20) {
         return _base;
     }
-
     function getQuote() external view override returns (IZRC20) {
         return _quote;
     }
-
     function getPair()
         external
         view
         override
-        returns (IZRC20 base, IZRC20 quote)
+        returns (IZRC20 base_, IZRC20 quote_)
     {
         return (_base, _quote);
     }
@@ -197,47 +309,38 @@ contract CLOB is ICLOB, ReentrancyGuard {
     }
 
     function getMaster() external view returns (address) {
-        return _master;
+        return _router;
     }
 
+    /*──────────────────── Internal order helpers ───────────────────*/
+
     /**
-     * @notice Creates a new order and assigns ownership to `authority`.
-     * @dev
-     * ▸ Either reserve may be zero (pure-bid *or* pure-ask liquidity).
-     * ▸ Tick‐range sanity: `tickBuy < tickSell` (spread must be positive).
-     * ▸ Storage is **fully written before** the `OrderCreated` event is emitted
-     *   so off-chain indexers never see a transient owner = 0 address.
-     *
-     * @param authority  The account that controls the order (passed down by router).
-     * @param baseReserve  Initial base-asset liquidity committed to the order.
-     * @param quoteReserve Initial quote-asset liquidity committed to the order.
-     * @param tickBuy  Lower tick (boundary price) at which the order will buy base.
-     * @param tickSell Upper tick (boundary price) at which the order will sell base.
-     * @return orderId  Auto-incremented identifier of the freshly created order.
+     * @dev Internal write helper; creates a new order and assigns ownership.
+     *      **MUST** be followed by router-level token settlement.
      */
-    function createOrder(
-        address authority,
+    function _createOrder(
+        address owner,
         uint64 baseReserve,
         uint64 quoteReserve,
         int24 tickBuy,
         int24 tickSell
     ) internal returns (uint64 orderId) {
-        require(authority != address(0), "owner-0");
-        require(baseReserve > 0 || quoteReserve > 0, "zero-reserves");
-        require(tickBuy < tickSell, "bad-ticks");
+        _enforceTicks(tickBuy, tickSell);
+        if (owner == address(0)) revert ZeroAddress("owner");
+        if (baseReserve == 0 && quoteReserve == 0) revert ZeroReserves();
 
-        orderId = _nextOrderId++;
-        _orders[orderId] = ICLOB.Order({
+        orderId = _nextId++;
+        _orders[orderId] = Order({
             baseReserve: baseReserve,
             quoteReserve: quoteReserve,
             tickBuy: tickBuy,
             tickSell: tickSell
         });
-        _owners[orderId] = authority; // storage first, then event
+        _owners[orderId] = owner; // store before emit
 
-        emit ICLOB.OrderCreated(
+        emit OrderCreated(
             orderId,
-            authority,
+            owner,
             baseReserve,
             quoteReserve,
             uint24(tickBuy),
@@ -246,197 +349,127 @@ contract CLOB is ICLOB, ReentrancyGuard {
     }
 
     /**
-     * @notice Cancels an existing order and refunds its reserves.
-     * @dev    Callable only by the designated owner (`authority`).
-     *
-     * @param authority  The caller-supplied owner address (router passes it through).
-     * @param orderId    The order to cancel.
-     * @return baseRecovered   Base-asset liquidity returned to the owner.
-     * @return quoteRecovered  Quote-asset liquidity returned to the owner.
+     * @dev Cancels order and returns its reserves (router must refund owner).
      */
-    function cancelOrder(
-        address authority,
+    function _cancelOrder(
+        address owner,
         uint64 orderId
-    ) internal returns (uint64 baseRecovered, uint64 quoteRecovered) {
-        ICLOB.Order memory order = _orders[orderId];
-        address owner = _owners[orderId];
+    ) internal returns (uint64 br, uint64 qr) {
+        address actual = _owners[orderId];
+        if (actual == address(0)) revert NoOrder(orderId);
+        if (actual != owner) revert NotOwner(orderId, actual, owner);
 
-        require(owner != address(0), "no-order");
-        require(authority == owner, "not-owner");
-
-        baseRecovered = order.baseReserve;
-        quoteRecovered = order.quoteReserve;
+        Order memory o = _orders[orderId];
+        br = o.baseReserve;
+        qr = o.quoteReserve;
 
         delete _orders[orderId];
         delete _owners[orderId];
 
-        emit ICLOB.OrderCancelled(orderId, owner);
+        emit OrderCancelled(orderId, owner);
     }
 
     /**
-     * @notice Replaces the parameters of an existing order, only in the
-     *         *direction of improvement* (tighter spread and/or deeper reserves).
-     * @dev
-     * ▸ Deltas must be **funded later in the batch**; here we only update storage.
-     * ▸ Addition on `uint64` is checked-arithmetic in 0.8+, so overflow reverts.
-     *
-     * @param authority          The owner asserting control of `orderId`.
-     * @param orderId            Order to mutate in-place.
-     * @param baseReserveDelta   Additional base liquidity to add (no negatives).
-     * @param quoteReserveDelta  Additional quote liquidity to add (no negatives).
-     * @param tickBuy            New lower tick (≤ old).
-     * @param tickSell           New upper tick (≥ old).
+     * @dev In-place improvement of an order; only tighter/wider in maker favor.
      */
-    function replaceOrder(
-        address authority,
-        uint64 orderId,
-        uint64 baseReserveDelta,
-        uint64 quoteReserveDelta,
-        int24 tickBuy,
-        int24 tickSell
+    function _replaceOrder(
+        address owner,
+        uint64 id,
+        uint64 addBase,
+        uint64 addQuote,
+        int24 newBuy,
+        int24 newSell
     ) internal {
-        ICLOB.Order storage order = _orders[orderId];
-        address owner = _owners[orderId];
+        _enforceTicks(newBuy, newSell);
 
-        require(owner != address(0), "no-order");
-        require(authority == owner, "not-owner");
+        address actual = _owners[id];
+        if (actual == address(0)) revert NoOrder(id);
+        if (actual != owner) revert NotOwner(id, actual, owner);
 
-        uint64 newBase = order.baseReserve + baseReserveDelta; // reverts on ovf
-        uint64 newQuote = order.quoteReserve + quoteReserveDelta; // reverts on ovf
-        require(newBase > 0 || newQuote > 0, "zero-reserves");
-        require(tickBuy < tickSell, "bad-ticks");
-        require(
-            tickBuy <= order.tickBuy && tickSell >= order.tickSell,
-            "worse-ticks"
-        );
+        Order storage o = _orders[id];
 
-        order.baseReserve = newBase;
-        order.quoteReserve = newQuote;
-        order.tickBuy = tickBuy;
-        order.tickSell = tickSell;
-        // emit event
-        emit ICLOB.OrderReplaced(
-            orderId,
+        if (newBuy > o.tickBuy || newSell < o.tickSell)
+            revert WorseTicks(newBuy, newSell, o.tickBuy, o.tickSell);
+
+        /* Checked arithmetic (0.8+) — overflow ⇒ revert(Overflow()). */
+        uint64 newBase = o.baseReserve + addBase;
+        uint64 newQuote = o.quoteReserve + addQuote;
+        if (newBase == 0 && newQuote == 0) revert ZeroReserves();
+
+        o.baseReserve = newBase;
+        o.quoteReserve = newQuote;
+        o.tickBuy = newBuy;
+        o.tickSell = newSell;
+
+        emit OrderReplaced(
+            id,
             owner,
             newBase,
             newQuote,
-            uint24(tickBuy),
-            uint24(tickSell)
+            uint24(newBuy),
+            uint24(newSell)
         );
     }
 
+    /*────────────────────────── Maker entrypoint ──────────────────────────*/
     /**
-     * @notice Batch-process a maker’s order instructions, returning the **net**
-     *         liquidity delta without moving any tokens.  The router that
-     *         invoked this call is responsible for settling the result with a
-     *         single `transfer{From}` per asset, so the maker only needs one
-     *         approval per token.
+     * @inheritdoc ICLOB
      *
-     * @dev Implementation rules & assumptions
-     * ───────────────────────────────────────
-     * • `auth` is the maker’s EOA whose authority the router asserts.
-     * • `msg.sender` **must** be the trusted router (`_master`); the book never
-     *   interacts with arbitrary callers.
-     * • Positive return values ⇒ CLOB owes the maker a refund (router will
-     *   pull funds *out* of the book).
-     *   Negative return values ⇒ maker must supply additional liquidity
-     *   (router will push funds *into* the book).
-     * • Uses `int256` accumulators to eliminate overflow risk on whale batches.
-     * • Helper functions (`createOrder`, `replaceOrder`, `cancelOrder`) enforce
-     *   all per-order invariants (ownership, tick sanity, reserve > 0, etc.).
-     *
-     * @param  auth       Maker address, trusted and verified by the router.
-     * @param  commands   Sequence of create / replace / cancel directives.
-     * @return netBase    Signed net change of base-asset liquidity.
-     * @return netQuote   Signed net change of quote-asset liquidity.
+     * @custom:param auth  Maker address asserted by router.
+     * @dev    Returns **signed** liquidity deltas so the router can net-settle
+     *         the entire batch with one ERC-20 transfer per token.
      */
     function makeFrom(
         address auth,
-        ICLOB.MakeCommand[] calldata commands
+        MakeCommand[] calldata cmds
     ) external override nonReentrant returns (int256 netBase, int256 netQuote) {
-        require(msg.sender == _master, "router-only");
+        if (msg.sender != _router) revert RouterOnly(msg.sender, _router);
 
-        /* Running signed totals:   +ve → refund,  -ve → additional deposit. */
-        int256 baseDelta;
-        int256 quoteDelta;
+        /* Positive → refund to maker ; Negative → maker must deposit. */
+        int256 dBase;
+        int256 dQuote;
 
-        uint256 len = commands.length;
-        for (uint256 i; i < len; ++i) {
-            /* Calldata pointer stays cheap; no copy to memory needed.        */
-            ICLOB.MakeCommand calldata cmd = commands[i];
+        unchecked {
+            for (uint256 i; i < cmds.length; ++i) {
+                MakeCommand calldata c = cmds[i];
 
-            /* ───────────────── Replace (cancel + create) ───────────────── */
-            if (cmd.cancel.id != 0 && cmd.create.owner != address(0)) {
-                replaceOrder(
-                    auth,
-                    cmd.cancel.id,
-                    cmd.create.baseReserveDelta,
-                    cmd.create.quoteReserveDelta,
-                    cmd.create.tickBuy,
-                    cmd.create.tickSell
-                );
-                baseDelta -= int256(uint256(cmd.create.baseReserveDelta));
-                quoteDelta -= int256(uint256(cmd.create.quoteReserveDelta));
-
-                /* ───────────────────── Pure cancel ─────────────────────────── */
-            } else if (cmd.cancel.id != 0) {
-                (uint64 br, uint64 qr) = cancelOrder(auth, cmd.cancel.id);
-                baseDelta += int256(uint256(br));
-                quoteDelta += int256(uint256(qr));
-
-                /* ───────────────────── Pure create ─────────────────────────── */
-            } else if (cmd.create.owner != address(0)) {
-                createOrder(
-                    auth,
-                    cmd.create.baseReserveDelta,
-                    cmd.create.quoteReserveDelta,
-                    cmd.create.tickBuy,
-                    cmd.create.tickSell
-                );
-                baseDelta -= int256(uint256(cmd.create.baseReserveDelta));
-                quoteDelta -= int256(uint256(cmd.create.quoteReserveDelta));
-
-                /* ───────────────────── Bad tuple ───────────────────────────── */
-            } else {
-                revert("bad-command");
+                /* Replace = cancel+create in same slot (saves orderId churn). */
+                if (c.cancel.id != 0 && c.create.owner != address(0)) {
+                    _replaceOrder(
+                        auth,
+                        c.cancel.id,
+                        c.create.baseReserveDelta,
+                        c.create.quoteReserveDelta,
+                        c.create.tickBuy,
+                        c.create.tickSell
+                    );
+                    dBase -= int256(uint256(c.create.baseReserveDelta));
+                    dQuote -= int256(uint256(c.create.quoteReserveDelta));
+                } else if (c.cancel.id != 0) {
+                    (uint64 br, uint64 qr) = _cancelOrder(auth, c.cancel.id);
+                    dBase += int256(uint256(br));
+                    dQuote += int256(uint256(qr));
+                } else if (c.create.owner != address(0)) {
+                    _createOrder(
+                        auth,
+                        c.create.baseReserveDelta,
+                        c.create.quoteReserveDelta,
+                        c.create.tickBuy,
+                        c.create.tickSell
+                    );
+                    dBase -= int256(uint256(c.create.baseReserveDelta));
+                    dQuote -= int256(uint256(c.create.quoteReserveDelta));
+                } else {
+                    revert BadCommand(i);
+                }
             }
         }
-
-        /* Return the signed totals to the router for settlement. */
-        return (baseDelta, quoteDelta);
+        return (dBase, dQuote);
     }
 
+    /*────────────────────────── Taker entrypoint ──────────────────────────*/
     /**
-     * @notice Fills **one** maker order and returns *signed* deltas that the
-     *         router can net across multiple calls before doing any ERC-20
-     *         transfers.  The function supports both **exact-in** and **exact-out**
-     *         semantics, decided by the `exactIn` flag.
-     *
-     * Swap directions
-     * ───────────────
-     * • `baseForQuote == true`   →  taker *sells base*, receives quote
-     * • `baseForQuote == false`  →  taker *sells quote*, receives base
-     *
-     * Amount interpretation
-     * ─────────────────────
-     * • `exactIn  == true`  →  `amountSpecified` is the taker’s **input** amount
-     * • `exactIn  == false` →  `amountSpecified` is the taker’s **desired output**
-     *
-     * Returned deltas (signed)
-     * ────────────────────────
-     * • `netBase`  > 0  →  router must **pull** that many base tokens *into* CLOB
-     *             < 0  →  router must **push** that many base tokens *out* of CLOB
-     * • `netQuote` same convention for quote tokens
-     *
-     * @param orderId          Maker order to hit (no-op if it doesn’t exist).
-     * @param baseForQuote     Swap side flag (see table above).
-     * @param amountSpecified  Exact-in amount *or* exact-out amount, per `exactIn`.
-     * @param exactIn          Swap mode selector.
-     *
-     * @return netBase   Signed base-token delta for router settlement.
-     * @return netQuote  Signed quote-token delta for router settlement.
-     * @return gotBase   Actual base tokens that changed hands.
-     * @return gotQuote  Actual quote tokens that changed hands.
+     * @inheritdoc ICLOB
      */
     function takeFrom(
         uint64 orderId,
@@ -454,154 +487,114 @@ contract CLOB is ICLOB, ReentrancyGuard {
             uint64 gotQuote
         )
     {
-        require(msg.sender == _master, "router-only");
-        
-        /* Fast-exit for unknown or empty orders. */
+        if (msg.sender != _router) revert RouterOnly(msg.sender, _router);
+        if (amountSpecified == 0) revert ZeroAmount();
+
         address maker = _owners[orderId];
-        if (maker == address(0) || amountSpecified == 0) return (0, 0, 0, 0);
+        if (maker == address(0)) revert NoOrder(orderId);
 
-        ICLOB.Order storage o = _orders[orderId];
+        Order storage o = _orders[orderId];
 
-        /* ───── Direction: taker sells base → receives quote ───── */
+        /* Branch on side. */
         if (baseForQuote) {
-            uint256 priceX64 = TickMath.priceX64(o.tickBuy); // quote / base
-            require(priceX64 > 0, "buy-disabled");
+            if (o.tickBuy == DISABLED_TICK || o.quoteReserve == 0)
+                revert SideDisabled(orderId, true);
 
+            uint256 px = TickMath.priceX64(o.tickBuy); // quote / base (Q64.64)
+
+            /*-- exact-in: taker knows baseIn --*/
             if (exactIn) {
-                /* exact-in: amountSpecified = baseIn */
                 uint64 baseIn = amountSpecified;
 
-                /* Maximum quote we could pay at this price */
-                uint256 maxQuote = (uint256(baseIn) * priceX64) >> 64;
-                if (maxQuote == 0 || o.quoteReserve == 0) return (0, 0, 0, 0);
+                /* maxQuote = baseIn * price */
+                uint256 maxQuote = (uint256(baseIn) * px) >> 64;
+                if (maxQuote == 0) revert Overflow();
 
                 uint64 quoteOut = maxQuote <= o.quoteReserve
                     ? uint64(maxQuote)
-                    : o.quoteReserve; // partial if not enough quote
+                    : o.quoteReserve;
 
-                /* Mutate reserves */
                 o.baseReserve += baseIn;
                 o.quoteReserve -= quoteOut;
 
-                /* Signed deltas for the router */
-                netBase = int256(uint256(baseIn)); // router must pull IN base
-                netQuote = -int256(uint256(quoteOut)); // router must pay OUT quote
-
+                netBase = int256(uint256(baseIn));
+                netQuote = -int256(uint256(quoteOut));
                 gotBase = baseIn;
                 gotQuote = quoteOut;
-            } else {
-                /* exact-out: amountSpecified = quote desired */
-                uint64 quoteWant = amountSpecified;
-                if (o.quoteReserve == 0) return (0, 0, 0, 0);
 
+                /*-- exact-out: taker wants quoteOut --*/
+            } else {
+                uint64 quoteWant = amountSpecified;
                 uint64 quoteOut = quoteWant <= o.quoteReserve
                     ? quoteWant
-                    : o.quoteReserve; // partial if not enough quote
+                    : o.quoteReserve;
 
-                /* base needed, ceil-division */
-                uint256 needBase = ((uint256(quoteOut) << 64) + priceX64 - 1) /
-                    priceX64;
-
-                require(
-                    needBase > 0 &&
-                        needBase <= type(uint64).max &&
-                        o.baseReserve + needBase <= type(uint64).max,
-                    "ovf"
-                );
+                uint256 needBase = ((uint256(quoteOut) << 64) + px - 1) / px; // ceilDiv
+                if (needBase > type(uint64).max) revert Overflow();
 
                 o.baseReserve += uint64(needBase);
                 o.quoteReserve -= quoteOut;
 
-                netBase = int256(needBase); // pull IN base
-                netQuote = -int256(uint256(quoteOut)); // pay OUT quote
-
+                netBase = int256(needBase);
+                netQuote = -int256(uint256(quoteOut));
                 gotBase = uint64(needBase);
                 gotQuote = quoteOut;
             }
 
-            emit ICLOB.OrderFilled(orderId, maker, gotBase, gotQuote, true);
-
-            /* ───── Direction: taker sells quote → receives base ───── */
+            emit OrderFilled(orderId, maker, gotBase, gotQuote, true);
         } else {
-            uint256 priceX64 = TickMath.priceX64(o.tickSell); // quote / base
-            require(priceX64 > 0, "sell-disabled");
+            /*-- taker sells quote, receives base --*/
+            if (o.tickSell == DISABLED_TICK || o.baseReserve == 0)
+                revert SideDisabled(orderId, false);
+
+            uint256 px = TickMath.priceX64(o.tickSell); // quote / base
 
             if (exactIn) {
-                /* exact-in: amountSpecified = quoteIn */
-                uint64 quoteIn_ = amountSpecified;
+                uint64 quoteIn = amountSpecified;
 
-                uint64 baseOut = uint64((uint256(quoteIn_) << 64) / priceX64);
-                if (baseOut == 0 || o.baseReserve == 0) return (0, 0, 0, 0);
+                uint64 baseOut = uint64((uint256(quoteIn) << 64) / px);
+                if (baseOut == 0) revert Overflow();
 
                 if (baseOut > o.baseReserve) {
-                    /* Partial fill, scale quoteIn down to max possible */
                     baseOut = o.baseReserve;
-                    quoteIn_ = uint64((uint256(baseOut) * priceX64) >> 64);
+                    quoteIn = uint64((uint256(baseOut) * px) >> 64);
                 }
 
-                o.quoteReserve += quoteIn_;
+                o.quoteReserve += quoteIn;
                 o.baseReserve -= baseOut;
 
-                netBase = -int256(uint256(baseOut)); // pay OUT base
-                netQuote = int256(uint256(quoteIn_)); // pull IN quote
-
+                netBase = -int256(uint256(baseOut));
+                netQuote = int256(uint256(quoteIn));
                 gotBase = baseOut;
-                gotQuote = quoteIn_;
+                gotQuote = quoteIn;
             } else {
-                /* exact-out: amountSpecified = base desired */
                 uint64 baseWant = amountSpecified;
-                if (o.baseReserve == 0) return (0, 0, 0, 0);
-
                 uint64 baseOut = baseWant <= o.baseReserve
                     ? baseWant
                     : o.baseReserve;
 
-                uint256 needQuote = (uint256(baseOut) * priceX64) >> 64;
-                require(
-                    needQuote > 0 &&
-                        needQuote <= type(uint64).max &&
-                        o.quoteReserve + needQuote <= type(uint64).max,
-                    "ovf"
-                );
+                uint256 needQuote = (uint256(baseOut) * px) >> 64;
+                if (needQuote > type(uint64).max) revert Overflow();
 
                 o.quoteReserve += uint64(needQuote);
                 o.baseReserve -= baseOut;
 
-                netBase = -int256(uint256(baseOut)); // pay OUT base
-                netQuote = int256(needQuote); // pull IN quote
-
+                netBase = -int256(uint256(baseOut));
+                netQuote = int256(needQuote);
                 gotBase = baseOut;
                 gotQuote = uint64(needQuote);
             }
 
-            emit ICLOB.OrderFilled(orderId, maker, gotQuote, gotBase, false);
+            emit OrderFilled(orderId, maker, gotQuote, gotBase, false);
         }
     }
 
+    /*────────────────────── View-only “what-if” ──────────────────────────*/
     /**
-     * @notice “What-if” version of `takeFrom` that touches **no** storage and
-     *         performs **no** ERC-20 transfers.  It tells the router how many
-     *         tokens would move if this exact swap were executed right now.
+     * @inheritdoc ICLOB
      *
-     * Parameters mirror `takeFrom`
-     * ────────────────────────────
-     * • `orderId`        – maker order to hit (silently ignored if missing).
-     * • `baseForQuote`   – `true`  ⇒ taker sells base, receives quote
-     *                       `false` ⇒ taker sells quote, receives base
-     * • `amountSpecified`– exact amount on the *taker* side (see `exactIn`).
-     * • `exactIn`        – `true`  ⇒ `amountSpecified` is the **input** amount
-     *                       `false` ⇒ `amountSpecified` is the **desired output**.
-     *
-     * Return values
-     * ─────────────
-     * • `netBase`, `netQuote` – signed deltas for router-level netting
-     *   (>0 pull-in, <0 pay-out; 0 means no movement for that asset).
-     * • `gotBase`, `gotQuote` – gross token amounts that would actually change
-     *   hands (taker-perspective).  Helpful for detecting partial fills.
-     *
-     * The function never reverts for “missing order”, “side disabled”, or
-     * “insufficient liquidity”; it just returns zeros so callers can probe
-     * without risk.
+     * @dev Never reverts; any invalid combination returns all-zeros so callers
+     *      can probe the book safely.
      */
     function simulate(
         uint64 orderId,
@@ -619,86 +612,73 @@ contract CLOB is ICLOB, ReentrancyGuard {
             uint64 gotQuote
         )
     {
-        /* Short-circuit for bad inputs or unknown order */
-        if (amountSpecified == 0 || _owners[orderId] == address(0)) {
-            return (0, 0, 0, 0);
-        }
+        if (amountSpecified == 0) return (0, 0, 0, 0);
+        address maker = _owners[orderId];
+        if (maker == address(0)) return (0, 0, 0, 0);
 
-        ICLOB.Order storage o = _orders[orderId];
+        Order storage o = _orders[orderId];
 
-        /* ─────── taker sells base, receives quote ─────── */
+        /* Same math as takeFrom but without state changes. Any branch that
+           would revert simply early-returns zeros instead. */
         if (baseForQuote) {
-            /* side disabled? → no-op */
-            if (o.quoteReserve == 0 || o.tickBuy == TickMath.MIN_TICK) {
+            if (o.tickBuy == DISABLED_TICK || o.quoteReserve == 0)
                 return (0, 0, 0, 0);
-            }
-
-            uint256 priceX64 = TickMath.priceX64(o.tickBuy); // quote / base
+            uint256 px = TickMath.priceX64(o.tickBuy);
 
             if (exactIn) {
-                /* amountSpecified = baseIn */
                 uint64 baseIn = amountSpecified;
+                uint256 maxQ = (uint256(baseIn) * px) >> 64;
+                if (maxQ == 0) return (0, 0, 0, 0);
+                uint64 quoteOut = maxQ <= o.quoteReserve
+                    ? uint64(maxQ)
+                    : o.quoteReserve;
 
-                uint256 maxQuote = (uint256(baseIn) * priceX64) >> 64;
-                if (maxQuote == 0) return (0, 0, 0, 0);
-
-                uint64 quoteOut = maxQuote <= o.quoteReserve
-                    ? uint64(maxQuote)
-                    : o.quoteReserve; // partial
-
-                /* compose deltas */
-                netBase = int256(uint256(baseIn)); // pull base IN
-                netQuote = -int256(uint256(quoteOut)); // pay quote OUT
+                netBase = int256(uint256(baseIn));
+                netQuote = -int256(uint256(quoteOut));
                 gotBase = baseIn;
                 gotQuote = quoteOut;
             } else {
-                /* amountSpecified = quote desired (exact-out) */
                 uint64 quoteWant = amountSpecified;
                 uint64 quoteOut = quoteWant <= o.quoteReserve
                     ? quoteWant
-                    : o.quoteReserve; // partial
+                    : o.quoteReserve;
+                uint256 needBase = ((uint256(quoteOut) << 64) + px - 1) / px;
 
-                uint256 needBase = ((uint256(quoteOut) << 64) + priceX64 - 1) /
-                    priceX64; // ceil
+                if (needBase == 0 || needBase > type(uint64).max)
+                    return (0, 0, 0, 0);
 
                 netBase = int256(needBase);
                 netQuote = -int256(uint256(quoteOut));
                 gotBase = uint64(needBase);
                 gotQuote = quoteOut;
             }
-
-            /* ─────── taker sells quote, receives base ─────── */
         } else {
-            if (o.baseReserve == 0 || o.tickSell == TickMath.MIN_TICK) {
+            if (o.tickSell == DISABLED_TICK || o.baseReserve == 0)
                 return (0, 0, 0, 0);
-            }
-
-            uint256 priceX64 = TickMath.priceX64(o.tickSell); // quote / base
+            uint256 px = TickMath.priceX64(o.tickSell);
 
             if (exactIn) {
-                /* amountSpecified = quoteIn */
-                uint64 quoteIn_ = amountSpecified;
-
-                uint64 baseOut = uint64((uint256(quoteIn_) << 64) / priceX64);
+                uint64 quoteIn = amountSpecified;
+                uint64 baseOut = uint64((uint256(quoteIn) << 64) / px);
                 if (baseOut == 0) return (0, 0, 0, 0);
-
                 if (baseOut > o.baseReserve) {
-                    baseOut = o.baseReserve; // partial
-                    quoteIn_ = uint64((uint256(baseOut) * priceX64) >> 64);
+                    baseOut = o.baseReserve;
+                    quoteIn = uint64((uint256(baseOut) * px) >> 64);
                 }
 
-                netBase = -int256(uint256(baseOut)); // pay base OUT
-                netQuote = int256(uint256(quoteIn_)); // pull quote IN
+                netBase = -int256(uint256(baseOut));
+                netQuote = int256(uint256(quoteIn));
                 gotBase = baseOut;
-                gotQuote = quoteIn_;
+                gotQuote = quoteIn;
             } else {
-                /* amountSpecified = base desired (exact-out) */
                 uint64 baseWant = amountSpecified;
                 uint64 baseOut = baseWant <= o.baseReserve
                     ? baseWant
                     : o.baseReserve;
+                uint256 needQuote = (uint256(baseOut) * px) >> 64;
 
-                uint256 needQuote = (uint256(baseOut) * priceX64) >> 64;
+                if (needQuote == 0 || needQuote > type(uint64).max)
+                    return (0, 0, 0, 0);
 
                 netBase = -int256(uint256(baseOut));
                 netQuote = int256(needQuote);
@@ -708,76 +688,95 @@ contract CLOB is ICLOB, ReentrancyGuard {
         }
     }
 
+    /*──────────────────────── Batch price helper ─────────────────────────*/
     /**
-     * @notice Batch-fetch the buy-side and sell-side prices for a list of orders.
-     *
-     * @dev
-     * • Each price is returned as a Q64.64 fixed-point number (quote / base).
-     * • Missing orders or disabled sides (tick == MIN_TICK) return **0**.
-     * • The two returned arrays always have the same length as `orderIds`,
-     *   indexed 1-for-1 with the input.
-     *
-     * @param  orderIds        Array of maker-order IDs.
-     * @return buyPricesX64    Q64.64 prices at which each order *buys* base.
-     * @return sellPricesX64   Q64.64 prices at which each order *sells* base.
+     * @inheritdoc ICLOB
      */
     function getPrices(
-        uint64[] calldata orderIds
+        uint64[] calldata ids
     )
         external
         view
-        returns (uint256[] memory buyPricesX64, uint256[] memory sellPricesX64)
+        override
+        returns (uint256[] memory buyPx, uint256[] memory sellPx)
     {
-        uint256 n = orderIds.length;
-        buyPricesX64 = new uint256[](n);
-        sellPricesX64 = new uint256[](n);
+        uint256 n = ids.length;
+        buyPx = new uint256[](n);
+        sellPx = new uint256[](n);
 
-        for (uint256 i; i < n; ++i) {
-            uint64 id = orderIds[i];
-            address owner = _owners[id];
-            if (owner == address(0)) continue; // order missing → 0,0
+        unchecked {
+            for (uint256 i; i < n; ++i) {
+                uint64 id = ids[i];
+                if (_owners[id] == address(0)) {
+                    continue;
+                } // gap remains zero
+                Order storage o = _orders[id];
 
-            ICLOB.Order storage o = _orders[id];
-
-            if (o.tickBuy != TickMath.MIN_TICK) {
-                buyPricesX64[i] = TickMath.priceX64(o.tickBuy); // may be 0 if tickBuy sentinel
-            }
-            if (o.tickSell != TickMath.MIN_TICK) {
-                sellPricesX64[i] = TickMath.priceX64(o.tickSell); // 0 if tickSell sentinel
+                if (o.tickBuy != DISABLED_TICK)
+                    buyPx[i] = TickMath.priceX64(o.tickBuy);
+                if (o.tickSell != DISABLED_TICK)
+                    sellPx[i] = TickMath.priceX64(o.tickSell);
             }
         }
     }
 
+    /*──────────────────── Public getters (unchanged ABI) ─────────────────*/
     function getOrders(
-        uint64[] calldata orderIds
-    ) external view override returns (Order[] memory) {
-        uint256 n = orderIds.length;
-        Order[] memory orders = new Order[](n);
-        for (uint256 i; i < n; ++i) {
-            uint64 id = orderIds[i];
-            address owner = _owners[id];
-            if (owner != address(0)) {
-                orders[i] = _orders[id];
-            } else {
-                orders[i] = Order({
-                    baseReserve: 0,
-                    quoteReserve: 0,
-                    tickBuy: TickMath.MIN_TICK,
-                    tickSell: TickMath.MIN_TICK
-                });
+        uint64[] calldata ids
+    ) external view override returns (Order[] memory out) {
+        uint256 n = ids.length;
+        out = new Order[](n);
+        unchecked {
+            for (uint256 i; i < n; ++i) {
+                uint64 id = ids[i];
+                out[i] = _owners[id] != address(0)
+                    ? _orders[id]
+                    : Order({
+                        baseReserve: 0,
+                        quoteReserve: 0,
+                        tickBuy: DISABLED_TICK,
+                        tickSell: DISABLED_TICK
+                    });
             }
         }
-        return orders;
     }
 
     function isOwner(
-        uint64 orderId,
-        address owner
+        uint64 id,
+        address who
     ) external view override returns (bool) {
-        address actual = _owners[orderId];
-        return actual != address(0) && actual == owner;
+        return _owners[id] == who && who != address(0);
+    }
+
+    // helpers
+    function _validTick(int24 t) private pure returns (bool) {
+        return
+            t == DISABLED_TICK ||
+            (t >= TickMath.MIN_TICK && t <= TickMath.MAX_TICK);
+    }
+
+    /// @dev Sanity-checks tick inputs.
+    ///      – Each tick must be either DISABLED_TICK **or** within the Uni V3 range.
+    ///      – At least **one** side must be enabled (avoids “zombie” orders).
+    ///      – When both sides are enabled we still enforce tickBuy < tickSell.
+    function _enforceTicks(int24 tickBuy, int24 tickSell) internal pure {
+        // 1. Individual-tick bounds.
+        if (!_validTick(tickBuy) || !_validTick(tickSell))
+            revert BadTicksRange(tickBuy, tickSell);
+
+        // 2. Disallow both sides disabled => untakeable order.
+        if (tickBuy == DISABLED_TICK && tickSell == DISABLED_TICK)
+            revert BothTicksDisabled(tickBuy, tickSell);
+
+        // 3. If both enabled, maintain buy < sell invariant.
+        if (
+            tickBuy != DISABLED_TICK &&
+            tickSell != DISABLED_TICK &&
+            tickBuy >= tickSell
+        ) revert BadTicks(tickBuy, tickSell);
     }
 }
+/*╚══════════════════════════  End of CLOB  ════════════════════════════*/
 
 /*══════════════════════════════════════════════════════════════════════*\
 │                         TickMath — Uniswap V3                         │
