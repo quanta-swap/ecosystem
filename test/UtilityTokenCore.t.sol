@@ -82,11 +82,7 @@ contract StandardUtilityTokenTest is Test {
         );
 
         /* 3️⃣  Sanity-check that the deployer received the supply. */
-        assertEq(
-            tok.balanceOf(address(1)),
-            SUPPLY64,
-            "mint balance mismatch"
-        );
+        assertEq(tok.balanceOf(address(1)), SUPPLY64, "mint balance mismatch");
     }
 
     /*────────────────── theme() tests ──────────────────*/
@@ -1035,6 +1031,35 @@ contract StandardUtilityTokenTest is Test {
 
         bool ok = dep.verify(bogus);
         assertFalse(ok, "verify() should be false for non-factory addresses");
+    }
+
+    /**
+     * @notice `authority()` must equal the transaction origin that deployed
+     *         the token (EOA or contract).  We prank so both msg.sender and
+     *         tx.origin are AL for the full depth of the call-stack.
+     */
+    function testAuthorityCapturesTxOrigin() public {
+        /* 1. fresh factory */
+        UtilityTokenDeployer dep = new UtilityTokenDeployer();
+
+        /* 2. single-call prank → sets msg.sender *and* tx.origin to AL */
+        vm.prank(AL, AL);
+        address tokAddr = dep.create(
+            "Auth-Coin",
+            "AUTH",
+            10_000 * uint64(ONE_TOKEN),
+            9,
+            LOCK_TIME,
+            AL, // root holder
+            "auth.test"
+        );
+
+        /* 3. check the immutable field */
+        assertEq(
+            StandardUtilityToken(tokAddr).authority(),
+            AL,
+            "authority should record tx.origin"
+        );
     }
 
     /*───────────────── helpers ─────────────────*/

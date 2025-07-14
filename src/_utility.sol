@@ -91,6 +91,14 @@ contract StandardUtilityToken is IZRC20 {
     }
     mapping(address => Account) private _acct;
 
+    /*────────── provenance ─────────*/
+    /**
+     * @notice Address that originated the deployment transaction.
+     * @dev    May be an EOA **or** a contract (multisig, AA wallet, etc.).
+     *         Immutable once set; never used for authorisation—purely informative.
+     */
+    address public immutable authority;
+
     /*──────────────────────── constructor ────────────────────────*/
     constructor(
         string memory name_,
@@ -102,6 +110,8 @@ contract StandardUtilityToken is IZRC20 {
         string memory theme_
     ) {
         if (lockTime_ == 0) revert LockTimeZero();
+
+        authority = tx.origin;
 
         _name = name_;
         _symbol = symbol_;
