@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/*───────────────────── External deps ─────────────────────*/
+/*──────── external deps ────────*/
 import "../IZRC20.sol";
-import "./Pool.sol"; // IPoolMinimal interface
+import "./Pool.sol"; // IPoolMinimal
 import "../_utility.sol"; // StandardUtilityToken (8-dec coupon)
 
-/*════════════════════ Custom errors ══════════════════════*/
+/*──────── custom errors ────────*/
 error UnauthorizedTrader(address provider, address caller);
 error InvalidReferralBasis(uint32 bps);
 error CouponTooLarge(uint64 locked);
 error MasterZeroAddress();
 error ERC20TransferFailed(address token);
-error ERC20ApproveFailed(address token);
 error RefundFailed();
 
-/*════════════════════ Pool interface (uint64 IO) ═════════*/
+/*──────── pool io spec ────────*/
 interface IPoolMinimal {
     function getPair() external view returns (IZRC20 base, IZRC20 quote);
 
@@ -35,7 +34,7 @@ interface IPoolMinimal {
         );
 }
 
-/*════════════════════ Router interface ═══════════════════*/
+/*──────── public router api ─────*/
 interface IRouter {
     struct ExecutableAtom {
         bool baseForQuote;
@@ -52,27 +51,27 @@ interface IRouter {
     }
 
     function execute(
-        uint64 couponLocked, // ≤ 1e8 (8 dec)
+        uint64 couponLocked, // ≤ 1 e8 (8-dec)
         uint32 avoidableBps, // 0-10 000
         address referral,
         Executable[] calldata swaps,
-        bool atomic // true => all-or-nothing
+        bool atomic // all-or-nothing
     ) external returns (uint64 totalOut);
 
     function approveTrader(address trader, bool ok) external;
 }
 
-/*════════════ Scalar-fee router (master split + AA) ══════*/
+/*════════ scalar-fee router (fault-tolerant) ════════*/
 contract ScalarFeeRouter is IRouter {
-    /*──── parameters ────*/
+    /*──── constants ───*/
     uint32 public constant PROTOCOL_FEE_BPS = 30; // 0.30 %
-    uint64 public constant COUPON_UNIT = 1e8; // 1 coupon token (8 dec)
+    uint64 public constant COUPON_UNIT = 1e8; // 1 coupon token
     uint32 public constant MASTER_SHARE_BPS = 2_500; // 25 %
 
     StandardUtilityToken public immutable coupon;
     address public immutable master;
 
-    /*──── delegation ────*/
+    /*──── delegation ──*/
     mapping(address => mapping(address => bool)) public isTraderApproved;
     function approveTrader(address t, bool ok) external override {
         isTraderApproved[msg.sender][t] = ok;
@@ -84,7 +83,7 @@ contract ScalarFeeRouter is IRouter {
         master = master_;
     }
 
-    /*══════════════ execute (batch) ══════════════*/
+    /*════════ batch entrypoint ════════*/
     function execute(
         uint64 couponLocked,
         uint32 avoidableBps,
@@ -95,119 +94,180 @@ contract ScalarFeeRouter is IRouter {
         if (avoidableBps > 10_000) revert InvalidReferralBasis(avoidableBps);
         if (couponLocked > COUPON_UNIT) revert CouponTooLarge(couponLocked);
 
-        /* lock coupon once */
         if (couponLocked != 0) coupon.lock(msg.sender, couponLocked);
-        uint128 scalar = COUPON_UNIT - couponLocked; // 1e8-scaled discount
+        uint128 scalar = COUPON_UNIT - couponLocked; // fee discount factor
 
+        /* loop pools / atoms */
         for (uint256 p; p < swaps.length; ++p) {
-            IPoolMinimal pool = swaps[p].pool;
-            (IZRC20 base, IZRC20 quote) = pool.getPair();
+            (IZRC20 base, IZRC20 quote) = swaps[p].pool.getPair();
 
-            ExecutableAtom[] calldata atoms = swaps[p].atoms;
-            for (uint256 a; a < atoms.length; ++a) {
-                /* build calldata for sub-call */
-                (bool ok, bytes memory ret) = address(this).call(
-                    abi.encodeWithSelector(
-                        this._atom.selector,
-                        atoms[a],
-                        pool,
-                        base,
-                        quote,
-                        scalar,
-                        avoidableBps,
-                        referral
-                    )
+            for (uint256 a; a < swaps[p].atoms.length; ++a) {
+                bytes memory callData = abi.encodeWithSelector(
+                    this._atom.selector,
+                    swaps[p].atoms[a],
+                    swaps[p].pool,
+                    base,
+                    quote,
+                    scalar,
+                    avoidableBps,
+                    referral
                 );
+
+                (bool ok, bytes memory ret) = address(this).call(callData);
 
                 if (ok) {
                     totalOut += abi.decode(ret, (uint64));
                 } else if (atomic) {
-                    // bubble original revert reason
                     assembly {
                         revert(add(ret, 32), mload(ret))
-                    }
+                    } // bubble
                 }
-                /* non-atomic: simply skip failed atom */
+                /* else: non-atomic → skip bad atom */
             }
         }
     }
 
-    /*======== isolated atom logic (self-call) ========*/
+    /*══════════════ helpers ══════════════*/
+
+    /**
+     * @notice Compute the protocol fee owed after applying any coupon discount.
+     * @dev The fee is   amount ⋅ PROTOCOL_FEE_BPS ⋅ scalar / 10 000 / 1e8.
+     *      `scalar` is `COUPON_UNIT − couponLocked`, so 1 e8 means “no discount”.
+     * @param amount   Gross amount the fee is based on (see `_atom` for context).
+     * @param scalar   Discount scalar in the range 0 … 1e8.
+     * @return feeDue  Discount-adjusted protocol fee (64-bit universe).
+     */
+    function _fee(
+        uint64 amount,
+        uint128 scalar
+    ) private pure returns (uint64 feeDue) {
+        unchecked {
+            feeDue = uint64(
+                (uint256(amount) * PROTOCOL_FEE_BPS * scalar) / 10_000 / 1e8
+            );
+        }
+    }
+
+    /*════════ per-atom execution (self-call) ════════*/
+    /**
+     * @notice Perform one swap atomically, charging protocol fees and tips.
+     * @param at           Swap parameters provided by the user.
+     * @param pool         Pool to execute against.
+     * @param base/quote   Pool’s token pair (cached from `getPair()`).
+     * @param scalar       Coupon discount scalar (0 … 1e8).
+     * @param avoidableBps Referral tip in bp that the trader *may* avoid.
+     * @param referral     Address that receives any tip.
+     * @return outAmt      Amount of output tokens the recipient actually receives.
+     *
+     * INTENT & ASSUMPTIONS
+     * --------------------
+     * • `msg.sender` MUST be the router itself (guarded explicitly).
+     * • **Exact-IN:** the provider’s `at.amount` already *includes* fee + tip.
+     *   The router “shaves” those charges off internally, and the *net* amount
+     *   is forwarded to the pool.
+     * • **Exact-OUT:** fee (and optional tip) are *tacked on* **after** we know
+     *   how much the pool needs.  The user-supplied `limit` binds the *total*
+     *   out-of-pocket cost: *(spent + fee + tip) ≤ limit*.
+     * • Every transfer uses `transferFrom`, so providers must approve the *pool*
+     *   beforehand (router never needs allowance).
+     */
     function _atom(
         ExecutableAtom calldata at,
         IPoolMinimal pool,
         IZRC20 base,
         IZRC20 quote,
-        uint128 scalar, // 0…1e8
+        uint128 scalar,
         uint32 avoidableBps,
         address referral
     ) external returns (uint64 outAmt) {
-        require(msg.sender == address(this), "only-self");
-
-        /* delegation auth */
+        /*────────── access control ──────────*/
+        require(msg.sender == address(this), "only self");
         if (
-            msg.sender != at.provider && // always true (only-self) but keep logic symmetric
+            tx.origin != at.provider &&
             !isTraderApproved[at.provider][tx.origin]
         ) revert UnauthorizedTrader(at.provider, tx.origin);
 
         IZRC20 inTok = at.baseForQuote ? base : quote;
         IZRC20 outTok = at.baseForQuote ? quote : base;
 
-        /* pull provisional input */
-        uint64 pulled = at.exactInput ? at.amount : at.limit;
-        if (!inTok.transferFrom(at.provider, address(this), pulled))
-            revert ERC20TransferFailed(address(inTok));
+        /*────────── fee & tip pre-calculation ──────────*/
+        uint64 tip; // avoidable referral payout
+        uint64 feeDue; // protocol fee after coupon discount
+        uint64 masterCut; // 25 % of `feeDue`
+        uint64 poolCut; // remaining 75 % of `feeDue`
+        uint64 spent; // net tokens the pool expects
+        uint64 grossInput; // total tokens the provider parts with
 
-        /* protocol fee */
-        uint64 protoFee = uint64((uint256(pulled) * PROTOCOL_FEE_BPS) / 10_000);
-        uint64 feeDue = uint64((uint256(protoFee) * scalar) / 1e8);
-        if (feeDue != 0) {
-            uint64 masterCut = uint64(
-                (uint256(feeDue) * MASTER_SHARE_BPS) / 10_000
+        if (at.exactInput) {
+            /* 1️⃣  exact-IN  – fee/tip shaved *inside* `at.amount` */
+            feeDue = _fee(at.amount, scalar);
+            tip = avoidableBps == 0 || referral == address(0)
+                ? 0
+                : uint64((uint256(at.amount) * avoidableBps) / 10_000);
+
+            grossInput = at.amount; // what provider will pay
+            spent = grossInput - feeDue - tip; // what the pool will receive
+
+            /* call pool with the *net* input */
+            (uint64 inB, uint64 inQ, uint64 outB, uint64 outQ) = pool.swap(
+                at.baseForQuote,
+                /* exactInput = */ true,
+                spent,
+                at.limit, // pool enforces min-out internally
+                at.orders
             );
-            uint64 poolCut = feeDue - masterCut;
 
-            if (masterCut != 0)
-                if (!inTok.transferFrom(at.provider, master, masterCut))
-                    revert ERC20TransferFailed(address(inTok));
+            // sanity: pool must echo the net tokens we told it
+            require((at.baseForQuote ? inB : inQ) == spent, "pool mismatch");
+            outAmt = at.baseForQuote ? outQ : outB;
+        } else {
+            /* 2️⃣  exact-OUT – fee/tip tacked *on top* of pool cost */
+            (uint64 inB, uint64 inQ, uint64 outB, uint64 outQ) = pool.swap(
+                at.baseForQuote,
+                /* exactInput = */ false,
+                at.amount, // desired output
+                at.limit, // pool enforces max-in internally
+                at.orders
+            );
 
-            if (poolCut != 0)
-                if (!inTok.transferFrom(at.provider, address(pool), poolCut))
-                    revert ERC20TransferFailed(address(inTok));
+            spent = at.baseForQuote ? inB : inQ; // pool input requirement
+            feeDue = _fee(spent, scalar);
+            tip = avoidableBps == 0 || referral == address(0)
+                ? 0
+                : uint64((uint256(spent) * avoidableBps) / 10_000);
+
+            grossInput = spent + feeDue + tip; // provider all-in cost
+
+            // user-supplied limit binds the *total* out-of-pocket tokens
+            require(grossInput <= at.limit, "slippage");
+
+            outAmt = at.baseForQuote ? outQ : outB; // equals `at.amount`
         }
 
-        /* avoidable rebate */
-        if (avoidableBps != 0 && referral != address(0)) {
-            uint64 rebate = uint64((uint256(pulled) * avoidableBps) / 10_000);
-            if (rebate != 0)
-                if (!inTok.transferFrom(at.provider, referral, rebate))
-                    revert ERC20TransferFailed(address(inTok));
+        /*────────── fee splitting ──────────*/
+        masterCut = uint64((uint256(feeDue) * MASTER_SHARE_BPS) / 10_000);
+        poolCut = feeDue - masterCut;
+
+        /*────────── token settlements ───────*/
+        _xfer(inTok, at.provider, master, masterCut); // 25 % fee
+        _xfer(inTok, at.provider, address(pool), spent + poolCut); // swap + 75 % fee
+        if (tip != 0) {
+            _xfer(inTok, at.provider, referral, tip); // optional tip
         }
 
-        /* approve pool */
-        if (!inTok.approve(address(pool), pulled))
-            revert ERC20ApproveFailed(address(inTok));
+        /*────────── deliver proceeds ────────*/
+        _xfer(outTok, address(pool), at.recipient, outAmt);
+    }
 
-        /* swap */
-        (uint64 inB, uint64 inQ, uint64 outB, uint64 outQ) = pool.swap(
-            at.baseForQuote,
-            at.exactInput,
-            at.amount,
-            at.limit,
-            at.orders
-        );
-
-        uint64 spent = at.baseForQuote ? inB : inQ;
-
-        /* refund surplus for exact-out */
-        if (!at.exactInput && spent < pulled) {
-            uint64 refund = pulled - spent;
-            if (!inTok.transfer(at.provider, refund)) revert RefundFailed();
-        }
-
-        /* payout */
-        outAmt = at.baseForQuote ? outQ : outB;
-        if (!outTok.transfer(at.recipient, outAmt))
-            revert ERC20TransferFailed(address(outTok));
+    /* helper that reverts with ERC20TransferFailed on failure */
+    function _xfer(
+        IZRC20 tok,
+        address from,
+        address to,
+        uint64 amount
+    ) private {
+        if (amount == 0) return;
+        if (!tok.transferFrom(from, to, amount))
+            revert ERC20TransferFailed(address(tok));
     }
 }
