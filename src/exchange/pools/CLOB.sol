@@ -183,7 +183,6 @@ interface ICLOB {
 
     // specifies a set of orders to cancel and a set of orders to create
     function makeFrom(
-        address auth,
         MakeCommand[] calldata commands
     ) external returns (int256 netBase, int256 netQuote);
 
@@ -471,7 +470,6 @@ contract CLOB is ICLOB, ReentrancyGuard {
      *         the entire batch with one ERC-20 transfer per token.
      */
     function makeFrom(
-        address auth,
         MakeCommand[] calldata cmds
     ) external override nonReentrant returns (int256 netBase, int256 netQuote) {
         if (msg.sender != _router) revert RouterOnly(msg.sender, _router);
@@ -487,7 +485,7 @@ contract CLOB is ICLOB, ReentrancyGuard {
                 /* Replace = cancel+create in same slot (saves orderId churn). */
                 if (c.cancel.id != 0 && c.create.owner != address(0)) {
                     _replaceOrder(
-                        auth,
+                        msg.sender,
                         c.cancel.id,
                         c.create.baseReserveDelta,
                         c.create.quoteReserveDelta,
@@ -497,12 +495,12 @@ contract CLOB is ICLOB, ReentrancyGuard {
                     dBase -= int256(uint256(c.create.baseReserveDelta));
                     dQuote -= int256(uint256(c.create.quoteReserveDelta));
                 } else if (c.cancel.id != 0) {
-                    (uint64 br, uint64 qr) = _cancelOrder(auth, c.cancel.id);
+                    (uint64 br, uint64 qr) = _cancelOrder(msg.sender, c.cancel.id);
                     dBase += int256(uint256(br));
                     dQuote += int256(uint256(qr));
                 } else if (c.create.owner != address(0)) {
                     _createOrder(
-                        auth,
+                        msg.sender,
                         c.create.baseReserveDelta,
                         c.create.quoteReserveDelta,
                         c.create.tickBuy,

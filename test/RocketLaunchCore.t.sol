@@ -42,18 +42,23 @@ contract ERC20Mock is IZRC20 {
     function name() external view returns (string memory) {
         return _name;
     }
+
     function symbol() external view returns (string memory) {
         return _symbol;
     }
+
     function decimals() external view returns (uint8) {
         return _decimals;
     }
+
     function totalSupply() external view returns (uint64) {
         return _tot;
     }
+
     function balanceOf(address a) external view returns (uint64) {
         return _bal[a];
     }
+
     function allowance(address o, address s) external view returns (uint64) {
         return _allow[o][s];
     }
@@ -64,10 +69,12 @@ contract ERC20Mock is IZRC20 {
         emit IZRC20.Approval(msg.sender, s, v);
         return true;
     }
+
     function transfer(address to, uint64 v) external returns (bool) {
         _xfer(msg.sender, to, v);
         return true;
     }
+
     function transferFrom(
         address f,
         address t,
@@ -87,6 +94,17 @@ contract ERC20Mock is IZRC20 {
         _bal[t] += v;
         emit IZRC20.Transfer(f, t, v);
     }
+
+    function transferBatch(
+        address[] calldata dst,
+        uint64[] calldata wad
+    ) external override returns (bool success) {}
+
+    function transferFromBatch(
+        address src,
+        address[] calldata dst,
+        uint64[] calldata wad
+    ) external override returns (bool success) {}
 }
 
 /** DEX that lets the test choose the next (utilOut, inviteOut) pair and
@@ -360,7 +378,6 @@ contract RocketLauncherTestHarness is Test {
             supply64: SUPPLY64,
             decimals: 9,
             lockTime: LOCK_TIME,
-            root: address(launcher),
             theme: "ipfs://token-theme"
         });
 
@@ -380,27 +397,51 @@ contract RocketLauncherTestHarness is Test {
     \*══════════════════════════════════════════════════════════════════*/
 
     /**
-     * @notice Happy-path: AL (the declared creator) deploys a rocket.
-     *         Verifies event emission, id return, counter increment, and that
-     *         the freshly-minted utility token is recognised by the launcher.
+     * @dev Positive path: a canonical config launches cleanly and emits the
+     *      expected `RocketCreated` event.
+     *
+     * Intent & invariants
+     * ───────────────────
+     * • We only *strictly* check the indexed topic‑0 (rocket‑ID) because the
+     *   utility‑token address is not known until after the call returns.
+     * • All non‑indexed data fields are ignored via `checkData = false`.
+     *   They are still supplied in the dummy `emit` so the ABI matches.
+     * • Post‑conditions verify ID sequencing, reverse lookup, and that the
+     *   launcher holds the full utility‑token supply.
      */
     function testCreateRocket_Succeeds() external {
-        RocketConfig memory cfg = _defaultConfig(); // canonical cfg
-        vm.prank(AL); // AL == creator
+        // ───── arrange ─────
+        RocketConfig memory cfg = _defaultConfig(); // canonical config
+        uint32 creatorPct = cfg.percentOfLiquidityCreator; // cached for event
+        uint32 burnPct = cfg.percentOfLiquidityBurned;
+        uint64 deployTs = cfg.liquidityDeployTime;
+        uint64 lockTs = cfg.liquidityLockedUpTime;
 
-        /* Expect the `RocketCreated` event with the correct rocket-ID (1).  
-           We ignore the token address in `data`, because we cannot know it
-           until after the call returns. */
-        vm.expectEmit(true /*topic1:id*/, false, false, false);
-        emit RocketLauncher.RocketCreated(1, AL, address(0));
+        vm.prank(AL); // AL is the offering creator
 
-        uint256 id = launcher.createRocket(cfg); // ====> CALL
+        /* Expect the `RocketCreated` event.
+       Topics:  topic0 = keccak256(eventSig)
+                topic1 = indexed id (we check this one)
+       Data   : creator, token, creatorPct, burnPct, deployTs, lockTs
+       We set `checkData = false` so the concrete values don’t matter. */
+        vm.expectEmit(true /*check topic1*/, false, false, false);
+        emit RocketLauncher.RocketCreated(
+            1, // id (checked)
+            address(0), // creator (ignored)
+            address(0), // token  (ignored)
+            creatorPct, // ignored
+            burnPct, // ignored
+            deployTs, // ignored
+            lockTs // ignored
+        );
 
-        /* ───── post-conditions ───── */
+        // ───── act ─────
+        uint256 id = launcher.createRocket(cfg);
+
+        // ───── assert ─────
         assertEq(id, 1, "return id");
         assertEq(launcher.rocketCount(), 1, "rocketCount");
 
-        // The launcher must recognise the freshly-minted utility token.
         IZRC20 util = launcher.offeringToken(1);
         assertEq(launcher.idOfUtilityToken(address(util)), 1, "reverse lookup");
         assertEq(
@@ -749,43 +790,42 @@ contract RocketLauncherTestHarness is Test {
     }
 
     /*-------------------------------------------------------------*
- |  2. ZeroLiquidity – no deposits supplied                    |
- *-------------------------------------------------------------*/
-    function testDeployLiquidity_Revert_ZeroLiquidity_NoDeposit() external {
+    |  3. ZeroLiquidity – utility-token supply is zero            |
+    *-------------------------------------------------------------*/
+    /*──────────────────────────── helpers ───────────────────────────*/
+    function _launchDefault() internal returns (uint256 id) {
         RocketConfig memory cfg = _defaultConfig();
         vm.prank(AL);
-        uint256 id = launcher.createRocket(cfg);
-
-        vm.warp(cfg.liquidityDeployTime + 1); // past gate, still zero deposits
-        vm.expectRevert(ZeroLiquidity.selector);
-        launcher.deployLiquidity(id);
+        return launcher.createRocket(cfg);
     }
 
-    /*-------------------------------------------------------------*
- |  3. ZeroLiquidity – utility-token supply is zero            |
- *-------------------------------------------------------------*/
-    function testDeployLiquidity_Revert_ZeroLiquidity_NoSupply() external {
+    /*────────────────────── 1. zero‑supply guard  ───────────────────*/
+    function testCreateRocket_Revert_ZeroSupply() external {
         RocketConfig memory cfg = _defaultConfig();
         cfg.utilityTokenParams.supply64 = 0; // break supply
 
         vm.prank(AL);
-        uint256 id = launcher.createRocket(cfg);
+        vm.expectRevert(ZeroLiquidity.selector);
+        launcher.createRocket(cfg); // ← reverts here now
+    }
 
-        // Creator makes a non-zero deposit so only supply==0 path triggers
-        ERC20Mock inviting = ERC20Mock(address(cfg.invitingToken));
-        vm.startPrank(AL);
-        inviting.approve(address(launcher), 10 * ONE);
-        launcher.deposit(id, 10 * ONE);
-        vm.stopPrank();
+    /*────────────────────── 2. zero‑contribution guard ──────────────*/
+    function testDeployLiquidity_Revert_ZeroLiquidity_NoDeposit() external {
+        // Step 1: create a normal rocket (non‑zero supply)
+        uint256 id = _launchDefault();
 
+        // Step 2: advance time past deployTime but contribute nothing
+        RocketConfig memory cfg = _defaultConfig();
         vm.warp(cfg.liquidityDeployTime + 1);
+
+        // Step 3: expect revert because totalInviteContributed == 0
         vm.expectRevert(ZeroLiquidity.selector);
         launcher.deployLiquidity(id);
     }
 
     /*-------------------------------------------------------------*
- |  4. AlreadyLaunched – second call should revert             |
- *-------------------------------------------------------------*/
+    |  4. AlreadyLaunched – second call should revert             |
+    *-------------------------------------------------------------*/
     function testDeployLiquidity_Revert_AlreadyLaunched() external {
         RocketConfig memory cfg = _defaultConfig();
         vm.prank(AL);
