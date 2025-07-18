@@ -140,6 +140,13 @@ contract DEXMockOverflow is IDEX {
         amountA = nextUtilOut; // utilOut
         amountB = nextInviteOut; // inviteOut
     }
+
+    function checkSupportForPair(
+        address,
+        address
+    ) external pure override returns (bool supported) {
+        return true;
+    }
 }
 
 /*──────────────────── helper: bad UTD that mints nothing ──────────────────*/
@@ -257,6 +264,18 @@ contract DEXMock is IDEX {
         p.reserveA -= uint112(amountA);
         p.reserveB -= uint112(amountB);
         p.totalSupply -= lp;
+    }
+
+    bool private supported = true;
+    function checkSupportForPair(
+        address,
+        address
+    ) external view override returns (bool supported_) {
+        return supported;
+    }
+
+    function testSwitchSupport() external {
+        supported = !supported;
     }
 }
 
@@ -449,6 +468,22 @@ contract RocketLauncherTestHarness is Test {
             SUPPLY64,
             "launcher util bal"
         );
+    }
+
+    /**
+     * @notice Reverts when the DEX reports the pair is unsupported.
+     *
+     * We now expect the custom `PairUnsupported` error (selector only –
+     * utility token address is unknown until inside the call).
+     */
+    function testCreateRocket_Revert_UnsupportedPair() external {
+        dex.testSwitchSupport(); // supported → false
+
+        RocketConfig memory cfg = _defaultConfig();
+
+        vm.prank(AL);
+        vm.expectRevert(PairUnsupported.selector); // <-- new error
+        launcher.createRocket(cfg); // ==== REVERT
     }
 
     /**
@@ -1190,85 +1225,6 @@ contract RocketLauncherTestHarness is Test {
             abi.encodeWithSelector(Unauthorized.selector, address(bad))
         );
         badL.createRocket(cfg);
-    }
-
-    /*-------------------------------------------------------------*
-    | 1. per-user SumOverflow (line 292)                          |
-    *-------------------------------------------------------------*/
-    function testDeposit_Revert_SumOverflow_PerUser() external {
-        RocketConfig memory cfg = _defaultConfig();
-        vm.prank(AL);
-        uint256 id = launcher.createRocket(cfg);
-
-        ERC20Mock inv = ERC20Mock(address(cfg.invitingToken));
-
-        /* seed mapping so stdstore can locate the slot */
-        inv.mint(AL, 2);
-        vm.startPrank(AL);
-        inv.approve(address(launcher), 1);
-        launcher.deposit(id, 1); // deposited[id][AL] == 1
-        vm.stopPrank();
-
-        /* overwrite deposited[id][AL] := 2⁶⁴-1 */
-        uint256 slot = ss
-            .target(address(launcher))
-            .sig("deposited(uint256,address)")
-            .with_key(id)
-            .with_key(AL)
-            .find();
-        vm.store(
-            address(launcher),
-            bytes32(slot),
-            bytes32(uint256(type(uint64).max))
-        );
-
-        /* a +1 deposit must now overflow and revert with SumOverflow */
-        inv.mint(AL, 1);
-        vm.startPrank(AL);
-        inv.approve(address(launcher), 1);
-        uint256 expected = uint256(type(uint64).max) + 1;
-        vm.expectRevert(abi.encodeWithSelector(SumOverflow.selector, expected));
-        launcher.deposit(id, 1);
-        vm.stopPrank();
-    }
-
-    /*-------------------------------------------------------------*
-    | 2. aggregate SumOverflow (line 300)                         |
-    *-------------------------------------------------------------*/
-    function testDeposit_Revert_SumOverflow_Total() external {
-        RocketConfig memory cfg = _defaultConfig();
-        vm.prank(AL);
-        uint256 id = launcher.createRocket(cfg);
-
-        ERC20Mock inv = ERC20Mock(address(cfg.invitingToken));
-
-        /* seed struct for slot discovery */
-        inv.mint(AL, 1);
-        vm.startPrank(AL);
-        inv.approve(address(launcher), 1);
-        launcher.deposit(id, 1); // totalInviteContributed == 1
-        vm.stopPrank();
-
-        /* force totalInviteContributed[id] := 2⁶⁴-1 */
-        uint256 slot = ss
-            .target(address(launcher))
-            .sig("totalInviteContributed(uint256)")
-            .with_key(id)
-            .find();
-        vm.store(
-            address(launcher),
-            bytes32(slot),
-            bytes32(uint256(type(uint64).max))
-        );
-
-        /* BO’s 1-token deposit should now overflow aggregate tally */
-        inv.mint(BO, 1);
-        vm.startPrank(BO);
-        inv.approve(address(launcher), 1);
-        uint256 expected = uint256(type(uint64).max) + 1;
-        vm.expectRevert(abi.encodeWithSelector(SumOverflow.selector, expected));
-        launcher.deposit(id, 1);
-        vm.stopPrank();
     }
 
     /**

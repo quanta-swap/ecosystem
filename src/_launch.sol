@@ -28,6 +28,10 @@ interface IUTD {
     ) external returns (address);
 }
 interface IDEX {
+    function checkSupportForPair(
+        address,
+        address
+    ) external returns (bool supported);
     function initializeLiquidity(
         address,
         address,
@@ -70,6 +74,7 @@ struct RocketState {
     uint64 poolInvite; // inviting tokens held, ignored if no dex
     uint64 poolUtility; // utility tokens held, ignored if no dex
     uint64 creatorUtilityClaimed; // utility tokens claimed by creator, ignored if dex
+    bool isFaulted; // anti-marooning flag, toggled if liquidity deployment fails
     mapping(address => uint128) claimedLP; // LP-equivalent already claimed
 }
 
@@ -85,6 +90,21 @@ error VestBeforeLaunch(uint256);
 error NothingToVest(uint256);
 error NotLaunched(uint256);
 error NothingToClaim(uint256);
+error RocketFaulted(uint256);
+/**
+ * @dev The DEX refused to list the (invite, utility) pair.
+ * @param dex      Address of the DEX that declined.
+ * @param invite   Address of the inviting token.
+ * @param utility  Address of the freshly‑minted utility token.
+ */
+error PairUnsupported(address dex, address invite, address utility);
+
+/**
+ * @dev The utility token factory delivered an unexpected initial balance.
+ * @param expected  Full supply that should have been minted.
+ * @param found     Actual balance observed in the launcher.
+ */
+error BadInitialSupply(uint64 expected, uint64 found);
 
 /// Vesting schedule must have a non-zero positive duration.
 error InvalidVestingWindow(uint64 start, uint64 end);
@@ -94,13 +114,6 @@ error ZeroLiquidity();
 
 /** Zero-value deposit supplied where a positive amount is required. */
 error ZeroDeposit();
-
-/*─────────────────── new / reused custom errors ───────────────────*/
-/**
- * @dev Raised when an arithmetic addition would overflow 64-bit space.
- * @param sum  The offending sum that exceeded 2⁶⁴-1.
- */
-error SumOverflow(uint256 sum);
 
 /**
  * @dev Raised when the caller is not authorised to perform the requested action.
@@ -151,6 +164,7 @@ contract RocketLauncher is ReentrancyGuard {
     );
     /** Residual dust fully burned → both pool counters zeroed. */
     event DustBurned(uint256 indexed id, uint64 inviteDust, uint64 utilityDust);
+    event Faulted(uint256 indexed id);
 
     constructor(IDEX _dex, IUTD _deployer, string memory themeURI) {
         // if (address(_dex) == address(0)) revert ZeroAddress(address(0));
@@ -188,114 +202,121 @@ contract RocketLauncher is ReentrancyGuard {
         return uint64((uint256(amount) * pct) >> 32);
     }
 
+    /*═════════════════════ RocketLauncher.createRocket ════════════════*/
     /**
-     * @notice Registers a new rocket and mints its dedicated utility token.
+     * @notice Register a new launch configuration and mint its utility token.
      *
-     * @dev    Performs strict upfront validation to ensure the rocket cannot
-     *         be created in an inconsistent state.  Key checks:
-     *         1. Non-zero inviting token address.
-     *         2. Caller must match `offeringCreator`.
-     *         3. `creatorPct` ≤ 50 %.
-     *         4. (`creatorPct` + `burnPct`) ≤ 100 % – computed in 64-bit
-     *            space to avoid the 32-bit wrap bug.
-     *         5. Vesting window must have positive duration.
-     *         6. Factory must deliver the full utility-token supply to this
-     *            launcher (simple sanity check on `deployer.create`).
+     * Post‑conditions (atomic on success)
+     * ───────────────────────────────────
+     *  • All numeric invariants validated (creator ≤ 50 %, (creator+burn) < 100 %)
+     *  • Vesting window has positive duration.
+     *  • Fresh utility token exists *and* sits entirely in the launcher.
+     *  • DEX confirms it will accept the (invite, utility) pair (if a DEX is set).
+     *  • Config and reverse‑lookup mappings fully initialised.
      *
-     * @param  cfg_  Full rocket configuration (calldata).
-     * @return id    Sequential rocket ID (starts at 1).
+     * @param cfg_  Full immutable rocket settings (calldata).
+     * @return id   Sequential rocket ID (starts at 1).
      *
-     * @custom:error ZeroAddress          Inviting token is the zero address.
-     * @custom:error Unauthorized         Caller is not `offeringCreator`.
-     * @custom:error CreatorShareTooHigh  Creator allocation > 50 %.
-     * @custom:error PercentOutOfRange    Burn % + Creator % > 100 %.
-     * @custom:error InvalidVestingWindow `liquidityLockedUpTime` ≤ deploy time.
+     * @custom:reverts ZeroAddress         `invitingToken` is the zero address.
+     * @custom:reverts Unauthorized        Caller ≠ `offeringCreator`.
+     * @custom:reverts CreatorShareTooHigh `creatorPct` > 50 %.
+     * @custom:reverts PercentOutOfRange   creator + burn ≥ 100 %.
+     * @custom:reverts InvalidVestingWindow `lockUpTime` ≤ `deployTime`.
+     * @custom:reverts ZeroLiquidity       Utility‑token supply is zero.
+     * @custom:reverts BadInitialSupply    Factory minted the wrong amount.
+     * @custom:reverts PairUnsupported     DEX refuses the pair.
      */
     function createRocket(
         RocketConfig calldata cfg_
     ) external nonReentrant returns (uint256 id) {
-        /*─────────────────────── 1. Basic sanity checks ─────────────────────*/
+        /*──────────────────── 1. Static sanity checks ───────────────────*/
 
-        // Non-zero inviting token.
+        // Ensures a real ERC‑20 address.
         if (address(cfg_.invitingToken) == address(0))
-            revert ZeroAddress(address(0));
+            revert ZeroAddress(address(cfg_.invitingToken));
 
         // Only the declared creator may call.
-        if (cfg_.offeringCreator != msg.sender) revert Unauthorized(msg.sender);
+        if (msg.sender != cfg_.offeringCreator) revert Unauthorized(msg.sender);
 
-        /*──────────────────── 2. Percentage invariants ─────────────────────*/
+        unchecked {
+            uint32 FULL = type(uint32).max; // 100 % in Q32‑fixed‑point.
+            uint32 creatorPct = cfg_.percentOfLiquidityCreator;
+            uint32 burnPct = cfg_.percentOfLiquidityBurned;
 
-        uint32 creatorPct = cfg_.percentOfLiquidityCreator;
-        uint32 burnPct = cfg_.percentOfLiquidityBurned;
-        uint32 FULL = type(uint32).max; // fixed-point 100 %
+            // Creator slice ≤ 50 %.
+            if (creatorPct > FULL / 2) revert CreatorShareTooHigh(creatorPct);
 
-        // a) Creator share capped at 50 %.
-        if (creatorPct > (FULL >> 1)) revert CreatorShareTooHigh(creatorPct);
+            // Public share must be strictly positive to avoid rug patterns.
+            uint64 sum = uint64(creatorPct) + uint64(burnPct);
+            if (sum >= FULL) revert PercentOutOfRange(sum);
+        }
 
-        // b) Combined share (creator + burn) must not exceed 100 %.
-        //    We widen to 64 bits to avoid the wrap-around bug present in the
-        //    original 32-bit unchecked addition.
-        uint64 sum = uint64(creatorPct) + uint64(burnPct);
-        if (sum > FULL) revert PercentOutOfRange(sum);
-
-        /*──────────────── 3. Vesting-window consistency ────────────────────*/
-
+        // Vesting window must have positive duration.
         if (cfg_.liquidityLockedUpTime <= cfg_.liquidityDeployTime)
             revert InvalidVestingWindow(
                 cfg_.liquidityDeployTime,
                 cfg_.liquidityLockedUpTime
             );
 
-        /*──────────────── 4. Deploy the utility token ──────────────────────*/
-
-        // Clone the parameters to memory so we can safely mutate `root`.
+        // Non‑zero utility supply.
         UtilityTokenParams memory p = cfg_.utilityTokenParams;
         if (p.supply64 == 0) revert ZeroLiquidity();
 
-        try
-            deployer.create(
-                p.name,
-                p.symbol,
-                p.supply64,
-                p.decimals,
-                p.lockTime,
-                address(this), // the launcher should own root authority
-                p.theme
-            )
-        returns (address tok) {
-            // 4.a  Sanity‑check: full supply must now reside here.
-            if (IZRC20(tok).balanceOf(address(this)) != p.supply64) {
-                revert Unauthorized(address(deployer));
-            }
+        /*──────────────────── 2. Mint utility token ─────────────────────*/
 
-            //–––––––– 5. Register the rocket –––––––––
-            id = ++rocketCount; // sequential, 1‑based
-            RocketConfig memory newCfg = cfg_; // calldata → memory copy
-            newCfg.utilityTokenParams = p; // updated root owner
-            rocketCfg[id] = newCfg; // persist config
-            offeringToken[id] = IZRC20(tok); // index by id
-            _rocketIdOfToken[tok] = id; // reverse lookup
+        address utility = deployer.create(
+            p.name,
+            p.symbol,
+            p.supply64,
+            p.decimals,
+            p.lockTime,
+            address(this), // launcher owns root authority
+            p.theme
+        );
 
-            emit RocketCreated(
-                id,
-                msg.sender,
-                tok,
-                creatorPct,
-                burnPct,
-                cfg_.liquidityDeployTime,
-                cfg_.liquidityLockedUpTime
+        // Sanity‑check: full supply must reside here.
+        uint64 bal = IZRC20(utility).balanceOf(address(this));
+        if (bal != p.supply64) revert BadInitialSupply(p.supply64, bal);
+
+        /*──────────────────── 3. DEX pair validation ───────────────────*/
+
+        if (
+            address(dex) != address(0) &&
+            !dex.checkSupportForPair(address(cfg_.invitingToken), utility)
+        )
+            revert PairUnsupported(
+                address(dex),
+                address(cfg_.invitingToken),
+                utility
             );
-        } catch (bytes memory reason) {
-            /* Bubble up the original revert reason EXACTLY as received.
-             *
-             * Solidity’s catch clauses swallow the inner revert data;
-             * this assembly snippet re‑throws it verbatim so upstream
-             * tooling (hardhat, foundry, et al.) shows the real error.
-             */
-            assembly {
-                revert(add(reason, 32), mload(reason))
-            }
-        }
+
+        /*──────────────────── 4. Persist rocket state ──────────────────*/
+
+        id = ++rocketCount; // 1‑based ID.
+
+        // Store only what is necessary to avoid deep string copies.
+        rocketCfg[id] = RocketConfig({
+            offeringCreator: cfg_.offeringCreator,
+            invitingToken: cfg_.invitingToken,
+            utilityTokenParams: p, // already in memory
+            percentOfLiquidityBurned: cfg_.percentOfLiquidityBurned,
+            percentOfLiquidityCreator: cfg_.percentOfLiquidityCreator,
+            liquidityLockedUpTime: cfg_.liquidityLockedUpTime,
+            liquidityDeployTime: cfg_.liquidityDeployTime
+        });
+
+        offeringToken[id] = IZRC20(utility);
+        _rocketIdOfToken[utility] = id;
+
+        emit RocketCreated(
+            id,
+            msg.sender,
+            utility,
+            cfg_.percentOfLiquidityCreator,
+            cfg_.percentOfLiquidityBurned,
+            cfg_.liquidityDeployTime,
+            cfg_.liquidityLockedUpTime
+        );
     }
 
     /*═════════════════ 2. deposit ‒ overflow-safe ═══════════════════════*/
@@ -322,86 +343,114 @@ contract RocketLauncher is ReentrancyGuard {
         );
 
         // ---------- 3. storage mutation ----------
-        unchecked {
-            uint64 newUser = prevUser + amount;
-            if (newUser < prevUser)
-                revert SumOverflow(uint256(prevUser) + amount);
-            _deposited[id][msg.sender] = newUser;
-
-            uint64 newTot = prevTot + amount;
-            if (newTot < prevTot) revert SumOverflow(uint256(prevTot) + amount);
-            s.totalInviteContributed = newTot;
-        }
+        _deposited[id][msg.sender] = prevUser + amount;
+        s.totalInviteContributed = prevTot + amount;
 
         emit Deposited(id, msg.sender, amount);
     }
 
     /**
-     * @notice Locks contributed assets and seeds the AMM with initial liquidity.
-     * @dev
-     * - Only callable once per rocket and not before `liquidityDeployTime`.
-     * - Rejects zero-supply or zero-contribution launches.
-     * - Immediately burns (withdraws to `address(0)`) the configured burn share.
-     * - Anyone can deploy liquidity to defeat deliberate/accidental lock-out scams.
-     * @param id Rocket identifier.
+     * @notice Locks raised assets and seeds the AMM with initial liquidity.
+     *         **If *any* step fails the rocket is permanently marked
+     *         `isFaulted = true` so off‑chain operators can rescue funds.**
+     *
+     * Execution flow
+     * ──────────────
+     * 1. Pre‑flight gating & invariants.
+     * 2. Grant token allowances to the DEX (single‑shot, no race risk).
+     * 3. Attempt `dex.initializeLiquidity` inside a guarded `try/catch`.
+     * 4. On *any* failure (approval issue, DEX revert, zero LP) we flag
+     *    `isFaulted` and exit **without** modifying other rocket state.
+     * 5. On success we revoke allowances, apply burn‑on‑launch, persist
+     *    the vestable LP supply, and emit {LiquidityDeployed}.
+     *
+     * Fault semantics
+     * ───────────────
+     * • A fault is terminal.  Subsequent calls that depend on `totalLP`
+     *   will fail due to the zero value, making the stuck state obvious.
+     * • No storage updates that could lock funds happen *before* fault
+     *   detection, preserving full recoverability by an eventual upgrade
+     *   or manual intervention (out‑of‑scope for this contract).
+     *
+     * @param id  Rocket identifier.
      */
     function deployLiquidity(uint256 id) external nonReentrant {
-        require(dex != IDEX(address(0)), "no DEX set");
+        /*──────────────────── 0. Basic checks ────────────────────*/
+        if (address(dex) == address(0)) revert ZeroAddress(address(0)); // DEX must be configured
 
-        RocketConfig storage c = _cfg(id);
+        RocketConfig storage c = _cfg(id); // Loads & validates rocket config (reverts UnknownRocket)
         RocketState storage s = rocketState[id];
 
-        // ───── temporal & one-shot gating ─────
+        if (s.isFaulted) revert RocketFaulted(id);
+
         if (block.timestamp < c.liquidityDeployTime)
+            // Launch window not yet open
             revert LaunchTooEarly(
                 id,
                 uint64(block.timestamp),
                 c.liquidityDeployTime
             );
-        if (s.totalLP != 0) revert AlreadyLaunched(id);
-
-        UtilityTokenParams memory p = c.utilityTokenParams;
-        if (p.supply64 == 0 || s.totalInviteContributed == 0)
+        if (s.totalLP != 0)
+            // One‑shot only
+            revert AlreadyLaunched(id);
+        if (s.totalInviteContributed == 0)
+            // Both legs must be non‑zero
             revert ZeroLiquidity();
 
-        // ───── approvals ─────
-        IZRC20 util = offeringToken[id];
-        safeApprove(util, address(dex), p.supply64);
-        safeApprove(c.invitingToken, address(dex), s.totalInviteContributed);
+        /*──────────────────── 1. Allowance setup ─────────────────*/
+        UtilityTokenParams memory p = c.utilityTokenParams;
+        IZRC20 utilTok = offeringToken[id];
 
-        // ───── pool creation ─────
-        uint128 lp = dex.initializeLiquidity(
-            address(util),
-            address(c.invitingToken),
-            p.supply64,
-            s.totalInviteContributed,
-            address(this)
-        );
-        if (lp == 0) revert ZeroLiquidity();
-
-        util.approve(address(dex), 0);
-        c.invitingToken.approve(address(dex), 0);
-
-        /*──────────── burn-on-launch (unclaimable LP) ────────────*
-         * 1. Compute the fixed-point burn ratio in LP units.
-         * 2. Exclude the burned amount from `lp`—and therefore from
-         *    `s.totalLP`—so future vesting/claims can never reach it.
-         *
-         * Post-conditions
-         * ───────────────
-         * • The AMM keeps the full deposit; reserves are untouched.
-         * • `lp` now tracks only the vestable portion (creator + public).
-         * • Orphaned LP remains custodied by this contract, but without
-         *   any code path that could move or burn it on-chain, making it
-         *   effectively unrecoverable and unclaimable.
-         ********************************************************************/
-        uint128 burnLP = _pct(lp, c.percentOfLiquidityBurned);
-        if (burnLP != 0) {
-            lp -= burnLP; // permanently discard claim-rights to this slice
+        // Grant one‑time spending rights to the DEX; abort on *any* failure.
+        bool approvalsOk = safeApprove(utilTok, address(dex), p.supply64) &&
+            safeApprove(
+                c.invitingToken,
+                address(dex),
+                s.totalInviteContributed
+            );
+        if (!approvalsOk) {
+            s.isFaulted = true; // Irrecoverable approval failure
+            emit Faulted(id);
+            return;
         }
 
-        s.totalLP = lp;
-        emit LiquidityDeployed(id, lp);
+        /*──────────────────── 2. Pool creation ───────────────────*/
+        uint128 lp; // Will hold the vestable LP supply
+        try
+            dex.initializeLiquidity(
+                address(utilTok),
+                address(c.invitingToken),
+                p.supply64,
+                s.totalInviteContributed,
+                address(this) // LP minted to the launcher
+            )
+        returns (uint128 mintedLP) {
+            lp = mintedLP; // Keep in memory until all checks pass
+        } catch {
+            s.isFaulted = true; // Any DEX‑side revert flags the rocket
+            emit Faulted(id);
+            return;
+        }
+
+        if (lp == 0) {
+            // Zero LP means something went wrong, so engage fall-back
+            s.isFaulted = true;
+            emit Faulted(id);
+            return;
+        }
+
+        /*──────────────────── 3. House‑keeping ───────────────────*/
+        utilTok.approve(address(dex), 0); // Revoke approvals
+        c.invitingToken.approve(address(dex), 0);
+
+        // Apply the optional burn‑on‑launch percentage.
+        uint128 burnLP = _pct(lp, c.percentOfLiquidityBurned); // Fixed‑point 32‑bit percentage
+        if (burnLP != 0) lp -= burnLP; // Vestable LP excludes the burned slice
+
+        /*──────────────────── 4. Commit state ────────────────────*/
+        s.totalLP = lp; // Persist the claimable LP supply
+
+        emit LiquidityDeployed(id, lp); // External observers track success
     }
 
     /*══════════════════  USER-CENTRIC VESTING  ══════════════════*/
@@ -436,7 +485,7 @@ contract RocketLauncher is ReentrancyGuard {
         uint64 minInviteOut
     ) external nonReentrant {
         /*──────────────── AMM path ─────────────*/
-        if (address(dex) != address(0)) {
+        if (address(dex) != address(0) && !rocketState[id].isFaulted) {
             _vestLiquidity(id, minUtilityOut, minInviteOut);
             return;
         }
@@ -452,6 +501,8 @@ contract RocketLauncher is ReentrancyGuard {
         uint64 publicSupply = fullSupply - creatorSlice;
 
         /*────────────────── CREATOR ──────────────────*/
+        uint64 claimedInvite = 0;
+        uint64 claimedUtility = 0;
         if (msg.sender == c.offeringCreator) {
             uint64 already = s.creatorUtilityClaimed;
             if (
@@ -460,7 +511,7 @@ contract RocketLauncher is ReentrancyGuard {
             ) revert NothingToClaim(id);
 
             /* 1. inviting‑token proceeds (entire raise) */
-            uint64 balInv = c.invitingToken.balanceOf(address(this));
+            uint64 balInv = s.totalInviteContributed;
             if (balInv != 0) {
                 require(
                     safeTransfer(c.invitingToken, msg.sender, balInv),
@@ -482,16 +533,11 @@ contract RocketLauncher is ReentrancyGuard {
                     : 0;
             }
 
-            emit LiquidityClaimed(
-                id,
-                msg.sender,
-                balInv,
-                creatorSlice - already
-            );
-            return;
+            claimedInvite += balInv;
+            claimedUtility += creatorSlice - already;
         }
 
-        /*──────────────── CONTRIBUTORS ───────────────*/
+        /*──────────────── CONTRIBUTORS (FALL THROUGH) ───────────────*/
         uint64 contributed = _deposited[id][msg.sender];
         if (contributed == 0) revert NothingToClaim(id);
 
@@ -511,7 +557,8 @@ contract RocketLauncher is ReentrancyGuard {
         s.poolUtility = s.poolUtility >= owedUtil
             ? s.poolUtility - owedUtil
             : 0;
-        emit LiquidityClaimed(id, msg.sender, 0, owedUtil);
+        claimedUtility += owedUtil;
+        emit LiquidityClaimed(id, msg.sender, claimedInvite, claimedUtility);
     }
 
     /*══════════════════════════════════════════════════════════════════════*\
@@ -701,6 +748,10 @@ contract RocketLauncher is ReentrancyGuard {
         return rocketState[id].claimedLP[who];
     }
 
+    function isFaulted(uint256 id) external view returns (bool) {
+        return rocketState[id].isFaulted;
+    }
+
     /// Reverse-lookup: utility-token address ⇒ rocket ID (0 → unknown).
     mapping(address => uint256) private _rocketIdOfToken;
 
@@ -783,10 +834,10 @@ contract RocketLauncher is ReentrancyGuard {
         address _spender,
         uint64 _value
     ) internal returns (bool) {
-        (bool success, ) = address(_token).call(
+        (bool _success, ) = address(_token).call(
             abi.encodeWithSignature("approve(address,uint64)", _spender, _value)
         );
-        require(success, "Low-level call failed");
+        // require(success, "Low-level call failed"); some tokens lie
 
         // Fail if the new allowance its not equal than _value
         return _token.allowance(address(this), _spender) == _value;
@@ -811,10 +862,10 @@ contract RocketLauncher is ReentrancyGuard {
             return false;
         }
 
-        (bool success, ) = address(_token).call(
+        (bool _success, ) = address(_token).call(
             abi.encodeWithSignature("transfer(address,uint64)", _to, _value)
         );
-        require(success, "Low-level call failed");
+        // require(_success, "Low-level call failed"); some tokens lie
 
         // Fail if the new balance its not equal than previous balance sub _value
         return prevBalance - _value == _token.balanceOf(address(this));

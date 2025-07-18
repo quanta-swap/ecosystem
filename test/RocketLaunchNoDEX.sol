@@ -261,7 +261,12 @@ contract VestLiquidity_NoDex_Test is Test {
         // ─── assertions ───
         uint64 fullSupply = cfg.utilityTokenParams.supply64;
         uint64 creatorSlice = _pct64(fullSupply, cfg.percentOfLiquidityCreator);
+        uint64 publicSupply = fullSupply - creatorSlice;
         uint64 totalRaise = creatorStake + contribStake;
+        uint64 creatorPubShare = uint64(
+            (uint256(creatorStake) * publicSupply) / totalRaise
+        );
+        uint64 expectedUtil = creatorSlice + creatorPubShare;
 
         assertEq(
             invit.balanceOf(AL) - preInv,
@@ -270,11 +275,11 @@ contract VestLiquidity_NoDex_Test is Test {
         );
         assertEq(
             util.balanceOf(AL) - preUtil,
-            creatorSlice,
-            "creator utility slice"
+            expectedUtil,
+            "creator util (private + public) mismatch"
         );
 
-        // Launcher no longer tracks pools until contributors claim
+        // pools should be zero until the contributor claims
         assertEq(launcher.poolInvite(id), 0, "poolInvite zero");
         assertEq(launcher.poolUtility(id), 0, "poolUtility zero");
     }
