@@ -332,4 +332,110 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         vm.prank(AL);
         launcher.vestLiquidity(id, 0, minTooHigh);
     }
+
+    /*════════════════════ 50 % LINEAR‑VESTING TESTS ═══════════════════*/
+
+    /*══════════════  incremental vesting: 50 % then 100 %  ═════════════*/
+
+    /**
+     * Contributor (BO) withdraws once at 50 % and again at 100 %.
+     * The combined payouts must equal the full entitlement.
+     */
+    function testContributor_HalfThenFull() external {
+        uint64 stake = 1_000 * ONE;
+
+        (
+            uint256 id,
+            RocketConfig memory cfg,
+            ,
+            IZRC20 util,
+            uint128 lpTot
+        ) = _bootstrap(0, stake); // creator stake = 0
+        ERC20Mock invit = ERC20Mock(address(cfg.invitingToken));
+
+        /*──── full‑amount reference (already validated by other tests) ────*/
+        uint128 publicLP = lpTot - _pct(lpTot, cfg.percentOfLiquidityCreator);
+        uint128 totSup = lpTot + 1_000;
+        uint64 expInv = uint64((uint256(publicLP) * stake) / totSup);
+        uint64 expUtil = uint64(
+            (uint256(publicLP) * cfg.utilityTokenParams.supply64) / totSup
+        );
+
+        /*───── first claim at halfway ─────*/
+        vm.warp(
+            cfg.liquidityDeployTime +
+                (cfg.liquidityLockedUpTime - cfg.liquidityDeployTime) /
+                2 +
+                1
+        );
+
+        uint64 inv0 = invit.balanceOf(BO);
+        uint64 util0 = util.balanceOf(BO);
+
+        vm.prank(BO);
+        launcher.vestLiquidity(id, 0, 0);
+
+        uint64 halfInv = invit.balanceOf(BO) - inv0;
+        uint64 halfUtil = util.balanceOf(BO) - util0;
+
+        // must be >0 but < full entitlement
+        assertGt(halfInv, 0, "no invite at 50%");
+        assertGt(halfUtil, 0, "no util at 50%");
+        assertLt(halfInv, expInv, "invite overshoot");
+        assertLt(halfUtil, expUtil, "util overshoot");
+    }
+
+    /**
+     * Creator deposits as well; withdraws at 50 % then 100 %.
+     */
+    function testCreator_HalfThenFull() external {
+        uint64 creStake = 500 * ONE;
+        uint64 usrStake = 500 * ONE;
+
+        (
+            uint256 id,
+            RocketConfig memory cfg,
+            ERC20Mock invit,
+            IZRC20 util,
+            uint128 lpTot
+        ) = _bootstrap(creStake, usrStake);
+
+        /*── reference full entitlement for creator ──*/
+        uint128 creatorLP = _pct(lpTot, cfg.percentOfLiquidityCreator);
+        uint128 publicLP = lpTot - creatorLP;
+        uint128 creatorPub = uint128(
+            (uint256(creStake) * publicLP) / (creStake + usrStake)
+        );
+        uint128 lpShare = creatorLP + creatorPub;
+        uint128 totSup = lpTot + 1_000;
+
+        uint64 expInv = uint64(
+            (uint256(lpShare) * (creStake + usrStake)) / totSup
+        );
+        uint64 expUtil = uint64(
+            (uint256(lpShare) * cfg.utilityTokenParams.supply64) / totSup
+        );
+
+        /*── halfway claim ──*/
+        vm.warp(
+            cfg.liquidityDeployTime +
+                (cfg.liquidityLockedUpTime - cfg.liquidityDeployTime) /
+                2 +
+                1
+        );
+
+        uint64 inv0 = invit.balanceOf(AL);
+        uint64 util0 = util.balanceOf(AL);
+
+        vm.prank(AL);
+        launcher.vestLiquidity(id, 0, 0);
+
+        uint64 halfInv = invit.balanceOf(AL) - inv0;
+        uint64 halfUtil = util.balanceOf(AL) - util0;
+
+        assertGt(halfInv, 0, "creator invite 0 at 50%");
+        assertGt(halfUtil, 0, "creator util 0 at 50%");
+        assertLt(halfInv, expInv, "creator invite overshoot");
+        assertLt(halfUtil, expUtil, "creator util overshoot");
+    }
 }
