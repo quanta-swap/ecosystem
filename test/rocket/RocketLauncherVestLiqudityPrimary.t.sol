@@ -17,15 +17,15 @@ import "./mocks/Mocks.sol";
 /**
  * @title  VestLiquidityAMM_Initial
  * @notice Verifies the primary DEX‑backed vesting flow of
- *         {RocketLauncher.vestLiquidity}.  
+ *         {RocketLauncher.vestLiquidity}.
  *
  *         Covered branches
  *         ─────────────────
- *         ✓ Creator claim (reserved slice + public share)  
- *         ✓ Contributor claim (public share only)  
- *         ✓ Creator‑also‑contributor claim  
- *         ✓ VestBeforeLaunch, LaunchTooEarly, double‑claim, no‑deposit,  
- *           and slippage guard reverts  
+ *         ✓ Creator claim (reserved slice + public share)
+ *         ✓ Contributor claim (public share only)
+ *         ✓ Creator‑also‑contributor claim
+ *         ✓ VestBeforeLaunch, LaunchTooEarly, double‑claim, no‑deposit,
+ *           and slippage guard reverts
  *
  * @dev    All tests inherit the pristine environment prepared by
  *         {RocketLauncherTestBase}.  No external storage manipulation,
@@ -101,8 +101,8 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         /* 4. warp past lock‑up → 100 % vested */
         vm.warp(cfg.liquidityLockedUpTime + 1);
 
-        util     = launcher.offeringToken(id);
-        lpTotal  = _expectedLp(
+        util = launcher.offeringToken(id);
+        lpTotal = _expectedLp(
             cfg.utilityTokenParams.supply64,
             stakeCreator + stakeUser
         );
@@ -128,7 +128,7 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
 
         /*----- expected withdrawals --------------------------------*/
         uint128 creatorLP = _pct(lpTotal, cfg.percentOfLiquidityCreator);
-        uint128 publicLP  = lpTotal - creatorLP;
+        uint128 publicLP = lpTotal - creatorLP;
 
         uint128 creatorPubLP = uint128(
             (uint256(creStake) * publicLP) / (creStake + usrStake)
@@ -143,31 +143,18 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
             (uint256(owedLP) * (creStake + usrStake)) / totSupplyLP
         );
 
-        uint64 preInv  = invit.balanceOf(AL);
+        uint64 preInv = invit.balanceOf(AL);
         uint64 preUtil = util.balanceOf(AL);
 
         vm.expectEmit(true, true, false, true);
-        emit RocketLauncher.LiquidityVested(
-            id,
-            owedLP,
-            expectInv,
-            expectUtil
-        );
+        emit RocketLauncher.LiquidityVested(id, owedLP, expectInv, expectUtil);
 
         vm.prank(AL);
         launcher.vestLiquidity(id, 0, 0);
 
         /*----- assertions ------------------------------------------*/
-        assertEq(
-            invit.balanceOf(AL) - preInv,
-            expectInv,
-            "inviting delta"
-        );
-        assertEq(
-            util.balanceOf(AL) - preUtil,
-            expectUtil,
-            "utility delta"
-        );
+        assertEq(invit.balanceOf(AL) - preInv, expectInv, "inviting delta");
+        assertEq(util.balanceOf(AL) - preUtil, expectUtil, "utility delta");
     }
 
     /**
@@ -186,7 +173,7 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         ) = _bootstrap(creStake, usrStake);
 
         uint128 creatorLP = _pct(lpTotal, cfg.percentOfLiquidityCreator);
-        uint128 publicLP  = lpTotal - creatorLP;
+        uint128 publicLP = lpTotal - creatorLP;
 
         uint128 contribLP = uint128(
             (uint256(usrStake) * publicLP) / (creStake + usrStake)
@@ -194,15 +181,15 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
 
         uint128 totSupplyLP = lpTotal + 1_000;
         uint64 expectUtil = uint64(
-            (uint256(contribLP) * cfg.utilityTokenParams.supply64) /
-                totSupplyLP
+            (uint256(contribLP) * cfg.utilityTokenParams.supply64) / totSupplyLP
         );
         uint64 expectInv = uint64(
             (uint256(contribLP) * (creStake + usrStake)) / totSupplyLP
         );
 
-        uint64 preInv  = uint64(ERC20Mock(address(cfg.invitingToken))
-                        .balanceOf(BO));
+        uint64 preInv = uint64(
+            ERC20Mock(address(cfg.invitingToken)).balanceOf(BO)
+        );
         uint64 preUtil = util.balanceOf(BO);
 
         vm.expectEmit(true, true, false, true);
@@ -216,11 +203,7 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         vm.prank(BO);
         launcher.vestLiquidity(id, 0, 0);
 
-        assertEq(
-            util.balanceOf(BO) - preUtil,
-            expectUtil,
-            "util delta"
-        );
+        assertEq(util.balanceOf(BO) - preUtil, expectUtil, "util delta");
         assertEq(
             ERC20Mock(address(cfg.invitingToken)).balanceOf(BO) - preInv,
             expectInv,
@@ -245,7 +228,7 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         ) = _bootstrap(creStake, usrStake);
 
         uint128 creatorLP = _pct(lpTotal, cfg.percentOfLiquidityCreator);
-        uint128 publicLP  = lpTotal - creatorLP;
+        uint128 publicLP = lpTotal - creatorLP;
 
         uint128 creatorPubLP = uint128(
             (uint256(creStake) * publicLP) / (creStake + usrStake)
@@ -260,22 +243,17 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
             (uint256(owedLP) * (creStake + usrStake)) / totSupplyLP
         );
 
-        uint64 preInv  = invit.balanceOf(AL);
+        uint64 preInv = invit.balanceOf(AL);
         uint64 preUtil = util.balanceOf(AL);
 
         vm.expectEmit(true, true, false, true);
-        emit RocketLauncher.LiquidityVested(
-            id,
-            owedLP,
-            expectInv,
-            expectUtil
-        );
+        emit RocketLauncher.LiquidityVested(id, owedLP, expectInv, expectUtil);
 
         vm.prank(AL);
         launcher.vestLiquidity(id, 0, 0);
 
-        assertEq(invit.balanceOf(AL) - preInv,  expectInv,  "invite delta");
-        assertEq(util.balanceOf(AL)  - preUtil, expectUtil, "utility delta");
+        assertEq(invit.balanceOf(AL) - preInv, expectInv, "invite delta");
+        assertEq(util.balanceOf(AL) - preUtil, expectUtil, "utility delta");
     }
 
     /*══════════════════════ revert paths ════════════════════════*/
@@ -286,9 +264,7 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         vm.prank(AL);
         uint256 id = launcher.createRocket(cfg);
 
-        vm.expectRevert(
-            abi.encodeWithSelector(VestBeforeLaunch.selector, id)
-        );
+        vm.expectRevert(abi.encodeWithSelector(VestBeforeLaunch.selector, id));
         vm.prank(BO);
         launcher.vestLiquidity(id, 0, 0);
     }
@@ -298,9 +274,10 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         uint64 stake = 100 * ONE;
         (
             uint256 id,
-            RocketConfig memory cfg, /*invit*/ /*util*/
+            RocketConfig memory cfg /*invit*/ /*util*/,
             ,
             ,
+
         ) = _bootstrap(stake, 0);
 
         // rewind to exact deploy timestamp
@@ -320,48 +297,35 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
 
     /// second claim → NothingToVest
     function testDoubleClaim_Revert() external {
-        (
-            uint256 id, /*cfg*/ /*invit*/ /*util*/
-            ,
-            ,
-            ,
-        ) = _bootstrap(50 * ONE, 0);
+        (uint256 id /*cfg*/ /*invit*/ /*util*/, , , , ) = _bootstrap(
+            50 * ONE,
+            0
+        );
 
         vm.prank(AL);
         launcher.vestLiquidity(id, 0, 0); // first OK
 
         vm.prank(AL);
-        vm.expectRevert(
-            abi.encodeWithSelector(NothingToVest.selector, id)
-        );
+        vm.expectRevert(abi.encodeWithSelector(NothingToVest.selector, id));
         launcher.vestLiquidity(id, 0, 0); // second fails
     }
 
     /// contributor with zero deposit → NothingToVest
     function testContributorNoDeposit_Revert() external {
-        (
-            uint256 id, /*cfg*/ /*invit*/ /*util*/
-            ,
-            ,
-            ,
-        ) = _bootstrap(200 * ONE, 0); // BO deposited nothing
+        (uint256 id /*cfg*/ /*invit*/ /*util*/, , , , ) = _bootstrap(
+            200 * ONE,
+            0
+        ); // BO deposited nothing
 
         vm.prank(BO);
-        vm.expectRevert(
-            abi.encodeWithSelector(NothingToVest.selector, id)
-        );
+        vm.expectRevert(abi.encodeWithSelector(NothingToVest.selector, id));
         launcher.vestLiquidity(id, 0, 0);
     }
 
     /// minOut parameters exceed obtainable amounts → DEXMock “slippage”
     function testSlippageGuard_Revert() external {
         uint64 creStake = 100 * ONE;
-        (
-            uint256 id,
-            ,
-            ,
-            ,
-        ) = _bootstrap(creStake, 0);
+        (uint256 id, , , , ) = _bootstrap(creStake, 0);
         uint64 minTooHigh = type(uint64).max;
 
         vm.expectRevert(bytes("slippage"));
