@@ -113,7 +113,8 @@ abstract contract RocketLauncherTestBase is Test {
             percentOfLiquidityBurned:  0,
             percentOfLiquidityCreator: uint32(type(uint32).max >> 2), // 25 %
             liquidityLockedUpTime:     uint64(block.timestamp + 30 days),
-            liquidityDeployTime:       uint64(block.timestamp +  1 days)
+            liquidityDeployTime:       uint64(block.timestamp +  1 days),
+            invitingTokenSweetener: 0
         });
     }
 

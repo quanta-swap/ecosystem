@@ -190,6 +190,9 @@ struct RocketConfig {
     uint32 percentOfLiquidityCreator; // ≤ 50 %, ignored if no dex
     uint64 liquidityLockedUpTime; // vest ends here, ignored if no dex
     uint64 liquidityDeployTime; // vest starts here
+    /* Allows for one iteration cycle of essentially a ponzi scheme */
+    /* The investor paying yield to other investors is the creator */
+    uint64 invitingTokenSweetener; // ignored if no dex
 }
 struct RocketState {
     uint64 totalInviteContributed;
@@ -200,6 +203,7 @@ struct RocketState {
     uint64 creatorUtilityClaimed; // utility tokens claimed by creator, ignored if dex
     uint64 leftoverInviting;
     uint64 leftoverUtility;
+    uint64 remainingSweetener;
     bool isFaulted; // anti-marooning flag, toggled if liquidity deployment fails
     address pool;
     mapping(address => uint256) claimedLP; // LP-equivalent already claimed
@@ -291,7 +295,9 @@ contract RocketLauncher is ReentrancyGuard {
         uint32 creatorPct,
         uint32 burnPct,
         uint64 deployTime,
-        uint64 lockupTime
+        uint64 lockupTime,
+        IZRC20 indexed invitingToken,
+        uint64 sweetener
     );
     event Deposited(uint256 indexed id, address from, uint64 amount);
     event LiquidityDeployed(uint256 indexed id, uint256 lpMinted);
@@ -435,6 +441,19 @@ contract RocketLauncher is ReentrancyGuard {
                 utility
             );
 
+        // transfer the sweetener to this contract
+        if (address(dex) != address(0) && cfg_.invitingTokenSweetener != 0) {
+            require(
+                safeTransferFrom(
+                    cfg_.invitingToken,
+                    msg.sender,
+                    address(this),
+                    cfg_.invitingTokenSweetener
+                ),
+                "sweetener trf failed"
+            );
+        }
+
         /*──────────────────── 4. Persist rocket state ──────────────────*/
 
         id = ++rocketCount; // 1‑based ID.
@@ -447,11 +466,14 @@ contract RocketLauncher is ReentrancyGuard {
             percentOfLiquidityBurned: cfg_.percentOfLiquidityBurned,
             percentOfLiquidityCreator: cfg_.percentOfLiquidityCreator,
             liquidityLockedUpTime: cfg_.liquidityLockedUpTime,
-            liquidityDeployTime: cfg_.liquidityDeployTime
+            liquidityDeployTime: cfg_.liquidityDeployTime,
+            invitingTokenSweetener: cfg_.invitingTokenSweetener
         });
 
         offeringToken[id] = IZRC20(utility);
         rocketState[id].poolUtility = p.supply64;
+        rocketState[id].remainingSweetener = cfg_.invitingTokenSweetener;
+
         // guards against deployer logic that caches deployments
         if (_rocketIdOfToken[utility] != 0) revert DuplicateUtilityToken();
         _rocketIdOfToken[utility] = id;
@@ -463,7 +485,9 @@ contract RocketLauncher is ReentrancyGuard {
             cfg_.percentOfLiquidityCreator,
             cfg_.percentOfLiquidityBurned,
             cfg_.liquidityDeployTime,
-            cfg_.liquidityLockedUpTime
+            cfg_.liquidityLockedUpTime,
+            offeringToken[id],
+            cfg_.invitingTokenSweetener
         );
     }
 
@@ -736,7 +760,7 @@ contract RocketLauncher is ReentrancyGuard {
             claimedUtility += creatorSlice - already;
         }
 
-        /*──────────────── CONTRIBUTORS (FALL THROUGH) ───────────────*/
+        /*──────────────── CONTRIBUTORS (FALL‑THROUGH) ───────────────*/
         uint64 contributed = _deposited[id][msg.sender];
         if (contributed == 0) revert NothingToClaim(id);
 
@@ -744,18 +768,39 @@ contract RocketLauncher is ReentrancyGuard {
             (uint256(contributed) * publicSupply) / s.totalInviteContributed
         );
         if (owedUtil == 0) revert NothingToClaim(id);
-        /* defensive‑write before external call */
+
+        /* defensive‑write before any external transfer */
         _deposited[id][msg.sender] = 0;
 
+        /* 1. transfer utility tokens */
         require(
             safeTransfer(offeringToken[id], msg.sender, owedUtil),
             "util trf failed"
         );
-
         s.poolUtility = s.poolUtility >= owedUtil
             ? s.poolUtility - owedUtil
             : 0;
+
+        /* 2. proportional sweetener — **contributors only** */
+        uint64 sweet = 0;
+        if (s.remainingSweetener != 0 && msg.sender != c.offeringCreator) {
+            sweet = uint64(
+                (uint256(s.remainingSweetener) * contributed) /
+                    s.totalInviteContributed
+            );
+            if (sweet != 0) {
+                require(
+                    safeTransfer(c.invitingToken, msg.sender, sweet),
+                    "sweetener trf failed"
+                );
+                s.remainingSweetener -= sweet;
+            }
+        }
+
+        /* 3. account for what was actually paid to caller */
+        claimedInvite += sweet; // creator receives no sweetener → no change
         claimedUtility += owedUtil;
+
         emit LiquidityClaimed(id, msg.sender, claimedInvite, claimedUtility);
     }
 
@@ -764,50 +809,47 @@ contract RocketLauncher is ReentrancyGuard {
     \*══════════════════════════════════════════════════════════════════════*/
 
     /**
-     * @notice Vest the caller’s share of LP **and** any residual dust
-     *         (inviting‑ / utility‑tokens left in the launcher because
-     *         of rounding, rebates, or fee‑on‑transfer quirks).
+     * @dev Vest LP, sweep residual dust **and distribute the “sweetener” pool**
+     *      (extra inviting tokens deposited by the creator at launch) pro‑rata
+     *      to contributors. The creator never receives a share of the sweetener.
      *
-     *  Execution flow & invariants
-     *  ───────────────────────────
-     *  1.  All math is performed first; may revert {VestBeforeLaunch},
-     *      {LaunchTooEarly}, {NothingToVest}.
-     *  2.  External DEX call executes **before** any state is mutated.
-     *  3.  Dust is paid out *after* the DEX withdrawal, using the same
-     *      pro‑rata fraction: `owedLP / totalLP`.
-     *  4.  State is mutated only after all external transfers succeed.
+     *      Assumptions
+     *      ───────────
+     *      • `remainingSweetener` ≤ 2⁶⁴‑1 and is **NOT** part of
+     *        `totalInviteContributed`; it is a separate incentive pool.
+     *      • 64‑bit arithmetic is preserved throughout; any overflow reverts
+     *        upstream in helpers.
      *
-     *  @param id          Rocket identifier.
-     *  @param minUtilOut  Minimum acceptable utility‑token out from DEX.
-     *  @param minInvOut   Minimum acceptable inviting‑token out from DEX.
-     *
-     *  @custom:reverts VestBeforeLaunch  Rocket not launched yet.
-     *  @custom:reverts LaunchTooEarly    Vesting window not started.
-     *  @custom:reverts NothingToVest     Caller has nothing newly vested.
-     *  @custom:reverts Transfer failures bubble up from {safeTransfer}.
+     *      Security invariants
+     *      ───────────────────
+     *      1.  Sweetener is transferred *after* the external DEX call and *after*
+     *          dust, so state only mutates if **all** transfers succeed.
+     *      2.  Each caller can drain at most their fair share; rounding dust
+     *          (≤ callers) remains in `remainingSweetener` and can be burned
+     *          at the end of vesting.
      */
     function _vestLiquidity(
         uint256 id,
         uint64 minUtilOut,
         uint64 minInvOut
     ) internal {
-        /*───────────────── 0. Fast‑fail checks ─────────────────*/
+        /* 0 ─ fast‑fail checks unchanged … */
         RocketState storage s = rocketState[id];
         if (s.totalLP == 0) revert VestBeforeLaunch(id);
 
-        RocketConfig storage c = _cfg(id); // UnknownRocket guard inside.
+        RocketConfig storage c = _cfg(id);
 
         uint64 nowTs = uint64(block.timestamp);
         if (nowTs <= c.liquidityDeployTime)
             revert LaunchTooEarly(id, nowTs, c.liquidityDeployTime);
 
-        /*───────── 1. Compute global vesting fraction ──────────*/
+        /* 1 ─ compute vested fraction */
         uint256 vestedGlobal = (nowTs >= c.liquidityLockedUpTime)
             ? s.totalLP
             : (uint256(s.totalLP) * (nowTs - c.liquidityDeployTime)) /
                 (c.liquidityLockedUpTime - c.liquidityDeployTime);
 
-        /*───────── 2. Per‑caller LP entitlement ───────────────*/
+        /* 2 ─ caller’s LP entitlement */
         (uint256 owedLP, uint256 newClaimed) = _calcOwedLP(
             id,
             s,
@@ -815,16 +857,14 @@ contract RocketLauncher is ReentrancyGuard {
             _deposited[id][msg.sender],
             vestedGlobal,
             msg.sender
-        ); // ↳ may revert NothingToVest
+        );
 
-        /*───────── 3. Dex withdrawal (external) ───────────────*/
+        /* 3 ─ external DEX burn+withdraw */
         _executeWithdraw(id, owedLP, minUtilOut, minInvOut);
 
-        /*───────── 4. Dust payout computation ─────────────────*/
-        // Fraction of dust owed = owedLP / totalLP
+        /* 4 ─ residual dust payout (unchanged) */
         uint64 dustInvite = 0;
         uint64 dustUtil = 0;
-
         if (s.leftoverInviting != 0) {
             dustInvite = uint64(
                 (uint256(s.leftoverInviting) * owedLP) / s.totalLP
@@ -834,10 +874,9 @@ contract RocketLauncher is ReentrancyGuard {
                     safeTransfer(c.invitingToken, msg.sender, dustInvite),
                     "dust invite trf failed"
                 );
-                s.leftoverInviting -= dustInvite; // 64‑bit safe (dustInvite ≤ leftover)
+                s.leftoverInviting -= dustInvite;
             }
         }
-
         if (s.leftoverUtility != 0) {
             dustUtil = uint64(
                 (uint256(s.leftoverUtility) * owedLP) / s.totalLP
@@ -851,12 +890,29 @@ contract RocketLauncher is ReentrancyGuard {
             }
         }
 
-        /*───────── 5. State mutation (post‑external) ──────────*/
+        /* 5 ─ NEW: proportional sweetener yield */
+        uint64 sweet = 0;
+        if (s.remainingSweetener != 0 && msg.sender != c.offeringCreator) {
+            uint64 contributed = _deposited[id][msg.sender];
+            // Guard against div‑by‑zero: creator slice removed above guarantees >0
+            sweet = uint64(
+                (uint256(s.remainingSweetener) * contributed) /
+                    s.totalInviteContributed
+            );
+            if (sweet != 0) {
+                require(
+                    safeTransfer(c.invitingToken, msg.sender, sweet),
+                    "sweetener trf failed"
+                );
+                s.remainingSweetener -= sweet;
+            }
+        }
+
+        /* 6 ─ commit LP accounting */
         s.claimedLP[msg.sender] = newClaimed;
         s.lpPulled += owedLP;
 
-        // (Optional) Emit an event if you wish to surface dust paid.
-        // emit DustClaimed(id, msg.sender, dustInvite, dustUtil);
+        emit LiquidityVested(id, owedLP, dustInvite + sweet, dustUtil);
     }
 
     /**
@@ -981,6 +1037,11 @@ contract RocketLauncher is ReentrancyGuard {
      */
     function poolInvite(uint256 id) external view returns (uint64) {
         return rocketState[id].poolInvite;
+    }
+
+    function invitation(uint256 id) external view returns (address, uint64) {
+        RocketConfig storage c = rocketCfg[id];
+        return (address(c.invitingToken), c.invitingTokenSweetener);
     }
 
     /**

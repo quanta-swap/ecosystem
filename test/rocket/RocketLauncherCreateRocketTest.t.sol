@@ -62,7 +62,9 @@ contract CreateRocketTest is RocketLauncherTestBase {
             cfg.percentOfLiquidityCreator,
             cfg.percentOfLiquidityBurned,
             cfg.liquidityDeployTime,
-            cfg.liquidityLockedUpTime
+            cfg.liquidityLockedUpTime,
+            cfg.invitingToken,
+            0
         );
 
         vm.prank(AL);
