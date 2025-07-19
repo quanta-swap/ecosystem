@@ -3,8 +3,6 @@ pragma solidity ^0.8.24;
 
 import "./IZRC20.sol";
 
-// TODO! Add mulDiv?
-
 /*─────────────────── minimal ReentrancyGuard ───────────────────*/
 abstract contract ReentrancyGuard {
     uint256 private constant _NOT_ENTERED = 1;
@@ -211,11 +209,10 @@ struct RocketState {
 error ZeroAddress(address);
 error PercentOutOfRange(uint64);
 error LiquidityOutOfRange(uint256);
-error LockTimeShort(uint64); // Added declaration for LockTimeShort
 error CreatorShareTooHigh(uint32);
 error UnknownRocket(uint256);
 error AlreadyLaunched(uint256);
-error LaunchTooEarly(uint256, uint256, uint64);
+error LaunchTooEarly(uint256, uint64, uint64);
 error VestBeforeLaunch(uint256);
 error NothingToVest(uint256);
 error NotLaunched(uint256);
@@ -224,15 +221,6 @@ error RocketFaulted(uint256);
 error DuplicateUtilityToken();
 error ZeroCodeDeployed();
 error DepositTooLate(uint256, uint64, uint64);
-error SumOverflow(uint256, uint256); // Added declaration for SumOverflow
-
-/**
- * @dev Raised when the balance of a token decreases unexpectedly.
- * @param token    Address of the token.
- * @param before   Balance before the operation.
- * @param afterwards    Balance after the operation.
- */
-error BalanceDecrease(address token, uint64 before, uint64 afterwards);
 
 /**
  * @dev The DEX refused to list the (invite, utility) pair.
@@ -319,11 +307,8 @@ contract RocketLauncher is ReentrancyGuard {
         uint64 invite,
         uint64 utility
     );
-    event DustForgiven(uint256 indexed id, address indexed who);
     /** Residual dust fully burned → both pool counters zeroed. */
     event DustBurned(uint256 indexed id, uint64 inviteDust, uint64 utilityDust);
-
-    // Funds are recoverable through the fall-back non-DEX leg which does a direct swap
     event Faulted(uint256 indexed id);
 
     constructor(IDEX _dex, IUTD _deployer, string memory themeURI) {
@@ -415,13 +400,6 @@ contract RocketLauncher is ReentrancyGuard {
             revert InvalidVestingWindow(
                 cfg_.liquidityDeployTime,
                 cfg_.liquidityLockedUpTime
-            );
-
-        if (cfg_.liquidityDeployTime <= block.timestamp)
-            revert LaunchTooEarly(
-                id,
-                block.timestamp,
-                cfg_.liquidityDeployTime
             );
 
         // Non‑zero utility supply.
@@ -519,27 +497,9 @@ contract RocketLauncher is ReentrancyGuard {
             "transfer failed"
         );
 
-        /*────────── 3. storage mutation — explicit overflow‑guarded ──────────*/
-        uint64 newUser = prevUser + amount;
-        /*
-         * Overflow check (64‑bit domain)
-         * ──────────────────────────────
-         * If `prevUser + amount` wraps around, the result becomes smaller than
-         * `prevUser`.  That indicates the 2⁶⁴‑1 hard‑cap was exceeded, so we
-         * abort with a semantic revert instead of a generic panic.
-         */
-        if (newUser < prevUser) revert SumOverflow(prevUser, amount);
-
-        uint64 newTot = prevTot + amount;
-        /*
-         * Same reasoning as above but for the rocket‑level aggregate.  A single
-         * large deposit or many small ones could push the total contributions
-         * past the 64‑bit ceiling; detect and revert explicitly.
-         */
-        if (newTot < prevTot) revert SumOverflow(prevTot, amount);
-
-        _deposited[id][msg.sender] = newUser;
-        s.totalInviteContributed = newTot;
+        // ---------- 3. storage mutation ----------
+        _deposited[id][msg.sender] = prevUser + amount;
+        s.totalInviteContributed = prevTot + amount;
 
         emit Deposited(id, msg.sender, amount);
     }
@@ -629,39 +589,20 @@ contract RocketLauncher is ReentrancyGuard {
                     s.totalInviteContributed,
                     address(this) // LP minted to the launcher
                 )
-            returns (address location, uint256 mintedLP) {
-                s.pool = location; // Persist the pool address
+            returns (address, uint256 mintedLP) {
                 lp = mintedLP; // Keep in memory until all checks pass
-                require(
-                    safeApprove(utilTok, address(dex), 0), // utility‑token revoke
-                    "revoke utilTok failed"
-                );
-                require(
-                    safeApprove(c.invitingToken, address(dex), 0), // inviting‑token revoke
-                    "revoke inviter failed"
-                );
+                utilTok.approve(address(dex), 0); // Revoke approvals
+                c.invitingToken.approve(address(dex), 0);
             } catch {
-                require(
-                    safeApprove(utilTok, address(dex), 0), // utility‑token revoke
-                    "revoke utilTok failed"
-                );
-                require(
-                    safeApprove(c.invitingToken, address(dex), 0), // inviting‑token revoke
-                    "revoke inviter failed"
-                );
+                utilTok.approve(address(dex), 0); // Revoke approvals
+                c.invitingToken.approve(address(dex), 0);
                 s.isFaulted = true; // Any DEX‑side revert flags the rocket
                 emit Faulted(id);
                 return;
             }
         } else {
-            require(
-                safeApprove(utilTok, address(dex), 0), // utility‑token revoke
-                "revoke utilTok failed"
-            );
-            require(
-                safeApprove(c.invitingToken, address(dex), 0), // inviting‑token revoke
-                "revoke inviter failed"
-            );
+            utilTok.approve(address(dex), 0); // Revoke approvals
+            c.invitingToken.approve(address(dex), 0);
             s.isFaulted = true;
             emit Faulted(id);
             return;
@@ -686,26 +627,15 @@ contract RocketLauncher is ReentrancyGuard {
          *    is already the exact dust.
          *──────────────────────────────────────────────────────────*/
         uint64 leftoverInviting;
-        {
-            uint256 delta; // signed‑magnitude in 256‑bit space
-            uint256 tot; // candidate new dust amount (256‑bit)
-
-            if (balInvAfter >= balInvBefore) {
-                /* Net *increase* ⇒ some invite tokens were refunded */
-                delta = uint256(balInvAfter) - balInvBefore; // Δ ≥ 0
-                tot = uint256(s.totalInviteContributed) + delta; // may overflow 64‑bit
-
-                if (tot > type(uint64).max)
-                    revert SumOverflow(s.totalInviteContributed, delta); // semantic error
-                leftoverInviting = uint64(tot); // safe down‑cast
-            } else {
-                /* Net *decrease* ⇒ most or all invite tokens consumed */
-                delta = uint256(balInvBefore) - balInvAfter; // |Δ| ≥ 0
-                tot = uint256(s.totalInviteContributed) - delta; // cannot underflow
-
-                // `tot` is by construction ≤ original contributed amount ⇒ fits in 64‑bit
-                leftoverInviting = uint64(tot);
-            }
+        if (balInvAfter >= balInvBefore) {
+            // Net *increase* ⇒ some of our invite tokens were refunded.
+            uint64 rebate = balInvAfter - balInvBefore; // Δ ≥ 0, fits in 64‑bit
+            // Our dust is what we originally contributed plus the rebate
+            leftoverInviting = s.totalInviteContributed + rebate; // safe: 64‑bit universe
+        } else {
+            // Net *decrease* ⇒ most or all of our invite tokens were consumed.
+            uint64 spent = balInvBefore - balInvAfter; // Δ ≥ 0
+            leftoverInviting = s.totalInviteContributed - spent; // ≥ 0 by construction
         }
 
         s.leftoverInviting = leftoverInviting; // dust attributable to this rocket
@@ -813,13 +743,9 @@ contract RocketLauncher is ReentrancyGuard {
         uint64 owedUtil = uint64(
             (uint256(contributed) * publicSupply) / s.totalInviteContributed
         );
-        _deposited[id][msg.sender] = 0;
-        if (owedUtil == 0) {
-            emit DustForgiven(id, msg.sender);
-            emit LiquidityClaimed(id, msg.sender, 0, 0);
-            return;
-        }
+        if (owedUtil == 0) revert NothingToClaim(id);
         /* defensive‑write before external call */
+        _deposited[id][msg.sender] = 0;
 
         require(
             safeTransfer(offeringToken[id], msg.sender, owedUtil),
@@ -872,7 +798,7 @@ contract RocketLauncher is ReentrancyGuard {
         RocketConfig storage c = _cfg(id); // UnknownRocket guard inside.
 
         uint64 nowTs = uint64(block.timestamp);
-        if (nowTs < c.liquidityDeployTime)
+        if (nowTs <= c.liquidityDeployTime)
             revert LaunchTooEarly(id, nowTs, c.liquidityDeployTime);
 
         /*───────── 1. Compute global vesting fraction ──────────*/
@@ -901,7 +827,7 @@ contract RocketLauncher is ReentrancyGuard {
 
         if (s.leftoverInviting != 0) {
             dustInvite = uint64(
-                (owedLP * uint256(s.leftoverInviting)) / s.totalLP
+                (uint256(s.leftoverInviting) * owedLP) / s.totalLP
             );
             if (dustInvite != 0) {
                 require(
@@ -914,7 +840,7 @@ contract RocketLauncher is ReentrancyGuard {
 
         if (s.leftoverUtility != 0) {
             dustUtil = uint64(
-                (owedLP * uint256(s.leftoverUtility)) / s.totalLP
+                (uint256(s.leftoverUtility) * owedLP) / s.totalLP
             );
             if (dustUtil != 0) {
                 require(
@@ -970,26 +896,8 @@ contract RocketLauncher is ReentrancyGuard {
 
         // we revoked approval so can't have gone down, unless tokens non-compliant
         // in which case the revert is ideal anyway because we don't want to lose
-        uint64 netUtil;
-        uint64 netInvite;
-
-        unchecked {
-            if (balUtilAfter < balUtilBefore)
-                revert BalanceDecrease(
-                    address(offeringToken[id]),
-                    balUtilBefore,
-                    balUtilAfter
-                );
-            netUtil = balUtilAfter - balUtilBefore;
-
-            if (balInviteAfter < balInviteBefore)
-                revert BalanceDecrease(
-                    address(c.invitingToken),
-                    balInviteBefore,
-                    balInviteAfter
-                );
-            netInvite = balInviteAfter - balInviteBefore;
-        }
+        uint64 netUtil = balUtilAfter - balUtilBefore;
+        uint64 netInvite = balInviteAfter - balInviteBefore;
 
         if (netUtil < minU) revert SlippageUtility(netUtil, minU);
         if (netInvite < minI) revert SlippageInviting(netInvite, minI);
@@ -1128,10 +1036,6 @@ contract RocketLauncher is ReentrancyGuard {
         return _theme;
     }
 
-    function pool(uint256 id) external view returns (address) {
-        return rocketState[id].pool;
-    }
-
     // HELPERS
 
     /**
@@ -1158,7 +1062,8 @@ contract RocketLauncher is ReentrancyGuard {
             return false;
         }
 
-        (bool success, ) = address(_token).call(
+        // ignored because we only care about balances
+        (bool _success, ) = address(_token).call(
             abi.encodeWithSignature(
                 "transferFrom(address,address,uint64)",
                 _from,
@@ -1166,7 +1071,6 @@ contract RocketLauncher is ReentrancyGuard {
                 _value
             )
         );
-        require(success, "Low-level call failed");
 
         require(
             _token.balanceOf(_to) == prevBalanceTarget + _value,
@@ -1197,12 +1101,33 @@ contract RocketLauncher is ReentrancyGuard {
         (bool _successZero, ) = address(_token).call(
             abi.encodeWithSignature("approve(address,uint64)", _spender, 0)
         );
-        require(_successZero, "Low-level call failed");
 
-        (bool successValue, ) = address(_token).call(
+        (bool _successValue, ) = address(_token).call(
             abi.encodeWithSignature("approve(address,uint64)", _spender, _value)
         );
-        require(successValue, "Low-level call failed");
+        // require(success, "Low-level call failed"); we only care about allowance
+
+        // Fail if the new allowance its not equal than _value
+        return _token.allowance(address(this), _spender) == _value;
+    }
+
+    function safeApprove256(
+        IZRC20 _token,
+        address _spender,
+        uint64 _value
+    ) internal returns (bool) {
+        (bool _successZero, ) = address(_token).call(
+            abi.encodeWithSignature("approve(address,uint256)", _spender, 0)
+        );
+
+        (bool _successValue, ) = address(_token).call(
+            abi.encodeWithSignature(
+                "approve(address,uint256)",
+                _spender,
+                _value
+            )
+        );
+        // require(success, "Low-level call failed"); we only care about allowance
 
         // Fail if the new allowance its not equal than _value
         return _token.allowance(address(this), _spender) == _value;
@@ -1228,10 +1153,10 @@ contract RocketLauncher is ReentrancyGuard {
             return false;
         }
 
-        (bool success, ) = address(_token).call(
+        // ignored because we only care about balances
+        (bool _success, ) = address(_token).call(
             abi.encodeWithSignature("transfer(address,uint64)", _to, _value)
         );
-        require(success, "Low-level call failed");
 
         require(
             _token.balanceOf(_to) == prevBalanceTarget + _value,
