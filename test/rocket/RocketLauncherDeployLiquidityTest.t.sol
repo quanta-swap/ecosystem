@@ -80,9 +80,9 @@ contract RocketLauncherDeployLiquidityTest is RocketLauncherTestBase {
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         /* event & state sanity */
-        bytes32 sig = keccak256("LiquidityDeployed(uint256,uint128)");
+        bytes32 sig = keccak256("LiquidityDeployed(uint256,uint256)");
         bool seen;
-        uint128 lpState = launcher.totalLP(id);
+        uint256 lpState = launcher.totalLP(id);
 
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].topics[0] == sig) {

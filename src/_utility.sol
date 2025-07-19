@@ -28,6 +28,9 @@ error UnauthorizedLocker(address holder, address caller);
 /// lockTime must be > 0.
 error LockTimeZero();
 
+/// Theme is already reserved.
+error Imposter(string theme);
+
 /*──────── events ────────*/
 event LockerSet(address indexed holder, address indexed locker, bool approved);
 event TokensLocked(
@@ -469,7 +472,7 @@ contract UtilityTokenDeployer {
         uint8 decimals_,
         uint32 lockTime_,
         address root,
-        string memory theme_
+        string memory theme_ // this is supposed to be a url but not validated
     ) external returns (address addr) {
         if (root == address(0)) revert ZeroAddress(root);
 

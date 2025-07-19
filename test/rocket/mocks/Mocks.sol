@@ -162,7 +162,7 @@ contract DEXMock is IDEX {
     struct Pair {
         uint112 reserveA;
         uint112 reserveB;
-        uint128 totalSupply; // includes the locked MINIMUM_LIQUIDITY
+        uint256 totalSupply; // includes the locked MINIMUM_LIQUIDITY
     }
 
     mapping(bytes32 => Pair) private _pairs;
@@ -194,7 +194,7 @@ contract DEXMock is IDEX {
         uint256 amountA,
         uint256 amountB,
         address /*to*/
-    ) external override returns (uint128 liquidity) {
+    ) external override returns (address _location, uint256 liquidity) {
         require(amountA > 0 && amountB > 0, "zero amounts");
 
         // Pull the two legs from the caller (launcher)
@@ -225,7 +225,7 @@ contract DEXMock is IDEX {
         liquidity = uint128(rootK - MINIMUM_LIQUIDITY);
         p.reserveA = uint112(amountA);
         p.reserveB = uint112(amountB);
-        p.totalSupply = liquidity + uint128(MINIMUM_LIQUIDITY);
+        p.totalSupply = liquidity + MINIMUM_LIQUIDITY;
     }
 
     /**
@@ -236,7 +236,7 @@ contract DEXMock is IDEX {
     function withdrawLiquidity(
         address tokenA,
         address tokenB,
-        uint128 lp,
+        uint256 lp,
         address to,
         uint64 minA,
         uint64 minB
