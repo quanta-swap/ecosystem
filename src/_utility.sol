@@ -521,6 +521,6 @@ contract UtilityTokenDeployer is IUTD {
     }
 
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=kpnW68Q8ltc";
+        return "https://www.youtube.com/watch?v=w5k4YLWvOT0";
     }
 }

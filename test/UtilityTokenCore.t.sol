@@ -97,7 +97,7 @@ contract StandardUtilityTokenTest is Test {
     function testThemeReturnsExpectedURL() public {
         UtilityTokenDeployer dep = new UtilityTokenDeployer();
 
-        string memory expected = "https://www.youtube.com/watch?v=kpnW68Q8ltc";
+        string memory expected = "https://www.youtube.com/watch?v=w5k4YLWvOT0";
 
         assertEq(dep.theme(), expected, "theme URL mismatch");
     }
