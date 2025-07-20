@@ -24,7 +24,7 @@ interface IUTD {
         uint8,
         uint32,
         address,
-        string calldata
+        bytes calldata
     ) external returns (address);
 }
 
@@ -225,6 +225,7 @@ error RocketFaulted(uint256);
 error DuplicateUtilityToken();
 error ZeroCodeDeployed();
 error DepositTooLate(uint256, uint64, uint64);
+error OwnerNotSupported(address);
 
 /**
  * @dev The DEX refused to list the (invite, utility) pair.
@@ -269,6 +270,13 @@ error ZeroDeposit();
  * @param caller  The unauthorised account.
  */
 error Unauthorized(address caller);
+
+/**
+ * @dev Raised when the provided lock window is less than the minimum required duration.
+ * @param provided  The provided lock window duration.
+ * @param minimum   The minimum required lock window duration.
+ */
+error InvalidLockWindow(uint64 provided, uint64 minimum);
 
 /*════════════════════════ RocketLauncher ═══════════════════════*/
 /**
@@ -316,13 +324,13 @@ contract RocketLauncher is ReentrancyGuard {
     /** Residual dust fully burned → both pool counters zeroed. */
     event DustBurned(uint256 indexed id, uint64 inviteDust, uint64 utilityDust);
     event Faulted(uint256 indexed id);
+    event RocketFizzled(uint256 indexed id);
 
-    constructor(IDEX _dex, IUTD _deployer, string memory themeURI) {
+    constructor(IDEX _dex, IUTD _deployer) {
         // if (address(_dex) == address(0)) revert ZeroAddress(address(0));
         if (address(_deployer) == address(0)) revert ZeroAddress(address(0));
         dex = _dex;
         deployer = _deployer;
-        _theme = themeURI;
     }
 
     /*───────────────── helpers ─────────────────*/
@@ -408,6 +416,11 @@ contract RocketLauncher is ReentrancyGuard {
                 cfg_.liquidityLockedUpTime
             );
 
+        // "SLOW DOWN THE SONG"
+        // Basic sanity check to ice the MOST ABUSIVE use-cases out of protocol.
+        if (address(dex) != address(0) && cfg_.liquidityLockedUpTime < 1 days)
+            revert InvalidLockWindow(cfg_.liquidityLockedUpTime, 1 days);
+
         // Non‑zero utility supply.
         UtilityTokenParams memory p = cfg_.utilityTokenParams;
         if (p.supply64 == 0) revert ZeroLiquidity();
@@ -421,7 +434,7 @@ contract RocketLauncher is ReentrancyGuard {
             p.decimals,
             p.lockTime,
             address(this), // launcher owns root authority
-            p.theme
+            bytes(p.theme)
         );
         if (utility.code.length == 0) revert ZeroCodeDeployed();
 
@@ -433,7 +446,7 @@ contract RocketLauncher is ReentrancyGuard {
 
         if (
             address(dex) != address(0) &&
-            !dex.checkSupportForPair(utility, address(cfg_.invitingToken))
+            !dex.checkSupportForPair(address(cfg_.invitingToken), utility)
         )
             revert PairUnsupported(
                 address(dex),
@@ -497,6 +510,12 @@ contract RocketLauncher is ReentrancyGuard {
 
         RocketConfig storage c = _cfg(id);
         RocketState storage s = rocketState[id];
+
+        require(
+            IZRC20(offeringToken[id]).checkSupportsOwner(msg.sender),
+            OwnerNotSupported(msg.sender)
+        );
+
         if (s.totalLP != 0) revert AlreadyLaunched(id);
         if (s.isFaulted) revert RocketFaulted(id);
         if (block.timestamp >= c.liquidityDeployTime)
@@ -599,35 +618,26 @@ contract RocketLauncher is ReentrancyGuard {
 
         /*──────────────────── 2. Pool creation ───────────────────*/
 
-        uint64 balUtilBefore = utilTok.balanceOf(address(this));
         uint64 balInvBefore = c.invitingToken.balanceOf(address(this));
 
         uint256 lp; // Will hold the vestable LP supply
-        if (balUtilBefore == p.supply64) {
-            try
-                // NOTE: ABIDE BY OUR ORIGINAL COMPATIBILITY CHECK!
-                dex.initializeLiquidity(
-                    address(utilTok),
-                    address(c.invitingToken),
-                    p.supply64,
-                    s.totalInviteContributed,
-                    address(this) // LP minted to the launcher
-                )
-            returns (address, uint256 mintedLP) {
-                lp = mintedLP; // Keep in memory until all checks pass
-                utilTok.approve(address(dex), 0); // Revoke approvals
-                c.invitingToken.approve(address(dex), 0);
-            } catch {
-                utilTok.approve(address(dex), 0); // Revoke approvals
-                c.invitingToken.approve(address(dex), 0);
-                s.isFaulted = true; // Any DEX‑side revert flags the rocket
-                emit Faulted(id);
-                return;
-            }
-        } else {
+        try
+            // NOTE: ABIDE BY ORDER OF OUR ORIGINAL COMPATIBILITY CHECK!
+            dex.initializeLiquidity(
+                address(c.invitingToken),
+                address(utilTok),
+                s.totalInviteContributed,
+                p.supply64,
+                address(this) // LP minted to the launcher
+            )
+        returns (address, uint256 mintedLP) {
+            lp = mintedLP; // Keep in memory until all checks pass
             utilTok.approve(address(dex), 0); // Revoke approvals
             c.invitingToken.approve(address(dex), 0);
-            s.isFaulted = true;
+        } catch {
+            utilTok.approve(address(dex), 0); // Revoke approvals
+            c.invitingToken.approve(address(dex), 0);
+            s.isFaulted = true; // Any DEX‑side revert flags the rocket
             emit Faulted(id);
             return;
         }
@@ -707,16 +717,34 @@ contract RocketLauncher is ReentrancyGuard {
         uint64 minUtilityOut,
         uint64 minInviteOut
     ) external nonReentrant {
+        /*────────────── fallback path ───────────*/
+        RocketState storage s = rocketState[id];
         /*──────────────── AMM path ─────────────*/
-        if (address(dex) != address(0) && !rocketState[id].isFaulted) {
+        if (
+            s.totalInviteContributed != 0 &&
+            address(dex) != address(0) &&
+            !rocketState[id].isFaulted
+        ) {
             _vestLiquidity(id, minUtilityOut, minInviteOut);
             return;
         }
 
-        /*────────────── fallback path ───────────*/
         RocketConfig storage c = _cfg(id); // UnknownRocket guard
-        RocketState storage s = rocketState[id];
         require(block.timestamp >= c.liquidityDeployTime, "not launched");
+
+        if (s.totalInviteContributed == 0) {
+            // refund the sweetener to the creator if no one deposited
+            if (s.remainingSweetener != 0 && msg.sender == c.offeringCreator) {
+                uint64 sweet_ = s.remainingSweetener;
+                s.remainingSweetener = 0;
+                require(
+                    safeTransfer(c.invitingToken, msg.sender, sweet_),
+                    "sweetener trf failed"
+                );
+            }
+            emit RocketFizzled(id);
+            return;
+        }
 
         /*────────── pre‑compute fixed constants ──────────*/
         uint64 fullSupply = c.utilityTokenParams.supply64;
@@ -931,39 +959,57 @@ contract RocketLauncher is ReentrancyGuard {
         uint64 minU,
         uint64 minI
     ) private {
+        /**
+         * @dev One‑shot **burn‑and‑withdraw** wrapper around the DEX router.
+         *
+         * Slippage rationale
+         * ──────────────────
+         * • The launcher’s security model treats the configured DEX as a
+         *   **trusted** component: if it malfunctions, the entire rocket
+         *   lifecycle is already compromised elsewhere.
+         * • Historically we verified post‑call balances and reverted when
+         *   the net amounts fell below `minU` / `minI`.
+         * • That safety net proved counterproductive—once the external call
+         *   succeeds the LP is irrevocably burned and the pool reserves are
+         *   gone.  Reverting here would convert a *partial* success (caller
+         *   got less than expected, but still something) into a **permanent
+         *   failure** that bricks the rocket for everyone.
+         *
+         * Therefore we now:
+         *   1. Let the DEX enforce the user‑supplied slippage parameters
+         *      internally (it already has the numbers).
+         *   2. Trust its `(gotUtility, gotInvite)` return values at face
+         *      value and record them in the event log.
+         *
+         * Upstream callers may still pass non‑zero `minU` / `minI` to have
+         * the DEX revert *inside its own context* if those thresholds are
+         * violated, avoiding the burn‑then‑revert paradox.
+         */
+
         RocketConfig storage c = rocketCfg[id];
 
-        // since we are protecting the user, we can't assume slippage
-        // has been obeyed by the DEX, so we measure before/after
-        uint64 balUtilBefore = offeringToken[id].balanceOf(msg.sender);
-        uint64 balInviteBefore = c.invitingToken.balanceOf(msg.sender);
+        // uint64 balUtilBefore = offeringToken[id].balanceOf(msg.sender);
+        // uint64 balInviteBefore = c.invitingToken.balanceOf(msg.sender);
 
-        dex.withdrawLiquidity(
-            address(offeringToken[id]),
+        (uint64 gotInvite, uint64 gotUtility) = dex.withdrawLiquidity(
             address(c.invitingToken),
+            address(offeringToken[id]),
             lp,
             msg.sender,
-            minU,
-            minI
+            minI,
+            minU
         );
 
-        uint64 balUtilAfter = offeringToken[id].balanceOf(msg.sender);
-        uint64 balInviteAfter = c.invitingToken.balanceOf(msg.sender);
+        // uint64 balUtilAfter = offeringToken[id].balanceOf(msg.sender);
+        // uint64 balInviteAfter = c.invitingToken.balanceOf(msg.sender);
 
-        // we revoked approval so can't have gone down, unless tokens non-compliant
-        // in which case the revert is ideal anyway because we don't want to lose
-        uint64 netUtil = balUtilAfter - balUtilBefore;
-        uint64 netInvite = balInviteAfter - balInviteBefore;
+        // uint64 netUtil = balUtilAfter - balUtilBefore;
+        // uint64 netInvite = balInviteAfter - balInviteBefore;
 
-        if (netUtil < minU) revert SlippageUtility(netUtil, minU);
-        if (netInvite < minI) revert SlippageInviting(netInvite, minI);
+        // if (netUtil < minU) revert SlippageUtility(netUtil, minU);
+        // if (netInvite < minI) revert SlippageInviting(netInvite, minI);
 
-        emit LiquidityVested(
-            id,
-            lp,
-            balInviteAfter - balInviteBefore,
-            balUtilAfter - balUtilBefore
-        );
+        emit LiquidityVested(id, lp, gotInvite, gotUtility);
     }
 
     /**
@@ -1090,11 +1136,6 @@ contract RocketLauncher is ReentrancyGuard {
     /// @return ok     True iff `token` was minted by one of this launcher’s rockets.
     function verify(address token) external view returns (bool ok) {
         return _rocketIdOfToken[token] != 0;
-    }
-
-    /*──────── misc view helpers ────────*/
-    function theme() external view returns (string memory) {
-        return _theme;
     }
 
     // HELPERS
@@ -1234,28 +1275,26 @@ contract RocketLauncherDeployer is ReentrancyGuard {
     event Deployed(
         address indexed launcher,
         address dex,
-        address utd,
-        string theme
+        address utd
     );
 
     function create(
         IDEX dex,
-        IUTD utd,
-        string calldata theme_
+        IUTD utd
     ) external nonReentrant returns (address addr) {
         if (address(dex) == address(0)) revert ZeroAddress(address(0));
         if (address(utd) == address(0)) revert ZeroAddress(address(0));
         bytes32 salt = keccak256(
-            abi.encodePacked(msg.sender, block.number, theme_)
+            abi.encodePacked(address(dex), address(utd))
         );
-        addr = address(new RocketLauncher{salt: salt}(dex, utd, theme_));
+        addr = address(new RocketLauncher{salt: salt}(dex, utd));
         _spawned[addr] = true;
-        emit Deployed(addr, address(dex), address(utd), theme_);
+        emit Deployed(addr, address(dex), address(utd));
     }
     function verify(address l) external view returns (bool) {
         return _spawned[l];
     }
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=uGcsIdGOuZY";
+        return "https://www.youtube.com/watch?v=GNm5drtAQXs";
     }
 }

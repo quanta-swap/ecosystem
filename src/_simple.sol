@@ -1,54 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-/*═══════════════════════════════════════════════════════════════════════════════*\
-│                           IZRC-20 interface (64-bit)                           │
-\*═══════════════════════════════════════════════════════════════════════════════*/
-
-/**
- * 64-bit ERC-20 interface plus batch transfers for simulated signature aggregation.
- * Standardizing tokens to 64-bits greatly improves the efficiency of all downstream
- * contracts. It's always possible to scale a larger token to fit into 64-bits, safe.
- */
-interface IZRC20 {
-    /* view */
-    function name() external view returns (string memory);
-    function symbol() external view returns (string memory);
-    function decimals() external view returns (uint8);
-    function totalSupply() external view returns (uint64);
-    function balanceOf(address a) external view returns (uint64);
-    function allowance(address o, address s) external view returns (uint64);
-
-    /* actions */
-    function approve(address s, uint64 v) external returns (bool);
-    function transfer(address to, uint64 v) external returns (bool);
-    function transferFrom(
-        address f,
-        address t,
-        uint64 v
-    ) external returns (bool);
-
-    // Added in light of quantum resistant signatures being quite large.
-    function transferBatch(
-        address[] calldata to,
-        uint64[] calldata v
-    ) external returns (bool);
-
-    // Added in light of quantum resistant signatures being quite large.
-    function transferFromBatch(
-        address from,
-        address[] calldata to,
-        uint64[] calldata v
-    ) external returns (bool);
-
-    /* events */
-    event Transfer(address indexed from, address indexed to, uint64 value);
-    event Approval(
-        address indexed owner,
-        address indexed spender,
-        uint64 value
-    );
-}
+import "./IZRC20.sol";
 
 /*═══════════════════════════════════════════════════════════════════════════════*\
 │  ReentrancyGuard – one-byte, branch-free                                         │
@@ -359,14 +312,17 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     function name() external pure override returns (string memory) {
         return _NAME;
     }
+
     /// @notice ZRC-20 symbol.
     function symbol() external pure override returns (string memory) {
         return _SYMB;
     }
+
     /// @notice Number of decimals (always 9).
     function decimals() external pure override returns (uint8) {
         return DECIMALS;
     }
+
     /// @notice Current total supply (64-bit domain).
     function totalSupply() external view override returns (uint64) {
         return _tot;
@@ -453,8 +409,8 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
      * Detail
      * ------
      * • Consumes allowance unless it equals `type(uint64).max`
-     *   (treated as infinite and left unchanged).  
-     * • Fails early if `f` is wallet-locked.  
+     *   (treated as infinite and left unchanged).
+     * • Fails early if `f` is wallet-locked.
      * • Emits one ERC-20 {Transfer} event on success; may emit an
      *   {Approval} event if the allowance ticks down.
      *
@@ -467,9 +423,9 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
      *
      * Custom Errors
      * -------------
-     * • `InsufficientAllowance(allowance, needed)` — current allowance < `v`  
-     * • `InsufficientBalance(balance, needed)`     — balance of `f` < `v`  
-     * • `ZeroAddress()`                            — `t == address(0)`  
+     * • `InsufficientAllowance(allowance, needed)` — current allowance < `v`
+     * • `InsufficientBalance(balance, needed)`     — balance of `f` < `v`
+     * • `ZeroAddress()`                            — `t == address(0)`
      * • `WalletLocked(unlockAt)`                   — `f` is still time-locked
      *
      * Reentrancy
@@ -643,6 +599,18 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         return true;
     }
 
+    function checkSupportsOwner(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
+    }
+
+    function checkSupportsSpender(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
+    }
+
     /*──────────────────────── internal helpers – typed-error versions ─────────────*/
 
     /**
@@ -763,4 +731,5 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         if (uint256(inc) > uint256(MAX_BAL) - _tot)
             revert CapExceeded(_tot, inc);
     }
+
 }

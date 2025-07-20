@@ -60,8 +60,7 @@ abstract contract RocketLauncherTestBase is Test {
         factory = new RocketLauncherDeployer();
 
         // 3. Spawn a fresh launcher through the factory
-        string memory themeURI  = "ipfs://placeholder-theme";
-        address   addr          = factory.create(dex, utd, themeURI);
+        address   addr          = factory.create(dex, utd);
         launcher                 = RocketLauncher(addr);
 
         // 4. Sanity‑check provenance

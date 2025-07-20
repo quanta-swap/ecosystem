@@ -32,8 +32,6 @@ contract DeployerConstructorTest is Test {
     UTDMock private utd;             // fake utility‑token factory
     RocketLauncherDeployer private factory;
 
-    string private constant THEME = "ipfs://constructor-theme";
-
     /*──────────────────────── set‑up (runs before every test) ─────*/
     function setUp() public {
         vm.deal(CALLER, 100 ether);  // give the caller gas
@@ -49,8 +47,7 @@ contract DeployerConstructorTest is Test {
 
     /**
      * @notice `create` emits {Deployed}, records provenance, and the freshly
-     *         minted `RocketLauncher` exposes the exact `dex`, `deployer`,
-     *         and `theme` supplied.
+     *         minted `RocketLauncher` exposes the exact `dex`, `deployer`
      */
     function testCreate_Succeeds_ConfigCorrect() external {
         /*----- expect the Deployed event (all fields) ---------------*/
@@ -58,20 +55,18 @@ contract DeployerConstructorTest is Test {
         emit RocketLauncherDeployer.Deployed(
             address(0),          // placeholder (checked post‑call)
             address(dex),
-            address(utd),
-            THEME
+            address(utd)
         );
 
         /*----- act --------------------------------------------------*/
         vm.prank(CALLER);
-        address addr = factory.create(dex, utd, THEME);
+        address addr = factory.create(dex, utd);
 
         /*----- assert: factory provenance ---------------------------*/
         assertTrue(factory.verify(addr), "factory.verify failed");
 
         /*----- assert: launcher interior state ----------------------*/
         RocketLauncher launcher = RocketLauncher(addr);
-        assertEq(launcher.theme(), THEME,      "theme mismatch");
         assertEq(address(launcher.dex()), address(dex), "dex mismatch");
         assertEq(address(launcher.deployer()), address(utd), "utd mismatch");
     }
@@ -86,7 +81,7 @@ contract DeployerConstructorTest is Test {
     function testCreate_Revert_DexZero() external {
         vm.prank(CALLER);
         vm.expectRevert(abi.encodeWithSelector(ZeroAddress.selector, address(0)));
-        factory.create(IDEX(address(0)), utd, THEME);
+        factory.create(IDEX(address(0)), utd);
     }
 
     /**
@@ -95,6 +90,6 @@ contract DeployerConstructorTest is Test {
     function testCreate_Revert_UTDZero() external {
         vm.prank(CALLER);
         vm.expectRevert(abi.encodeWithSelector(ZeroAddress.selector, address(0)));
-        factory.create(dex, IUTD(address(0)), THEME);
+        factory.create(dex, IUTD(address(0)));
     }
 }

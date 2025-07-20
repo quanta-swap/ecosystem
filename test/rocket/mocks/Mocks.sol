@@ -65,18 +65,23 @@ contract ERC20Mock is IZRC20 {
     function name() external view returns (string memory) {
         return _name;
     }
+
     function symbol() external view returns (string memory) {
         return _symbol;
     }
+
     function decimals() external view returns (uint8) {
         return _decimals;
     }
+
     function totalSupply() external view returns (uint64) {
         return _tot;
     }
+
     function balanceOf(address a) external view returns (uint64) {
         return _bal[a];
     }
+
     function allowance(address o, address s) external view returns (uint64) {
         return _allow[o][s];
     }
@@ -136,6 +141,18 @@ contract ERC20Mock is IZRC20 {
         uint64[] calldata
     ) external pure override returns (bool) {
         return false;
+    }
+
+    function checkSupportsOwner(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
+    }
+
+    function checkSupportsSpender(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
     }
 }
 
@@ -295,7 +312,7 @@ contract UTDMock is IUTD {
         uint8 dec,
         uint32 /*lock*/,
         address root,
-        string calldata /*theme*/
+        bytes calldata /*extra*/
     ) external override returns (address) {
         ERC20Mock tok = new ERC20Mock(n, s, dec);
         if (sup > 0) tok.mint(root, sup);

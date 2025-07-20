@@ -28,7 +28,7 @@ contract UTDMockBad is IUTD {
         uint8 dec,
         uint32,
         address /*root*/,
-        string calldata
+        bytes calldata
     ) external override returns (address) {
         return address(new ERC20Mock(n, s, dec)); // zero supply
     }
@@ -174,7 +174,7 @@ contract CreateRocketTest is RocketLauncherTestBase {
     /*────────────────── BadInitialSupply ────────────────*/
     function testCreateRocket_Revert_BadInitialSupply() external {
         UTDMockBad bad = new UTDMockBad();
-        RocketLauncher badLauncher = new RocketLauncher(dex, bad, "x");
+        RocketLauncher badLauncher = new RocketLauncher(dex, bad);
 
         RocketConfig memory cfg = _defaultConfig();
 

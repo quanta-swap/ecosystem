@@ -693,6 +693,7 @@ contract WrappedQRL is
      *       Gas impact: +1 SLOAD +1 SSTORE per call – negligible.
      */
     uint256 private _txnNonce;
+
     /*═══════════════ Account-level membership management (FIXED) ══════════════*/
     /**
      * @notice
@@ -1333,4 +1334,17 @@ contract WrappedQRL is
     function freeLists() external view returns (uint256, uint256) {
         return (_freeRes.length, _freeMem.length);
     }
+
+    function checkSupportsOwner(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
+    }
+
+    function checkSupportsSpender(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
+    }
+    
 }

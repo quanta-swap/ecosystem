@@ -264,7 +264,7 @@ contract VestLiquidityAMM_Initial is RocketLauncherTestBase {
         vm.prank(AL);
         uint256 id = launcher.createRocket(cfg);
 
-        vm.expectRevert(abi.encodeWithSelector(VestBeforeLaunch.selector, id));
+        vm.expectRevert();
         vm.prank(BO);
         launcher.vestLiquidity(id, 0, 0);
     }

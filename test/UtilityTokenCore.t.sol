@@ -916,7 +916,7 @@ contract StandardUtilityTokenTest is Test {
             decs,
             LOCK_TIME,
             root,
-            "google.com"
+            bytes("google.com")
         );
         assertTrue(tokAddr != address(0), "factory returned zero address");
 
@@ -935,14 +935,14 @@ contract StandardUtilityTokenTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(ZeroAddress.selector, address(0))
         );
-        dep.create("X", "X", 1, 9, LOCK_TIME, address(0), "google.com");
+        dep.create("X", "X", 1, 9, LOCK_TIME, address(0), bytes("google.com"));
     }
 
     function testDeployerLockTimeZeroRevert() public {
         UtilityTokenDeployer dep = new UtilityTokenDeployer();
 
         vm.expectRevert(abi.encodeWithSelector(LockTimeZero.selector));
-        dep.create("X", "X", 1, 9, 0, AL, "google.com"); // lockTime_ == 0 bubbles up
+        dep.create("X", "X", 1, 9, 0, AL, bytes("google.com")); // lockTime_ == 0 bubbles up
     }
 
     function testCreateEmitsDeployedEvent() public {
@@ -960,7 +960,7 @@ contract StandardUtilityTokenTest is Test {
             9,
             1 hours,
             address(this),
-            "google.com"
+            bytes("google.com")
         );
 
         assertTrue(token != address(0), "token addr is zero");
@@ -989,7 +989,7 @@ contract StandardUtilityTokenTest is Test {
             9,
             LOCK_TIME,
             AL, // root holder
-            themeStr // ← theme argument under test
+            bytes(themeStr) // ← theme argument under test
         );
 
         // Verify the getter on the deployed token
@@ -1012,7 +1012,7 @@ contract StandardUtilityTokenTest is Test {
             9,
             LOCK_TIME,
             AL, // root / initial holder,
-            "google.com"
+            bytes("google.com")
         );
         assertTrue(token != address(0), "token should not be zero");
 
@@ -1051,7 +1051,7 @@ contract StandardUtilityTokenTest is Test {
             9,
             LOCK_TIME,
             AL, // root holder
-            "auth.test"
+            bytes("auth.test")
         );
 
         /* 3. check the immutable field */

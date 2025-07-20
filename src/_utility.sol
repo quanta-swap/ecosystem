@@ -158,8 +158,8 @@ contract StandardUtilityToken is IZRC20 {
 
     /**
      * @notice Lock `amount` tokens in `holder`’s account for the current epoch.
-     * @dev    • Only authorised lockers may call.  
-     *         • A new epoch automatically resets previous locks.  
+     * @dev    • Only authorised lockers may call.
+     *         • A new epoch automatically resets previous locks.
      *         • Emits a {TokensLocked} event.
      * @param  holder  Account whose tokens will be locked.
      * @param  amount  Number of tokens to lock (must not exceed unlocked balance).
@@ -194,21 +194,27 @@ contract StandardUtilityToken is IZRC20 {
     function totalSupply() external view override returns (uint64) {
         return _tot;
     }
+
     /**
      * @notice Total balance (locked + unlocked) of an account.
      * @param  account Address to query.
      * @return balance Current balance of the account.
      */
-    function balanceOf(address account) external view override returns (uint64 balance) {
+    function balanceOf(
+        address account
+    ) external view override returns (uint64 balance) {
         return _acct[account].balance;
     }
+
     /**
      * @notice Tokens still locked for the current epoch.
      * @dev    If the stored window is stale, returns 0.
      * @param  holder Address to query.
      * @return locked Amount that remains locked until the epoch ends.
      */
-    function balanceOfLocked(address holder) external view returns (uint64 locked) {
+    function balanceOfLocked(
+        address holder
+    ) external view returns (uint64 locked) {
         Account storage acc = _acct[holder];
 
         // Re‐compute the epoch that governs this lock
@@ -268,7 +274,10 @@ contract StandardUtilityToken is IZRC20 {
      * @return ok      Always true on success.
      * @custom:error ZeroAddress spender is the zero address.
      */
-    function approve(address spender, uint64 value) external override returns (bool ok) {
+    function approve(
+        address spender,
+        uint64 value
+    ) external override returns (bool ok) {
         if (spender == address(0)) revert ZeroAddress(spender);
         _allow[msg.sender][spender] = value;
         emit Approval(msg.sender, spender, value);
@@ -286,7 +295,10 @@ contract StandardUtilityToken is IZRC20 {
      * @custom:error InsufficientUnlocked Unlocked balance is less than value.
      * @custom:error ZeroAddress         Recipient is the zero address.
      */
-    function transfer(address to, uint64 value) external override returns (bool ok) {
+    function transfer(
+        address to,
+        uint64 value
+    ) external override returns (bool ok) {
         _xfer(msg.sender, to, value);
         return true;
     }
@@ -435,6 +447,18 @@ contract StandardUtilityToken is IZRC20 {
             emit Approval(owner_, msg.sender, cur - amt);
         }
     }
+
+    function checkSupportsOwner(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
+    }
+
+    function checkSupportsSpender(
+        address /* who */
+    ) external pure override returns (bool) {
+        return true;
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════*\
@@ -472,7 +496,7 @@ contract UtilityTokenDeployer {
         uint8 decimals_,
         uint32 lockTime_,
         address root,
-        string memory theme_ // this is supposed to be a url but not validated
+        bytes calldata extra
     ) external returns (address addr) {
         if (root == address(0)) revert ZeroAddress(root);
 
@@ -483,7 +507,7 @@ contract UtilityTokenDeployer {
             decimals_,
             lockTime_,
             root,
-            theme_
+            string(extra)
         );
         addr = address(token);
         deployed[addr] = true;

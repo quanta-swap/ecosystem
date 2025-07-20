@@ -55,6 +55,13 @@ contract MockZRC20 is IZRC20 {
         emit Transfer(f, t, amt);
     }
 
+    function checkSupportsOwner(address /* who */) external pure returns (bool) {
+        return true;
+    }
+    function checkSupportsSpender(address /* who */) external pure returns (bool) {
+        return true;
+    }
+
     function transferBatch(
         address[] calldata dst,
         uint64[] calldata wad

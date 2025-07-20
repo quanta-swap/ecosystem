@@ -38,7 +38,7 @@ contract UTDMockBadApprove is IUTD {
         uint8 dec,
         uint32,
         address root,
-        string calldata
+        bytes calldata
     ) external override returns (address) {
         ERC20BadApprove tok = new ERC20BadApprove();
         if (sup > 0) tok.mint(root, sup);
@@ -138,7 +138,7 @@ contract RocketLauncherDeployLiquidityTest is RocketLauncherTestBase {
     function testDeployLiquidity_FaultsOnApproveFailure() external {
         /* fresh launcher whose UTD mints ERC20BadApprove */
         UTDMockBadApprove bad = new UTDMockBadApprove();
-        RocketLauncher badL = new RocketLauncher(dex, bad, "x");
+        RocketLauncher badL = new RocketLauncher(dex, bad);
 
         /* rocket & deposit */
         RocketConfig memory cfg = _defaultConfig();

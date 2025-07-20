@@ -72,4 +72,57 @@ interface IZRC20 {
         uint64[] calldata wad
     ) external returns (bool success);
 
+    // For tokens that have certain on-chain compliance requirements. This
+    // allows callers to protect an intention to do something in the future.
+    function checkSupportsOwner(address who) external view returns (bool);
+    function checkSupportsSpender(address who) external view returns (bool);
+    
+}
+
+/**
+ * @title  IZRC20Helper
+ * @notice   • “Does this address *look* like an IZRC20?”  
+ *           • Checks a single, view‑only selector: `totalSupply()`.  
+ *           • Returns **true / false** – never reverts.  
+ *
+ * Rationale ────────────────────────────────────────────────────────────
+ *   IZRC20 guarantees that all externally visible balances use **uint64**.  
+ *   A compliant `totalSupply()` therefore *must*:
+ *     1. Exist (selector handled, call succeeds).  
+ *     2. Return exactly 32 bytes.  
+ *     3. Encode a value ≤ 2⁶⁴‑1.  
+ *
+ * Anything else (EOA, missing selector, revert, 256‑bit supply) => false.
+ *
+ * Limitations ─────────────────────────────────────────────────────────
+ *   • A malicious contract can spoof the check (return a 64‑bit number now,  
+ *     revert later). Wrap real interactions in `try/catch`.  
+ *   • Proxies can upgrade after you probe. If certainty is mission‑critical,  
+ *     maintain an allow‑list instead.  
+ */
+library IZRC20Helper {
+    /**
+     * @dev Best‑effort probe for IZRC20 compliance (64‑bit `totalSupply()`).
+     *
+     * @param token  Address under test.
+     * @return ok    `true` iff all three assertions above hold.
+     */
+    function isIZRC20(address token) internal view returns (bool ok) {
+        /* 1 ─ Reject externally‑owned accounts outright */
+        if (token.code.length == 0) return false;
+
+        /* 2 ─ Ask for totalSupply(); ignore any state‑changing side‑effects */
+        (bool success, bytes memory ret) = token.staticcall(
+            abi.encodeWithSelector(IZRC20.totalSupply.selector)
+        );
+        if (!(success && ret.length == 32)) return false; // selector missing or malformed
+
+        /* 3 ─ Decode the returned word and confirm it fits in 64 bits */
+        uint256 supply;
+        // Load the 32‑byte word into `supply`
+        assembly {
+            supply := mload(add(ret, 0x20))
+        }
+        return supply <= type(uint64).max;
+    }
 }

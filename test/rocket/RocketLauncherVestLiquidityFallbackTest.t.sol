@@ -31,7 +31,7 @@ contract RocketLauncherVestFallbackTest is RocketLauncherTestBase {
         )
     {
         /* 1. launcher with dex == 0x0 */
-        ndL = new RocketLauncher(IDEX(address(0)), new UTDMock(), "theme");
+        ndL = new RocketLauncher(IDEX(address(0)), new UTDMock());
 
         /* 2. rocket config & creation */
         cfg = _defaultConfig();
