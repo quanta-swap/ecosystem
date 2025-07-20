@@ -210,7 +210,8 @@ contract DEXMock is IDEX {
         address tokenB,
         uint256 amountA,
         uint256 amountB,
-        address /*to*/
+        address /*to*/,
+        bytes calldata /*extra*/
     ) external override returns (address _location, uint256 liquidity) {
         require(amountA > 0 && amountB > 0, "zero amounts");
 

@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import "./IZRC20.sol";
+// TODO! Fix locatable liquidity
+// TODO! Add a more structured approach to view functions
 
 /*─────────────────── minimal ReentrancyGuard ───────────────────*/
 abstract contract ReentrancyGuard {
@@ -119,7 +121,8 @@ interface IDEX {
         address tokenB,
         uint256 amountA,
         uint256 amountB,
-        address to
+        address to,
+        bytes calldata data
     ) external returns (address location, uint256 liquidity);
 
     /**
@@ -192,6 +195,7 @@ struct RocketConfig {
     /* Allows for one iteration cycle of essentially a ponzi scheme */
     /* The investor paying yield to other investors is the creator */
     uint64 invitingTokenSweetener; // ignored if no dex
+    bytes liquidityDeploymentData;
 }
 struct RocketState {
     uint64 totalInviteContributed;
@@ -479,11 +483,13 @@ contract RocketLauncher is ReentrancyGuard {
             percentOfLiquidityCreator: cfg_.percentOfLiquidityCreator,
             liquidityLockedUpTime: cfg_.liquidityLockedUpTime,
             liquidityDeployTime: cfg_.liquidityDeployTime,
-            invitingTokenSweetener: cfg_.invitingTokenSweetener
+            invitingTokenSweetener: cfg_.invitingTokenSweetener,
+            liquidityDeploymentData: cfg_.liquidityDeploymentData
         });
 
         offeringToken[id] = IZRC20(utility);
-        rocketState[id].poolUtility = p.supply64;
+        // Some token implementations might not give the root all of the tokens.
+        rocketState[id].poolUtility = IZRC20(utility).balanceOf(address(this));
         rocketState[id].remainingSweetener = cfg_.invitingTokenSweetener;
 
         // guards against deployer logic that caches deployments
@@ -632,8 +638,9 @@ contract RocketLauncher is ReentrancyGuard {
                 address(c.invitingToken),
                 address(utilTok),
                 s.totalInviteContributed,
-                p.supply64,
-                address(this) // LP minted to the launcher
+                IZRC20(utilTok).balanceOf(address(this)),
+                address(this), // LP minted to the launcher
+                c.liquidityDeploymentData
             )
         returns (address, uint256 mintedLP) {
             lp = mintedLP; // Keep in memory until all checks pass
