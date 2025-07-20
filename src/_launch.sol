@@ -225,6 +225,7 @@ error DuplicateUtilityToken();
 error ZeroCodeDeployed();
 error DepositTooLate(uint256, uint64, uint64);
 error OwnerNotSupported(address);
+error SpenderNotSupported(address);
 
 /**
  * @dev The DEX refused to list the (invite, utility) pair.
@@ -509,9 +510,15 @@ contract RocketLauncher is ReentrancyGuard {
         RocketConfig storage c = _cfg(id);
         RocketState storage s = rocketState[id];
 
+        IZRC20 offering = IZRC20(offeringToken[id]);
         require(
-            IZRC20(offeringToken[id]).checkSupportsOwner(msg.sender),
+            offering.checkSupportsOwner(msg.sender),
             OwnerNotSupported(msg.sender)
+        );
+
+        require(
+            offering.checkSupportsSpender(address(this)),
+            SpenderNotSupported(address(this))
         );
 
         if (s.totalLP != 0) revert AlreadyLaunched(id);
