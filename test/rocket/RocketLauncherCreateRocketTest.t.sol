@@ -77,7 +77,7 @@ contract CreateRocketTest is RocketLauncherTestBase {
 
         IZRC20 util = launcher.offeringToken(id);
         assertEq(util.balanceOf(address(launcher)), SUPPLY64, "supply");
-        assertEq(launcher.idOfUtilityToken(address(util)), id, "reverse map");
+        assertEq(launcher.rocketIdOfToken(address(util)), id, "reverse map");
     }
 
     /*──────────────────────── revert paths ───────────────────────*/

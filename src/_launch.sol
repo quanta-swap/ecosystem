@@ -296,9 +296,11 @@ contract RocketLauncher is ReentrancyGuard {
 
     uint256 public rocketCount;
     mapping(uint256 => RocketConfig) public rocketCfg;
-    mapping(uint256 => RocketState) private rocketState;
+    mapping(uint256 => RocketState) public rocketState;
     mapping(uint256 => IZRC20) public offeringToken;
-    mapping(uint256 => mapping(address => uint64)) private _deposited;
+    mapping(uint256 => mapping(address => uint64)) public deposited;
+    /// Reverse-lookup: utility-token address ⇒ rocket ID (0 → unknown).
+    mapping(address => uint256) public rocketIdOfToken;
 
     event RocketCreated(
         uint256 indexed id,
@@ -493,8 +495,8 @@ contract RocketLauncher is ReentrancyGuard {
         rocketState[id].remainingSweetener = cfg_.invitingTokenSweetener;
 
         // guards against deployer logic that caches deployments
-        if (_rocketIdOfToken[utility] != 0) revert DuplicateUtilityToken();
-        _rocketIdOfToken[utility] = id;
+        if (rocketIdOfToken[utility] != 0) revert DuplicateUtilityToken();
+        rocketIdOfToken[utility] = id;
 
         emit RocketCreated(
             id,
@@ -537,7 +539,7 @@ contract RocketLauncher is ReentrancyGuard {
             );
 
         // ---------- 1. read‑only state, nothing mutated yet ----------
-        uint64 prevUser = _deposited[id][msg.sender];
+        uint64 prevUser = deposited[id][msg.sender];
         uint64 prevTot = s.totalInviteContributed;
 
         // ---------- 2. external interaction ----------
@@ -552,7 +554,7 @@ contract RocketLauncher is ReentrancyGuard {
         );
 
         // ---------- 3. storage mutation ----------
-        _deposited[id][msg.sender] = prevUser + amount;
+        deposited[id][msg.sender] = prevUser + amount;
         s.totalInviteContributed = prevTot + amount;
 
         emit Deposited(id, msg.sender, amount);
@@ -801,7 +803,7 @@ contract RocketLauncher is ReentrancyGuard {
         }
 
         /*──────────────── CONTRIBUTORS (FALL‑THROUGH) ───────────────*/
-        uint64 contributed = _deposited[id][msg.sender];
+        uint64 contributed = deposited[id][msg.sender];
         if (contributed == 0) revert NothingToClaim(id);
 
         uint64 owedUtil = uint64(
@@ -810,7 +812,7 @@ contract RocketLauncher is ReentrancyGuard {
         if (owedUtil == 0) revert NothingToClaim(id);
 
         /* defensive‑write before any external transfer */
-        _deposited[id][msg.sender] = 0;
+        deposited[id][msg.sender] = 0;
 
         /* 1. transfer utility tokens */
         require(
@@ -894,7 +896,7 @@ contract RocketLauncher is ReentrancyGuard {
             id,
             s,
             c,
-            _deposited[id][msg.sender],
+            deposited[id][msg.sender],
             vestedGlobal,
             msg.sender
         );
@@ -933,7 +935,7 @@ contract RocketLauncher is ReentrancyGuard {
         /* 5 ─ NEW: proportional sweetener yield */
         uint64 sweet = 0;
         if (s.remainingSweetener != 0 && msg.sender != c.offeringCreator) {
-            uint64 contributed = _deposited[id][msg.sender];
+            uint64 contributed = deposited[id][msg.sender];
             // Guard against div‑by‑zero: creator slice removed above guarantees >0
             sweet = uint64(
                 (uint256(s.remainingSweetener) * contributed) /
@@ -1068,87 +1070,6 @@ contract RocketLauncher is ReentrancyGuard {
     }
 
     /*═══════════════════════ state-query helpers ═══════════════════════*/
-
-    /**
-     * @notice Total amount of inviting tokens contributed to rocket `id`.
-     */
-    function totalInviteContributed(uint256 id) external view returns (uint64) {
-        return rocketState[id].totalInviteContributed;
-    }
-
-    /**
-     * @notice Total LP minted for rocket `id` at launch.
-     */
-    function totalLP(uint256 id) external view returns (uint256) {
-        return rocketState[id].totalLP;
-    }
-
-    /**
-     * @notice Vested LP already withdrawn from the pool for rocket `id`.
-     */
-    function lpPulled(uint256 id) external view returns (uint256) {
-        return rocketState[id].lpPulled;
-    }
-
-    /**
-     * @notice Inviting-token balance currently held by the launcher for rocket `id`.
-     */
-    function poolInvite(uint256 id) external view returns (uint64) {
-        return rocketState[id].poolInvite;
-    }
-
-    function invitation(uint256 id) external view returns (address, uint64) {
-        RocketConfig storage c = rocketCfg[id];
-        return (address(c.invitingToken), c.invitingTokenSweetener);
-    }
-
-    /**
-     * @notice Utility-token balance currently held by the launcher for rocket `id`.
-     */
-    function poolUtility(uint256 id) external view returns (uint64) {
-        return rocketState[id].poolUtility;
-    }
-
-    /**
-     * @notice Inviting tokens deposited by `who` into rocket `id`.
-     */
-    function deposited(uint256 id, address who) external view returns (uint64) {
-        return _deposited[id][who];
-    }
-
-    /**
-     * @notice LP that `who` has already claimed for rocket `id` (fixed-point).
-     */
-    function claimedLP(
-        uint256 id,
-        address who
-    ) external view returns (uint256) {
-        return rocketState[id].claimedLP[who];
-    }
-
-    function isFaulted(uint256 id) external view returns (bool) {
-        return rocketState[id].isFaulted;
-    }
-
-    /// Reverse-lookup: utility-token address ⇒ rocket ID (0 → unknown).
-    mapping(address => uint256) private _rocketIdOfToken;
-
-    /*────────────────────  public views  ───────────────────*/
-    /// @notice Rocket ID that produced `token` (0 if none).
-    /// @param  token  Utility-token address to check.
-    /// @return id     Rocket ID (starts at 1) or 0 when unknown.
-    function idOfUtilityToken(
-        address token
-    ) external view returns (uint256 id) {
-        return _rocketIdOfToken[token];
-    }
-
-    /// @notice Quick boolean test that `token` belongs to this launcher.
-    /// @param  token  Utility-token address to verify.
-    /// @return ok     True iff `token` was minted by one of this launcher’s rockets.
-    function verify(address token) external view returns (bool ok) {
-        return _rocketIdOfToken[token] != 0;
-    }
 
     // HELPERS
 
