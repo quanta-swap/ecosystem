@@ -26,11 +26,16 @@ contract UTDMockBad is IUTD {
         string calldata s,
         uint64 /*sup*/,
         uint8 dec,
-        uint32,
         address /*root*/,
         bytes calldata
     ) external override returns (address) {
         return address(new ERC20Mock(n, s, dec)); // zero supply
+    }
+
+    function verify(
+        address /* coin */
+    ) external pure override returns (bool isDeployed) {
+        return true;
     }
 }
 

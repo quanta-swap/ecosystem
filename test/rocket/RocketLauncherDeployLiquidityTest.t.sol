@@ -36,13 +36,18 @@ contract UTDMockBadApprove is IUTD {
         string calldata s,
         uint64 sup,
         uint8 dec,
-        uint32,
         address root,
         bytes calldata
     ) external override returns (address) {
         ERC20BadApprove tok = new ERC20BadApprove();
         if (sup > 0) tok.mint(root, sup);
         return address(tok);
+    }
+
+    function verify(
+        address /* coin */
+    ) external pure override returns (bool isDeployed) {
+        return true;
     }
 }
 

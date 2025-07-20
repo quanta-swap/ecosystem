@@ -914,9 +914,8 @@ contract StandardUtilityTokenTest is Test {
             symbol_,
             supply64,
             decs,
-            LOCK_TIME,
             root,
-            bytes("google.com")
+            abi.encode(LOCK_TIME, "google.com")
         );
         assertTrue(tokAddr != address(0), "factory returned zero address");
 
@@ -935,14 +934,14 @@ contract StandardUtilityTokenTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(ZeroAddress.selector, address(0))
         );
-        dep.create("X", "X", 1, 9, LOCK_TIME, address(0), bytes("google.com"));
+        dep.create("X", "X", 1, 9, address(0), abi.encode(LOCK_TIME, "google.com"));
     }
 
     function testDeployerLockTimeZeroRevert() public {
         UtilityTokenDeployer dep = new UtilityTokenDeployer();
 
         vm.expectRevert(abi.encodeWithSelector(LockTimeZero.selector));
-        dep.create("X", "X", 1, 9, 0, AL, bytes("google.com")); // lockTime_ == 0 bubbles up
+        dep.create("X", "X", 1, 9, AL, abi.encode(0, "google.com")); // lockTime_ == 0 bubbles up
     }
 
     function testCreateEmitsDeployedEvent() public {
@@ -958,9 +957,8 @@ contract StandardUtilityTokenTest is Test {
             "UTK",
             1_000_000,
             9,
-            1 hours,
             address(this),
-            bytes("google.com")
+            abi.encode(1 hours, "google.com")
         );
 
         assertTrue(token != address(0), "token addr is zero");
@@ -987,9 +985,8 @@ contract StandardUtilityTokenTest is Test {
             "THM",
             10_000 * uint64(ONE_TOKEN),
             9,
-            LOCK_TIME,
             AL, // root holder
-            bytes(themeStr) // ← theme argument under test
+            abi.encode(LOCK_TIME, themeStr)
         );
 
         // Verify the getter on the deployed token
@@ -1010,9 +1007,8 @@ contract StandardUtilityTokenTest is Test {
             "VM",
             123_456 * uint64(ONE_TOKEN),
             9,
-            LOCK_TIME,
             AL, // root / initial holder,
-            bytes("google.com")
+            abi.encode(LOCK_TIME, "google.com")
         );
         assertTrue(token != address(0), "token should not be zero");
 
@@ -1049,9 +1045,8 @@ contract StandardUtilityTokenTest is Test {
             "AUTH",
             10_000 * uint64(ONE_TOKEN),
             9,
-            LOCK_TIME,
             AL, // root holder
-            bytes("auth.test")
+            abi.encode(LOCK_TIME, "auth.test")
         );
 
         /* 3. check the immutable field */

@@ -5,6 +5,7 @@ pragma solidity ^0.8.24;
 │                           IZRC-20 interface (64-bit)                   │
 \*═══════════════════════════════════════════════════════════════════════*/
 import {IZRC20} from "./IZRC20.sol";
+import {IUTD} from "./_launch.sol";
 
 /*══════════════════════════════ Custom errors ═════════════════════════*/
 /// Zero address supplied where non-zero required.
@@ -473,7 +474,7 @@ event Deployed(address indexed which);
  *         Protocol Research Engineer, Official Finance LLC. 
  * @notice Allows users to deploy verifiably twice-audited utility tokens.
  */
-contract UtilityTokenDeployer {
+contract UtilityTokenDeployer is IUTD {
     /**
      * @notice Deploy a new {StandardUtilityToken} with a fixed supply.
      * @dev    • All tokens are minted to `root`.  
@@ -483,8 +484,8 @@ contract UtilityTokenDeployer {
      * @param  symbol_    Token symbol.
      * @param  supply64   Fixed supply (≤ 2⁶⁴−1).
      * @param  decimals_  Display decimals.
-     * @param  lockTime_  Epoch duration in seconds (must be > 0).
      * @param  root       Address that will receive the full supply.
+     * @param extra      Extra data to be stored in the token (e.g. lock time, theme).
      * @return addr       Address of the deployed token.
      * @custom:error ZeroAddress  root is the zero address.
      * @custom:error LockTimeZero lockTime_ is zero (propagated from token).
@@ -494,12 +495,12 @@ contract UtilityTokenDeployer {
         string calldata symbol_,
         uint64 supply64,
         uint8 decimals_,
-        uint32 lockTime_,
         address root,
         bytes calldata extra
     ) external returns (address addr) {
         if (root == address(0)) revert ZeroAddress(root);
-
+        (uint32 lockTime_, string memory theme_) = abi.decode(extra, (uint32, string));
+        require(lockTime_ > 0, LockTimeZero());
         StandardUtilityToken token = new StandardUtilityToken(
             name_,
             symbol_,
@@ -507,7 +508,7 @@ contract UtilityTokenDeployer {
             decimals_,
             lockTime_,
             root,
-            string(extra)
+            theme_
         );
         addr = address(token);
         deployed[addr] = true;

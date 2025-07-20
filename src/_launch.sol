@@ -22,10 +22,10 @@ interface IUTD {
         string calldata,
         uint64,
         uint8,
-        uint32,
         address,
         bytes calldata
     ) external returns (address);
+    function verify(address coin) external view returns (bool isDeployed);
 }
 
 interface IDEX {
@@ -432,9 +432,8 @@ contract RocketLauncher is ReentrancyGuard {
             p.symbol,
             p.supply64,
             p.decimals,
-            p.lockTime,
             address(this), // launcher owns root authority
-            bytes(p.theme)
+            abi.encode(p.lockTime, p.theme)
         );
         if (utility.code.length == 0) revert ZeroCodeDeployed();
 
