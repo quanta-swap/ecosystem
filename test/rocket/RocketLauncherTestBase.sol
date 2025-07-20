@@ -101,8 +101,7 @@ abstract contract RocketLauncherTestBase is Test {
             symbol:    "UTK",
             supply64:  SUPPLY64,
             decimals:  9,
-            lockTime:  LOCKTIME,
-            theme:     "ipfs://token-theme"
+            extra: abi.encode(LOCKTIME, "ipfs://token-theme")
         });
 
         cfg = RocketConfig({

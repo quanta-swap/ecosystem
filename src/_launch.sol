@@ -179,8 +179,7 @@ struct UtilityTokenParams {
     string symbol;
     uint64 supply64;
     uint8 decimals;
-    uint32 lockTime;
-    string theme;
+    bytes extra;
 }
 struct RocketConfig {
     address offeringCreator;
@@ -433,7 +432,7 @@ contract RocketLauncher is ReentrancyGuard {
             p.supply64,
             p.decimals,
             address(this), // launcher owns root authority
-            abi.encode(p.lockTime, p.theme)
+            p.extra
         );
         if (utility.code.length == 0) revert ZeroCodeDeployed();
 
