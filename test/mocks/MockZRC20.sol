@@ -58,7 +58,7 @@ contract MockZRC20 is IZRC20 {
     function checkSupportsOwner(address /* who */) external pure returns (bool) {
         return true;
     }
-    function checkSupportsSpender(address /* who */) external pure returns (bool) {
+    function checkSupportsMover(address /* who */) external pure returns (bool) {
         return true;
     }
 

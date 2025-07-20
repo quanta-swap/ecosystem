@@ -75,7 +75,7 @@ interface IZRC20 {
     // For tokens that have certain on-chain compliance requirements. This
     // allows callers to protect an intention to do something in the future.
     function checkSupportsOwner(address who) external view returns (bool);
-    function checkSupportsSpender(address who) external view returns (bool);
+    function checkSupportsMover(address who) external view returns (bool);
     
 }
 

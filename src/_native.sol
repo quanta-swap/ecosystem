@@ -1341,7 +1341,7 @@ contract WrappedQRL is
         return true;
     }
 
-    function checkSupportsSpender(
+    function checkSupportsMover(
         address /* who */
     ) external pure override returns (bool) {
         return true;

@@ -455,7 +455,7 @@ contract StandardUtilityToken is IZRC20 {
         return true;
     }
 
-    function checkSupportsSpender(
+    function checkSupportsMover(
         address /* who */
     ) external pure override returns (bool) {
         return true;

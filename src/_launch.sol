@@ -517,7 +517,7 @@ contract RocketLauncher is ReentrancyGuard {
         );
 
         require(
-            offering.checkSupportsSpender(address(this)),
+            offering.checkSupportsMover(address(this)),
             SpenderNotSupported(address(this))
         );
 
