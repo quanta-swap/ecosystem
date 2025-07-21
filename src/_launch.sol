@@ -123,7 +123,7 @@ interface IDEX {
         uint256 amountB,
         address to,
         bytes calldata data
-    ) external returns (address location, uint256 liquidity);
+    ) external returns (uint64 location, uint256 liquidity);
 
     /**
      * @notice Burn `liquidity` LP tokens held by the caller and sweep the
@@ -169,6 +169,7 @@ interface IDEX {
     function withdrawLiquidity(
         address tokenA,
         address tokenB,
+        uint64 location,
         uint256 liquidity,
         address to,
         uint64 minA,

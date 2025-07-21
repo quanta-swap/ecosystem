@@ -402,7 +402,7 @@ contract PQSE {
     IZRC20 public immutable FREE; // fee discount token
 
     uint32 public constant MAX_FEE = 6442450; // 0.30%
-    uint32 public constant PRO_FEE = 536870911; // 25%
+    uint32 public constant PRO_FEE = 0; // no comment...
     uint32 public constant MIN_TIF = 10 minutes;
     uint32 public constant MIN_LIQ = 1_000;
     uint32 public constant MAX_TIP = 64424509; // 3%
@@ -410,10 +410,11 @@ contract PQSE {
     mapping(IZRC20 => mapping(IZRC20 => Pool)) public pools; // reserve => secured => Pool
     mapping(address => mapping(address => uint64)) public broke; // owner => broker => approved
     mapping(address => uint64) public profit; // reserved fees collected for protocol
+    mapping(uint64 => uint256) public shares;
 
-    // "Two nukes."
+    // quantaswap@gmail.com
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=ekM0VflXyok";
+        return "https://www.youtube.com/watch?v=BS0T8Cd4UhA";
     }
 
     function approve(address broker, uint64 expires) external {
@@ -468,7 +469,7 @@ contract PQSE {
             return false;
         }
 
-        // EXTREMELY IMPORTANT!
+        // EXTREMELY IMPORTANT! "Can this random person own the token?"
         if (!IZRC20(reserve).checkSupportsOwner(owner)) return false;
 
         return _isSupported(reserve) && _isSupported(secured);
@@ -719,7 +720,7 @@ contract PQSE {
             if (
                 o.securedAmount == 0 ||
                 o.reserveToSecuredTick >= o.securedToReserveTick ||
-                o.expiryTime != 0 && o.expiryTime <= block.timestamp
+                (o.expiryTime != 0 && o.expiryTime <= block.timestamp)
             ) continue;
 
             /* Effective order price (fee‑adjusted). */
@@ -799,8 +800,8 @@ contract PQSE {
             /* Skip inactive / crossed orders. */
             if (
                 o.reserveAmount == 0 ||
-                o.reserveToSecuredTick >= o.securedToReserveTick || 
-                o.expiryTime != 0 && o.expiryTime <= block.timestamp
+                o.reserveToSecuredTick >= o.securedToReserveTick ||
+                (o.expiryTime != 0 && o.expiryTime <= block.timestamp)
             ) continue;
 
             /* Order’s reserve‑per‑secured price. */
@@ -1290,7 +1291,7 @@ contract PQSE {
      * @return reserveOut Net reserve tokens delivered to secured suppliers.
      * @return securedOut Net secured tokens delivered to reserve suppliers.
      */
-    function execute(
+    function action(
         Cross calldata cross,
         uint64 free,
         uint64 tip
@@ -1306,6 +1307,8 @@ contract PQSE {
         Pair memory pair = cross.pair;
         Pool storage pool = pools[pair.reserve][pair.secured];
 
+        require(pool.shares > 0, "pool: empty");
+
         /*──────────────── 2. INPUT‑SIDE FEE ─────────────────*/
         uint32 discountQ32 = EssentialHelpers.discount32(FREE, free);
         result.reserveIn = _applyFee(
@@ -1314,7 +1317,7 @@ contract PQSE {
             result.reserveIn,
             discountQ32,
             uint32(tip),
-            /*outside=*/ true
+            /*outside=*/ false // embedded
         );
 
         /*──────────────── 3. CORE MATCHING ─────────────────*/
@@ -1693,15 +1696,327 @@ contract PQSE {
         }
     }
 
+    /**
+     * @notice Bootstrap an AMM pool by seeding its initial reserves.
+     *         The caller deposits **exactly** `amountA` of `tokenA`
+     *         **and** `amountB` of `tokenB`, receiving pool‑share
+     *         “LP tokens” in return.
+     *
+     * Requirements & assumptions
+     * ──────────────────────────
+     * • `tokenA` and `tokenB` must be *distinct* and individually satisfy
+     *   {_isSupported}.
+     * • The `(tokenA, tokenB)` ordering **defines** the pool direction:
+     *     – `tokenA` → reserve
+     *     – `tokenB` → secured
+     * • The very first liquidity provider **must** contribute at least
+     *   `MIN_LIQ` units *per side*; subsequent adds reuse Uniswap‑V2 maths
+     *   and inherit the minted‑LP quota from the current reserve ratio.
+     * • Errors **never** leave funds stuck: a failure prior to updating
+     *   contract state simply reverts and leaves balances unchanged.
+     *
+     * @param tokenA   Reserve‑side token.
+     * @param tokenB   Secured‑side token.
+     * @param amountA  Exact reserve tokens supplied by the caller.
+     * @param amountB  Exact secured tokens supplied by the caller.
+     * @param to       Address that will receive the minted LP position.
+     * @param data     Arbitrary hook data (currently unused).
+     *
+     * @return loc         Unique ID of the LP position (uint64 namespace).
+     * @return liquidity   Amount of pool‑shares minted to `to`.
+     */
+    function initializeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountA,
+        uint256 amountB,
+        address to,
+        bytes calldata data
+    ) external returns (uint64 loc, uint256 liquidity) {
+        /*─────────────────── 1. sanity & support checks ──────────────────*/
+        require(this.checkSupportsPair(tokenA, tokenB), "unsupported pair");
+
+        /*─────────────────── 2. canonicalise pair & storage refs ─────────*/
+        Pair memory pair = Pair(IZRC20(tokenA), IZRC20(tokenB));
+        Pool storage pool = pools[pair.reserve][pair.secured];
+
+        /*─────────────────── 3. pull funds (exact‑semantics) ─────────────*/
+        // – reserve side
+        require(
+            pair.reserve.transferFrom(
+                msg.sender,
+                address(this),
+                uint64(amountA)
+            ),
+            "reserve pull"
+        );
+        // – secured side
+        require(
+            pair.secured.transferFrom(
+                msg.sender,
+                address(this),
+                uint64(amountB)
+            ),
+            "secured pull"
+        );
+
+        /*─────────────────── 4. calculate LP to mint ─────────────────────*/
+        if (pool.shares == 0) {
+            /* First liquidity: geometric mean, ≥ MIN_LIQ^2 so > 0.  */
+            liquidity = _sqrt(amountA * amountB);
+        } else {
+            /* Subsequent adds: proportional to existing reserves.    */
+            uint256 liqByRes = (amountA * pool.shares) / pool.reserve;
+            uint256 liqBySec = (amountB * pool.shares) / pool.secured;
+            liquidity = liqByRes < liqBySec ? liqByRes : liqBySec;
+        }
+        require(liquidity > 0, "zero liquidity");
+
+        /*─────────────────── 5. update pool balances & shares ────────────*/
+        pool.reserve += uint64(amountA); // fits 64‑bit domain
+        pool.secured += uint64(amountB);
+        pool.shares += uint128(liquidity);
+
+        /*─────────────────── 6. record LP position for caller ────────────*/
+        loc = ++boop; // unique ID in the global nonce space
+        shares[loc] = liquidity - MIN_LIQ; // bookkeeping for future burns/moves
+
+        /*─────────────────── 7. send LP receipt to `to` ──────────────────*/
+        // For now the LP position is an internal ID; if/when an ERC‑20
+        // wrapper is introduced, mint to `to` here.  A direct transfer of
+        // “ownership” is sufficient at this stage.
+        if (to == address(0)) revert ZeroAddress(to);
+        pool.owners[loc] = to; // simple mapping already exists
+
+        /*─────────────────── 8. hook / ext‑integration (future‑proof) ───*/
+        if (data.length != 0) {
+            // Placeholder for potential callback integrations; ignored now.
+            // solhint-disable-next-line no-empty-blocks
+        }
+    }
+
+    /*══════════════════════════════ Custom errors ═════════════════════════*/
+    /// LP position does not belong to (or is not delegated to) `caller`.
+    error NotLpOwner(uint64 loc, address caller);
+
+    /// Caller tried to burn more shares than they hold.
+    error InsufficientShares(uint256 have, uint256 need);
+
+    /// Output amounts fall below the caller‑supplied minima.
+    error SlippageExceeded(uint64 outA, uint64 outB, uint64 minA, uint64 minB);
+
+    /**
+     * @notice Burn `liquidity` pool‑shares from an LP position and withdraw the
+     *         underlying reserves to `to`.
+     *
+     * @dev    Calculation is **fully proportional** – no protocol skim / tax
+     *         beyond the 64‑bit domain enforced elsewhere.
+     *
+     *         Ownership paths mirror order cancelling:
+     *         – Direct owner can burn at will.
+     *         – A broker may act if explicitly approved and un‑expired.
+     *
+     * @param tokenA     Must match the pool’s *reserve* token.
+     * @param tokenB     Must match the pool’s *secured* token.
+     * @param location   LP position ID obtained from {initializeLiquidity}.
+     * @param liquidity  Exact pool‑shares to burn (1 : 1 with `pool.shares`).
+     * @param to         Recipient of the underlying tokens.
+     * @param minA       Minimum reserve tokens expected (slippage guard).
+     * @param minB       Minimum secured tokens expected (slippage guard).
+     *
+     * @return amountA   Reserve tokens actually transferred.
+     * @return amountB   Secured tokens actually transferred.
+     */
+    function withdrawLiquidity(
+        address tokenA,
+        address tokenB,
+        uint64 location,
+        uint256 liquidity,
+        address to,
+        uint64 minA,
+        uint64 minB
+    ) external returns (uint64 amountA, uint64 amountB) {
+        /*──────────────── 0. sanity checks ─────────────────────────────*/
+        if (to == address(0)) revert ZeroAddress(to);
+        require(liquidity != 0, "zero burn");
+
+        /*──────────────── 1. pool lookup & ownership gating ────────────*/
+        Pair memory pair = Pair(IZRC20(tokenA), IZRC20(tokenB));
+        Pool storage pool = pools[pair.reserve][pair.secured];
+
+        address lpOwner = pool.owners[location];
+        if (
+            lpOwner == address(0) || // unknown ID
+            (msg.sender != lpOwner && // neither owner
+                broke[lpOwner][msg.sender] < block.timestamp) // nor live proxy
+        ) revert NotLpOwner(location, msg.sender);
+
+        uint256 owned = shares[location];
+        if (liquidity > owned) revert InsufficientShares(owned, liquidity);
+
+        /*──────────────── 2. proportional token amounts ───────────────*/
+        // amountX = liquidity * pool.X / pool.shares  (all 256‑bit math)
+        amountA = uint64((liquidity * pool.reserve) / pool.shares);
+        amountB = uint64((liquidity * pool.secured) / pool.shares);
+
+        /*──────────────── 3. caller‑supplied slippage guard ───────────*/
+        if (amountA < minA || amountB < minB)
+            revert SlippageExceeded(amountA, amountB, minA, minB);
+
+        /*──────────────── 4. state updates (checks‑effects‑interact) ──*/
+        pool.reserve -= amountA;
+        pool.secured -= amountB;
+        pool.shares -= uint128(liquidity);
+
+        uint256 remaining = owned - liquidity;
+        if (remaining == 0) {
+            delete pool.owners[location];
+            delete shares[location];
+        } else {
+            shares[location] = remaining;
+        }
+
+        /*──────────────── 5. token transfers – cannot fail on IZRC20 ─*/
+        pair.reserve.transfer(to, amountA);
+        pair.secured.transfer(to, amountB);
+    }
+
+    /**
+     * @notice Add liquidity to an **existing** AMM pool position or mint a new
+     *         one, returning its `loc` (ID) and the newly‑minted `liquidity`.
+     *
+     * Requirements & behaviour
+     * ────────────────────────
+     * • `tokenA`/`tokenB` **must** match the pool’s reserve/secured order.
+     * • The pool **must already exist** (i.e. `pool.shares > 0`).
+     * • `location == 0`
+     *     ‑ A brand‑new LP position is created for `to`.
+     * • `location != 0`
+     *     ‑ Adds to an existing position; caller must own or be an approved
+     *       broker (same rules as {withdrawLiquidity}).
+     * • At most **two ERC‑20 transfers** are executed (reserve + secured).
+     * • Price‑ratio slippage is enforced via `amountAMin` / `amountBMin`.
+     *
+     * Gas notes
+     * ─────────
+     * • All intermediates remain in 256‑bit; pool storage is 64‑bit.
+     * • Helpers are deliberately avoided to keep the stack shallow.
+     *
+     * @param tokenA         Reserve token (must match pool.reserve).
+     * @param tokenB         Secured token (must match pool.secured).
+     * @param location       LP position ID to top‑up (0 → create new).
+     * @param amountADesired Caller’s exact reserve tokens offered.
+     * @param amountBDesired Caller’s exact secured tokens offered.
+     * @param amountAMin     Minimum reserve accepted (slippage guard).
+     * @param amountBMin     Minimum secured accepted (slippage guard).
+     * @param to             Recipient / owner of the LP position.
+     *
+     * @return loc           LP position ID that received the liquidity.
+     * @return liquidity     Pool‑shares minted in this call.
+     */
+    function depositLiquidity(
+        address tokenA,
+        address tokenB,
+        uint64 location,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to
+    ) external returns (uint64 loc, uint256 liquidity) {
+        /*────────────────── 0. basic sanity ───────────────────*/
+        require(to != address(0), "zero to");
+        require(amountADesired != 0 && amountBDesired != 0, "zero input");
+
+        /*────────────────── 1. pool lookup ────────────────────*/
+        Pair memory pair = Pair(IZRC20(tokenA), IZRC20(tokenB));
+        Pool storage pool = pools[pair.reserve][pair.secured];
+        require(pool.shares > 0, "pool: un-initialised");
+
+        /*────────────────── 2. ownership gating ───────────────*/
+        if (location != 0) {
+            address lpOwner = pool.owners[location];
+            if (
+                lpOwner == address(0) || // unknown ID
+                (msg.sender != lpOwner &&
+                    broke[lpOwner][msg.sender] < block.timestamp)
+            ) revert NotLpOwner(location, msg.sender);
+        }
+
+        /*────────────────── 3. optimal amounts ────────────────*
+         * Keep pool price constant: amountB = amountA * S / R  */
+        uint256 R = pool.reserve;
+        uint256 S = pool.secured;
+
+        uint256 amountBOptimal = (amountADesired * S) / R;
+
+        uint256 amountA;
+        uint256 amountB;
+
+        if (amountBOptimal <= amountBDesired) {
+            // use all A, cap B
+            amountA = amountADesired;
+            amountB = amountBOptimal;
+        } else {
+            // too much A – recompute using all B
+            uint256 amountAOptimal = (amountBDesired * R) / S;
+            amountA = amountAOptimal;
+            amountB = amountBDesired;
+        }
+
+        /* slippage protection */
+        require(amountA >= amountAMin && amountB >= amountBMin, "slippage");
+
+        /*────────────────── 4. pull funds (≤ 2 transfers) ─────*/
+        require(
+            pair.reserve.transferFrom(
+                msg.sender,
+                address(this),
+                uint64(amountA)
+            ),
+            "reserve pull"
+        );
+        require(
+            pair.secured.transferFrom(
+                msg.sender,
+                address(this),
+                uint64(amountB)
+            ),
+            "secured pull"
+        );
+
+        /*────────────────── 5. mint liquidity ─────────────────*
+         * liquidity = min( amountA * shares / R ,
+         *                  amountB * shares / S )              */
+        uint256 liqByA = (amountA * pool.shares) / R;
+        uint256 liqByB = (amountB * pool.shares) / S;
+        liquidity = liqByA < liqByB ? liqByA : liqByB;
+        require(liquidity > 0, "zero liquidity");
+
+        /*────────────────── 6. update pool balances ───────────*/
+        pool.reserve += uint64(amountA); // fits 64‑bit
+        pool.secured += uint64(amountB);
+        pool.shares += uint128(liquidity);
+
+        /*────────────────── 7. LP position accounting ─────────*/
+        if (location == 0) {
+            loc = ++boop; // new ID
+            pool.owners[loc] = to;
+        } else {
+            loc = location; // topping‑up
+        }
+        shares[loc] += liquidity;
+
+        /*────────────────── 8. return values ──────────────────*/
+        // (loc, liquidity) already set
+    }
+
     constructor(address freeToken) {
         require(freeToken != address(0), "zero free");
         FREE = IZRC20(freeToken);
         boop++;
     }
-
 }
 
-
 // "Just fork Uniswap!"
-// Go ahead and do it.
-// ...
+// It's not efficient.
