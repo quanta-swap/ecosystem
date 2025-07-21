@@ -20,12 +20,12 @@ abstract contract ReentrancyGuard {
 
 interface IUTD {
     function create(
-        string calldata,
-        string calldata,
-        uint64,
-        uint8,
-        address,
-        bytes calldata
+        string calldata name,
+        string calldata symbol,
+        uint64 initialSupply,
+        uint8 decimals,
+        address root,
+        bytes calldata extra
     ) external returns (address);
     function verify(address coin) external view returns (bool isDeployed);
 }
@@ -528,6 +528,27 @@ contract RocketLauncher is ReentrancyGuard {
             offering.checkSupportsMover(address(this)),
             SpenderNotSupported(address(this))
         );
+
+        // check if the dex is a supported mover and owner
+        if (address(dex) != address(0)) {
+            require(
+                c.invitingToken.checkSupportsOwner(msg.sender),
+                OwnerNotSupported(msg.sender)
+            );
+            require(
+                c.invitingToken.checkSupportsMover(address(this)),
+                SpenderNotSupported(address(this))
+            );
+
+            require(
+                offering.checkSupportsOwner(msg.sender),
+                OwnerNotSupported(msg.sender)
+            );
+            require(
+                offering.checkSupportsMover(address(this)),
+                SpenderNotSupported(address(this))
+            );
+        }
 
         if (s.totalLP != 0) revert AlreadyLaunched(id);
         if (s.isFaulted) revert RocketFaulted(id);
