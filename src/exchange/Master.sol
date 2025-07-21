@@ -322,6 +322,7 @@ library EssentialHelpers {
  * - Limit orders are in-force for at least 10 minutes, to ensure stability.
  */
 
+// REMEMBER: Best execution is a !LEGAL! requirement in many jurisdictions.
 contract PQSE {
     using IZRC20Helper for address;
 
@@ -343,12 +344,39 @@ contract PQSE {
 
     struct Cross {
         Pair pair;
+        Maker[] makers;
         Resource[] reserveInputs;
         uint64[] reserveOrders;
         Resource[] securedInputs;
         uint64[] securedOrders;
         uint24 minStrikePrice;
         uint24 maxStrikePrice;
+        Taker[] takers;
+    }
+
+    struct Maker {
+        address owner;
+        Order[] orders;
+        Patch[] patches;
+    }
+
+    struct Patch {
+        // specifies which index in reserve to patch
+        uint16 reserveOrdersIdx; // max is sentinel
+        // specifies which index in secured to patch
+        uint16 securedOrdersIdx; // max is sentinel
+        // it is possible for both of these to be relevant; if so, both are applied
+        // if both are sentinel, this is a no-op
+    }
+
+    struct Taker {
+        address owner;
+        uint64[] orders;
+    }
+
+    struct Convo {
+        uint16 makerIdx;
+        uint16 orderIdx;
     }
 
     struct Order {
@@ -377,6 +405,7 @@ contract PQSE {
     uint32 public constant PRO_FEE = 536870911; // 25%
     uint32 public constant MIN_TIF = 10 minutes;
     uint32 public constant MIN_LIQ = 1_000;
+    uint32 public constant MAX_TIP = 64424509; // 3%
 
     mapping(IZRC20 => mapping(IZRC20 => Pool)) public pools; // reserve => secured => Pool
     mapping(address => mapping(address => uint64)) public broke; // owner => broker => approved
@@ -452,6 +481,49 @@ contract PQSE {
         uint64 securedIn;
         Resource[] securedRes;
         uint64 securedLen;
+    }
+
+    // 0xffff (= uint16.max) means “no slot to patch”.
+    uint16 constant SENTINEL = type(uint16).max;
+    function brokify(Cross memory cross) internal {
+        Pair memory pair = cross.pair;
+        /*─────────────────────── 1. makers ───────────────────────*/
+        for (uint m = 0; m < cross.makers.length; ++m) {
+            Maker memory mk = cross.makers[m];
+            uint ordersLen = mk.orders.length;
+            if (ordersLen == 0) continue; // nothing to place
+
+            // exactly ONE makeOrders call per maker
+            uint64 firstId = makeOrders(pair, mk.owner, mk.orders);
+            if (firstId == 0) continue; // creation failed → skip patches
+
+            // patch reserve / secured books
+            uint patchesLen = mk.patches.length;
+            uint limit = ordersLen < patchesLen ? ordersLen : patchesLen;
+
+            for (uint i = 0; i < limit; ++i) {
+                Patch memory p = mk.patches[i];
+                uint64 globalId = firstId + uint64(i);
+
+                // reserve side
+                if (
+                    p.reserveOrdersIdx != SENTINEL &&
+                    p.reserveOrdersIdx < cross.reserveOrders.length &&
+                    cross.reserveOrders[p.reserveOrdersIdx] == 0
+                ) {
+                    cross.reserveOrders[p.reserveOrdersIdx] = globalId;
+                }
+
+                // secured side
+                if (
+                    p.securedOrdersIdx != SENTINEL &&
+                    p.securedOrdersIdx < cross.securedOrders.length &&
+                    cross.securedOrders[p.securedOrdersIdx] == 0
+                ) {
+                    cross.securedOrders[p.securedOrdersIdx] = globalId;
+                }
+            }
+        }
     }
 
     /* does not revert */
@@ -646,7 +718,8 @@ contract PQSE {
             /* Skip inactive or crossed orders. */
             if (
                 o.securedAmount == 0 ||
-                o.reserveToSecuredTick >= o.securedToReserveTick
+                o.reserveToSecuredTick >= o.securedToReserveTick ||
+                o.expiryTime != 0 && o.expiryTime <= block.timestamp
             ) continue;
 
             /* Effective order price (fee‑adjusted). */
@@ -726,7 +799,8 @@ contract PQSE {
             /* Skip inactive / crossed orders. */
             if (
                 o.reserveAmount == 0 ||
-                o.reserveToSecuredTick >= o.securedToReserveTick
+                o.reserveToSecuredTick >= o.securedToReserveTick || 
+                o.expiryTime != 0 && o.expiryTime <= block.timestamp
             ) continue;
 
             /* Order’s reserve‑per‑secured price. */
@@ -1221,12 +1295,15 @@ contract PQSE {
         uint64 free,
         uint64 tip
     ) external returns (uint64 reserveOut, uint64 securedOut) {
+        require(tip <= MAX_TIP, "tip: too high");
+        brokify(cross);
+
         /*──────────────── 1. FUND COLLECTION ────────────────*/
-        Pair memory pair = cross.pair;
         CrucifyResult memory result = crucify(cross);
 
         if (result.reserveIn == 0 && result.securedIn == 0) return (0, 0);
 
+        Pair memory pair = cross.pair;
         Pool storage pool = pools[pair.reserve][pair.secured];
 
         /*──────────────── 2. INPUT‑SIDE FEE ─────────────────*/
@@ -1261,7 +1338,7 @@ contract PQSE {
 
         /*──────────────── 5. STRIKE GUARDRAIL ──────────────*/
         // (2) average execution prices, secured / reserve (Q64.64)
-        uint128 buyPxQ64  = result.reserveIn == 0
+        uint128 buyPxQ64 = result.reserveIn == 0
             ? 0
             : uint128((uint256(securedOut) << 64) / result.reserveIn);
 
@@ -1287,6 +1364,17 @@ contract PQSE {
             result.securedRes,
             result.securedLen
         );
+
+        killify(cross);
+    }
+
+    function killify(Cross memory cross) internal {
+        for (uint t = 0; t < cross.takers.length; ++t) {
+            uint64[] memory ids = cross.takers[t].orders;
+            if (ids.length == 0) continue;
+            // a single takeOrders per taker
+            takeOrders(cross.pair, ids);
+        }
     }
 
     /**
@@ -1472,11 +1560,147 @@ contract PQSE {
         }
     }
 
+    /*═══════════════════════════════════════════════════════════════*/
+    /*                      order life‑cycle                         */
+    /*═══════════════════════════════════════════════════════════════*/
+
+    /**
+     * @dev Batch‑creates one or more limit orders owned by `orderOwner`.
+     *
+     *      • Never reverts – returns 0 if *anything* goes wrong.
+     *      • Performs **at most two ERC‑20 transfers**: one for the
+     *        aggregate reserve input and one for the aggregate secured
+     *        input (skipped if the respective total is zero).
+     *      • Returns the ID of the **first** order in the batch (or 0 on
+     *        failure).  Subsequent orders receive consecutive IDs.
+     */
+    function makeOrders(
+        Pair memory pair,
+        address orderOwner,
+        Order[] memory orders
+    ) internal returns (uint64 id) {
+        if (orders.length == 0) return 0;
+
+        uint64 boopOld = boop;
+
+        /*──────────────── 0. broker / allowance checks ─────────────*/
+        if (
+            orderOwner != msg.sender &&
+            broke[orderOwner][msg.sender] < block.timestamp
+        ) return 0; // not authorised
+
+        /*──────────────── 1. aggregate token requirements ───────────*/
+        uint64 needReserve;
+        uint64 needSecured;
+
+        unchecked {
+            for (uint i; i < orders.length; ++i) {
+                needReserve += orders[i].reserveAmount;
+                needSecured += orders[i].securedAmount;
+            }
+        }
+        if (needReserve == 0 && needSecured == 0) return 0; // nothing to do
+
+        /*──────────────── 2. pull funds (≤ 2 transfers) ─────────────*/
+        // any failure → abort *before* mutating state
+        if (needReserve != 0) {
+            try
+                pair.reserve.transferFrom(
+                    orderOwner,
+                    address(this),
+                    needReserve
+                )
+            {} catch {
+                return 0;
+            }
+        }
+        if (needSecured != 0) {
+            try
+                pair.secured.transferFrom(
+                    orderOwner,
+                    address(this),
+                    needSecured
+                )
+            {} catch {
+                if (needSecured != 0) {
+                    // refund reserve if secured pull failed
+                    pair.secured.transfer(orderOwner, needSecured);
+                }
+                return 0;
+            }
+        }
+
+        /*──────────────── 3. register orders ───────────────────────*/
+        Pool storage pool = pools[pair.reserve][pair.secured];
+        id = boop; // first order‑ID to return
+
+        for (uint i; i < orders.length; ++i) {
+            pool.orders[boop] = orders[i];
+            pool.owners[boop] = orderOwner;
+            ++boop; // monotonic – no overflow in practice
+        }
+        return boopOld;
+    }
+
+    /**
+     * @dev Cancels a batch of orders and refunds their remaining balances
+     *      to the original owner – **at most two transfers** total.
+     *
+     *      • Ignores unknown IDs or orders that have already been emptied.
+     *      • Never reverts: if a refund transfer fails, the tokens simply
+     *        remain in the contract (owner can retry later).
+     */
+    function takeOrders(Pair memory pair, uint64[] memory ids) internal {
+        if (ids.length == 0) return;
+
+        Pool storage pool = pools[pair.reserve][pair.secured];
+
+        address eOwner = address(0);
+        uint64 refundRes = 0;
+        uint64 refundSec = 0;
+
+        /*────────────── 1. gather refunds & zero orders ────────────*/
+        for (uint i; i < ids.length; ++i) {
+            Order storage o = pool.orders[ids[i]];
+            if (o.reserveAmount == 0 && o.securedAmount == 0) continue;
+
+            address oOwner = pool.owners[ids[i]];
+            if (eOwner == address(0)) eOwner = oOwner; // first owner
+            if (oOwner != eOwner) continue; // mixed owners → skip
+
+            if (
+                eOwner != msg.sender &&
+                broke[eOwner][msg.sender] < block.timestamp
+            ) return;
+
+            refundRes += o.reserveAmount;
+            refundSec += o.securedAmount;
+
+            // burn the order (gas‑cheap)
+            delete pool.orders[ids[i]];
+            delete pool.owners[ids[i]];
+        }
+
+        if (owner == address(0)) return; // nothing refundable
+
+        /*────────────── 2. ship refunds (≤ 2 transfers) ────────────*/
+        if (refundRes != 0) {
+            // ignore failures – owner can claim later via another call
+            pair.reserve.transfer(owner, refundRes);
+        }
+        if (refundSec != 0) {
+            pair.secured.transfer(owner, refundSec);
+        }
+    }
+
     constructor(address freeToken) {
         require(freeToken != address(0), "zero free");
         FREE = IZRC20(freeToken);
+        boop++;
     }
+
 }
 
 // "Just fork Uniswap!"
 // Go ahead and do it.
+// ...
