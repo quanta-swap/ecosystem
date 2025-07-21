@@ -529,27 +529,6 @@ contract RocketLauncher is ReentrancyGuard {
             SpenderNotSupported(address(this))
         );
 
-        // check if the dex is a supported mover and owner
-        if (address(dex) != address(0)) {
-            require(
-                c.invitingToken.checkSupportsOwner(address(dex)),
-                OwnerNotSupported(address(dex))
-            );
-            require(
-                c.invitingToken.checkSupportsMover(address(dex)),
-                SpenderNotSupported(address(dex))
-            );
-
-            require(
-                offering.checkSupportsOwner(address(dex)),
-                OwnerNotSupported(address(dex))
-            );
-            require(
-                offering.checkSupportsMover(address(dex)),
-                SpenderNotSupported(address(dex))
-            );
-        }
-
         if (s.totalLP != 0) revert AlreadyLaunched(id);
         if (s.isFaulted) revert RocketFaulted(id);
         if (block.timestamp >= c.liquidityDeployTime)
