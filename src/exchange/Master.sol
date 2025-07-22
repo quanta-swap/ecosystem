@@ -329,9 +329,42 @@ contract PQSE is ReentrancyGuard {
 
     address public immutable owner;
 
-    function halt() external payable {
-        revert("https://www.youtube.com/watch?v=LE4u5qnJJj8");
+    bool public isHalted = false;
+
+    /**
+     * @notice Toggle global emergency halt.
+     * @dev Can only be activated/deactivated by a supermajority (≥75%) of FREE.
+     *      Designed for last-resort system freeze under severe conditions.
+     *
+     * Requirements:
+     * - Caller must hold ≥75% of FREE token supply.
+     * - `enabled` must differ from current `isHalted` state.
+     * - Emits `Halted(bool)` event on success.
+     *
+     * Note:
+     * - This disables *all* user functions guarded by `nonReentrant` and can
+     *   be checked manually where needed.
+     * - Does not prevent reading state or transferring tokens.
+     */
+    // MINES BELOW, LADS! BEWARE OF MINES BELOW!
+    function halt(bool enabled) external {
+        require(enabled != isHalted, "halt: no change");
+
+        uint64 userBal = FREE.balanceOf(msg.sender);
+        uint64 total = FREE.totalSupply();
+
+        // 3/4 = 0.75 = 3× total / 4
+        require(
+            uint256(userBal) * 4 >= uint256(total) * 3,
+            "halt: 75% required"
+        );
+
+        isHalted = enabled;
+        emit Halted(enabled);
     }
+
+    /// @notice Emitted when the global halt state changes.
+    event Halted(bool enabled);
 
     struct Pair {
         IZRC20 reserve;
@@ -400,22 +433,22 @@ contract PQSE is ReentrancyGuard {
     // BASIC ORDERED OPERATIONS POINTER
     uint64 public boop = 0; // global nonce for everything
 
-    StandardUtilityToken public immutable FREE; // fee discount token
+    StandardUtilityToken public FREE; // fee discount token
 
     uint32 public constant MAX_FEE = 6442450; // 0.30%
-    uint32 public constant PRO_FEE = 536870911; // 25%
+    uint32 public constant PRO_FEE = 2**32-1; // 100%
     uint32 public constant MIN_TIF = 10 minutes;
     uint32 public constant MIN_LIQ = 1_000;
     uint32 public constant MAX_TIP = 64424509; // 3%
 
     mapping(IZRC20 => mapping(IZRC20 => Pool)) public pools; // reserve => secured => Pool
     mapping(address => mapping(address => uint64)) public broke; // owner => broker => approved
-    mapping(address => uint64) public profit; // reserved fees collected for protocol
+    mapping(address => uint128) public profit; // total reserved fees collected for protocol over all time
     mapping(uint64 => uint256) public shares;
 
     // quantaswap@gmail.com
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=tqOHiDKPxe0";
+        return "https://www.youtube.com/watch?v=uGcsIdGOuZY";
     }
 
     function approve(address broker, uint64 expires) external {
@@ -1297,6 +1330,7 @@ contract PQSE is ReentrancyGuard {
         uint64 free,
         uint64 tip
     ) external nonReentrant returns (uint64 reserveOut, uint64 securedOut) {
+        require(!isHalted, "halted");
         require(tip <= MAX_TIP, "tip: too high");
         brokify(cross);
 
@@ -2015,7 +2049,12 @@ contract PQSE is ReentrancyGuard {
         // (loc, liquidity) already set
     }
 
-    event Speech(address, bytes words);
+    // Every FREE holder is assumed to be in a perpetual state of staking from genesis, even those not present.
+    // This keeps track of the total profit at the last take for the owner.
+    mapping(address /* free owner */ => mapping(address /* reserve */ => uint128 /* total base */))
+        public bases;
+
+    event Speech(address, address[], bytes words, bool want);
 
     /**
      * @notice Withdraw protocol profits proportionally to FREE token holdings.
@@ -2025,52 +2064,63 @@ contract PQSE is ReentrancyGuard {
      * @param tokens Array of token addresses to claim profits for.
      * @return amountsObtained Array of profit amounts transferred to the caller, matching `tokens` order.
      */
-    function takeProfits(
+    function speak(
         address[] calldata tokens,
-        bytes calldata speech
+        bytes calldata speech,
+        bool want
     ) external nonReentrant returns (uint64[] memory amountsObtained) {
-        require(speech.length > 0, "speech: no speech");
+        require(speech.length > 0, "speech: required");
 
-        // 1. Fetch caller's FREE token balance and total supply
-        uint64 userBalance = FREE.balanceOf(msg.sender);
-        uint64 totalSupply = FREE.totalSupply();
-        // 2. Prevent division by zero if no FREE tokens exist
-        if (totalSupply == 0) revert("takeProfit: no FREE supply");
+        uint64 total = FREE.totalSupply();
+        require(total > 0, "FREE: no supply");
 
-        // 3. Initialize the results array with fixed length = number of tokens
+        uint64 userBal = FREE.balanceOf(msg.sender);
+        require(userBal > 0, "FREE: no balance");
+
+        // Speak before payment, because we are paying holder for speech.
+        emit Speech(msg.sender, tokens, speech, want);
+
+        // So true bestie, let's give you some money for that speech.
         amountsObtained = new uint64[](tokens.length);
+        for (uint256 i = 0; i < tokens.length && want; ++i) {
+            address token = tokens[i];
 
-        // HAVE A SPEECH
-        emit Speech(msg.sender, speech);
+            uint128 prev = bases[msg.sender][token];
+            uint64 nowProfit = uint64(profit[token]);
 
-        // PAID FOR SPEECH
-        // 4. Loop over each token to compute and distribute profit share
-        for (uint256 i = 0; i < tokens.length; ++i) {
-            address tokenAddr = tokens[i];
-            // a) Read total accumulated profit for this token
-            uint64 totalProfit = profit[tokenAddr];
-
-            // b) Compute user's pro-rata share: profit * userBalance / totalSupply
-            uint256 rawShare = uint256(totalProfit) * userBalance;
-            uint64 share = uint64(rawShare / totalSupply);
-
-            // c) If share > 0, deduct from profit pool and transfer to user
-            if (share > 0) {
-                profit[tokenAddr] = totalProfit - share;
-                // Transfer shares of the profit token to the caller
-                IZRC20(tokenAddr).transfer(msg.sender, share);
+            if (nowProfit <= prev) {
+                amountsObtained[i] = 0;
+                continue;
             }
 
-            // d) Record the distributed amount in results
-            amountsObtained[i] = share;
+            uint128 delta = nowProfit - prev;
+            uint256 raw = uint256(delta) * userBal;
+            uint64 share = uint64(raw / total);
+
+            if (share > 0) {
+                profit[token] = nowProfit - share;
+                bases[msg.sender][token] = profit[token];
+                IZRC20(token).transfer(msg.sender, share);
+                amountsObtained[i] = share;
+            } else {
+                // still record that they've updated their base
+                bases[msg.sender][token] = nowProfit;
+                amountsObtained[i] = 0;
+            }
         }
     }
 
-    constructor(StandardUtilityToken freeToken) {
-        FREE = freeToken;
+    function setFree(StandardUtilityToken token) external {
+        require(msg.sender == owner, "only owner");
+        require(address(FREE) == address(0), "already set");
+        FREE = token;
+    }
+
+    constructor() {
+        owner = msg.sender;
         boop++;
     }
 }
 
 // "Just fork Uniswap!"
-// It's not efficient.
+// My wake, your path.

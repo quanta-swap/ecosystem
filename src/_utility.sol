@@ -172,19 +172,19 @@ contract StandardUtilityToken is IZRC20 {
             revert UnauthorizedLocker(holder, msg.sender);
 
         Account storage acc = _acct[holder];
-        uint64 epoch = uint64(block.timestamp / lockTime);
+        uint64 epoch_ = uint64(block.timestamp / lockTime);
 
-        if (epoch != acc.window) {
+        if (epoch_ != acc.window) {
             // new window – reset
             acc.locked = 0;
-            acc.window = epoch;
+            acc.window = epoch_;
         }
 
         uint64 unlocked = acc.balance - acc.locked;
         if (unlocked < amount) revert InsufficientUnlocked(unlocked, amount);
 
         acc.locked += amount;
-        emit TokensLocked(holder, msg.sender, amount, epoch);
+        emit TokensLocked(holder, msg.sender, amount, epoch_);
     }
 
     /*═════════════ ERC-20 view getters ═════════════*/
@@ -194,6 +194,10 @@ contract StandardUtilityToken is IZRC20 {
      */
     function totalSupply() external view override returns (uint64) {
         return _tot;
+    }
+
+    function epoch() external view returns (uint64) {
+        return uint64(block.timestamp / lockTime);
     }
 
     /**
