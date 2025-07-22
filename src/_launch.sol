@@ -766,7 +766,6 @@ contract RocketLauncher is ReentrancyGuard {
         /*────────── pre‑compute fixed constants ──────────*/
         uint64 fullSupply = c.utilityTokenParams.supply64;
         uint64 creatorSlice = _pct64(fullSupply, c.percentOfLiquidityCreator);
-        uint64 publicSupply = fullSupply - creatorSlice;
 
         /*────────────────── CREATOR ──────────────────*/
         uint64 claimedInvite = 0;
@@ -810,7 +809,8 @@ contract RocketLauncher is ReentrancyGuard {
         if (contributed == 0) revert NothingToClaim(id);
 
         uint64 owedUtil = uint64(
-            (uint256(contributed) * publicSupply) / s.totalInviteContributed
+            (uint256(contributed) * (fullSupply - creatorSlice)) /
+                s.totalInviteContributed
         );
         if (owedUtil == 0) revert NothingToClaim(id);
 
@@ -1209,11 +1209,7 @@ contract RocketLauncher is ReentrancyGuard {
 /*════════════════════ RocketLauncherDeployer ══════════════════════*/
 contract RocketLauncherDeployer is ReentrancyGuard {
     mapping(address => bool) private _spawned;
-    event Deployed(
-        address indexed launcher,
-        address dex,
-        address utd
-    );
+    event Deployed(address indexed launcher, address dex, address utd);
 
     function create(
         IDEX dex,
@@ -1221,9 +1217,7 @@ contract RocketLauncherDeployer is ReentrancyGuard {
     ) external nonReentrant returns (address addr) {
         if (address(dex) == address(0)) revert ZeroAddress(address(0));
         if (address(utd) == address(0)) revert ZeroAddress(address(0));
-        bytes32 salt = keccak256(
-            abi.encodePacked(address(dex), address(utd))
-        );
+        bytes32 salt = keccak256(abi.encodePacked(address(dex), address(utd)));
         addr = address(new RocketLauncher{salt: salt}(dex, utd));
         _spawned[addr] = true;
         emit Deployed(addr, address(dex), address(utd));
