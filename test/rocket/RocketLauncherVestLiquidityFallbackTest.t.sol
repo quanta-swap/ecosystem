@@ -201,7 +201,7 @@ contract RocketLauncherVestFallbackTest is RocketLauncherTestBase {
         vm.warp(cfg.liquidityDeployTime + 1);
         launcher.deployLiquidity(id);
 
-        (,,,,,,,,,bool isFaulted,) = launcher.rocketState(id);
+        (,,,,,,,,,bool isFaulted,,) = launcher.rocketState(id);
         assertTrue(isFaulted, "rocket not faulted");
 
         uint64 balBefore = launcher.offeringToken(id).balanceOf(BO);

@@ -6,6 +6,7 @@ pragma solidity ^0.8.24;
 └──────────────────────────────────*/
 import "../_launch.sol"; // pulls in IDEX, IZRC20, custom errors
 import "../IZRC20.sol";
+import {StandardUtilityToken} from "../_utility.sol";
 
 /*
 interface IZRC20 {
@@ -323,13 +324,13 @@ library EssentialHelpers {
  */
 
 // REMEMBER: Best execution is a !LEGAL! requirement in many jurisdictions.
-contract PQSE {
+contract PQSE is ReentrancyGuard {
     using IZRC20Helper for address;
 
     address public immutable owner;
 
     function halt() external payable {
-        revert("https://www.youtube.com/watch?v=fVIh1MFWDV");
+        revert("https://www.youtube.com/watch?v=LE4u5qnJJj8");
     }
 
     struct Pair {
@@ -399,10 +400,10 @@ contract PQSE {
     // BASIC ORDERED OPERATIONS POINTER
     uint64 public boop = 0; // global nonce for everything
 
-    IZRC20 public immutable FREE; // fee discount token
+    StandardUtilityToken public immutable FREE; // fee discount token
 
     uint32 public constant MAX_FEE = 6442450; // 0.30%
-    uint32 public constant PRO_FEE = 0; // no comment...
+    uint32 public constant PRO_FEE = 536870911; // 25%
     uint32 public constant MIN_TIF = 10 minutes;
     uint32 public constant MIN_LIQ = 1_000;
     uint32 public constant MAX_TIP = 64424509; // 3%
@@ -414,7 +415,7 @@ contract PQSE {
 
     // quantaswap@gmail.com
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=BS0T8Cd4UhA";
+        return "https://www.youtube.com/watch?v=tqOHiDKPxe0";
     }
 
     function approve(address broker, uint64 expires) external {
@@ -469,8 +470,8 @@ contract PQSE {
             return false;
         }
 
-        // EXTREMELY IMPORTANT! "Can this random person own the token?"
-        if (!IZRC20(reserve).checkSupportsOwner(owner)) return false;
+        // EXTREMELY IMPORTANT!
+        if (!IZRC20(reserve).checkSupportsOwner(address(0))) return false;
 
         return _isSupported(reserve) && _isSupported(secured);
     }
@@ -1295,7 +1296,7 @@ contract PQSE {
         Cross calldata cross,
         uint64 free,
         uint64 tip
-    ) external returns (uint64 reserveOut, uint64 securedOut) {
+    ) external nonReentrant returns (uint64 reserveOut, uint64 securedOut) {
         require(tip <= MAX_TIP, "tip: too high");
         brokify(cross);
 
@@ -1319,6 +1320,7 @@ contract PQSE {
             uint32(tip),
             /*outside=*/ false // embedded
         );
+        FREE.lock(address(this), free);
 
         /*──────────────── 3. CORE MATCHING ─────────────────*/
         (reserveOut, securedOut) = _execute(
@@ -1732,7 +1734,7 @@ contract PQSE {
         uint256 amountB,
         address to,
         bytes calldata data
-    ) external returns (uint64 loc, uint256 liquidity) {
+    ) external nonReentrant returns (uint64 loc, uint256 liquidity) {
         /*─────────────────── 1. sanity & support checks ──────────────────*/
         require(this.checkSupportsPair(tokenA, tokenB), "unsupported pair");
 
@@ -1835,7 +1837,7 @@ contract PQSE {
         address to,
         uint64 minA,
         uint64 minB
-    ) external returns (uint64 amountA, uint64 amountB) {
+    ) external nonReentrant returns (uint64 amountA, uint64 amountB) {
         /*──────────────── 0. sanity checks ─────────────────────────────*/
         if (to == address(0)) revert ZeroAddress(to);
         require(liquidity != 0, "zero burn");
@@ -1923,7 +1925,7 @@ contract PQSE {
         uint256 amountAMin,
         uint256 amountBMin,
         address to
-    ) external returns (uint64 loc, uint256 liquidity) {
+    ) external nonReentrant returns (uint64 loc, uint256 liquidity) {
         /*────────────────── 0. basic sanity ───────────────────*/
         require(to != address(0), "zero to");
         require(amountADesired != 0 && amountBDesired != 0, "zero input");
@@ -1945,58 +1947,60 @@ contract PQSE {
 
         /*────────────────── 3. optimal amounts ────────────────*
          * Keep pool price constant: amountB = amountA * S / R  */
-        uint256 R = pool.reserve;
-        uint256 S = pool.secured;
+        {
+            uint256 R = pool.reserve;
+            uint256 S = pool.secured;
 
-        uint256 amountBOptimal = (amountADesired * S) / R;
+            uint256 amountBOptimal = (amountADesired * S) / R;
 
-        uint256 amountA;
-        uint256 amountB;
+            uint256 amountA;
+            uint256 amountB;
 
-        if (amountBOptimal <= amountBDesired) {
-            // use all A, cap B
-            amountA = amountADesired;
-            amountB = amountBOptimal;
-        } else {
-            // too much A – recompute using all B
-            uint256 amountAOptimal = (amountBDesired * R) / S;
-            amountA = amountAOptimal;
-            amountB = amountBDesired;
+            if (amountBOptimal <= amountBDesired) {
+                // use all A, cap B
+                amountA = amountADesired;
+                amountB = amountBOptimal;
+            } else {
+                // too much A – recompute using all B
+                uint256 amountAOptimal = (amountBDesired * R) / S;
+                amountA = amountAOptimal;
+                amountB = amountBDesired;
+            }
+
+            /* slippage protection */
+            require(amountA >= amountAMin && amountB >= amountBMin, "slippage");
+
+            /*────────────────── 4. pull funds (≤ 2 transfers) ─────*/
+            require(
+                pair.reserve.transferFrom(
+                    msg.sender,
+                    address(this),
+                    uint64(amountA)
+                ),
+                "reserve pull"
+            );
+            require(
+                pair.secured.transferFrom(
+                    msg.sender,
+                    address(this),
+                    uint64(amountB)
+                ),
+                "secured pull"
+            );
+
+            /*────────────────── 5. mint liquidity ─────────────────*
+             * liquidity = min( amountA * shares / R ,
+             *                  amountB * shares / S )              */
+            uint256 liqByA = (amountA * pool.shares) / R;
+            uint256 liqByB = (amountB * pool.shares) / S;
+            liquidity = liqByA < liqByB ? liqByA : liqByB;
+            require(liquidity > 0, "zero liquidity");
+
+            /*────────────────── 6. update pool balances ───────────*/
+            pool.reserve += uint64(amountA); // fits 64‑bit
+            pool.secured += uint64(amountB);
+            pool.shares += uint128(liquidity);
         }
-
-        /* slippage protection */
-        require(amountA >= amountAMin && amountB >= amountBMin, "slippage");
-
-        /*────────────────── 4. pull funds (≤ 2 transfers) ─────*/
-        require(
-            pair.reserve.transferFrom(
-                msg.sender,
-                address(this),
-                uint64(amountA)
-            ),
-            "reserve pull"
-        );
-        require(
-            pair.secured.transferFrom(
-                msg.sender,
-                address(this),
-                uint64(amountB)
-            ),
-            "secured pull"
-        );
-
-        /*────────────────── 5. mint liquidity ─────────────────*
-         * liquidity = min( amountA * shares / R ,
-         *                  amountB * shares / S )              */
-        uint256 liqByA = (amountA * pool.shares) / R;
-        uint256 liqByB = (amountB * pool.shares) / S;
-        liquidity = liqByA < liqByB ? liqByA : liqByB;
-        require(liquidity > 0, "zero liquidity");
-
-        /*────────────────── 6. update pool balances ───────────*/
-        pool.reserve += uint64(amountA); // fits 64‑bit
-        pool.secured += uint64(amountB);
-        pool.shares += uint128(liquidity);
 
         /*────────────────── 7. LP position accounting ─────────*/
         if (location == 0) {
@@ -2011,9 +2015,59 @@ contract PQSE {
         // (loc, liquidity) already set
     }
 
-    constructor(address freeToken) {
-        require(freeToken != address(0), "zero free");
-        FREE = IZRC20(freeToken);
+    event Speech(address, bytes words);
+
+    /**
+     * @notice Withdraw protocol profits proportionally to FREE token holdings.
+     * @dev For each `token` in `tokens`, compute `share = profit[token] * userBalance / totalSupply`.
+     *      Transfers `share` to the caller and deducts it from `profit[token]`.
+     *      Rounds down; any remainder stays in the contract.
+     * @param tokens Array of token addresses to claim profits for.
+     * @return amountsObtained Array of profit amounts transferred to the caller, matching `tokens` order.
+     */
+    function takeProfits(
+        address[] calldata tokens,
+        bytes calldata speech
+    ) external nonReentrant returns (uint64[] memory amountsObtained) {
+        require(speech.length > 0, "speech: no speech");
+
+        // 1. Fetch caller's FREE token balance and total supply
+        uint64 userBalance = FREE.balanceOf(msg.sender);
+        uint64 totalSupply = FREE.totalSupply();
+        // 2. Prevent division by zero if no FREE tokens exist
+        if (totalSupply == 0) revert("takeProfit: no FREE supply");
+
+        // 3. Initialize the results array with fixed length = number of tokens
+        amountsObtained = new uint64[](tokens.length);
+
+        // HAVE A SPEECH
+        emit Speech(msg.sender, speech);
+
+        // PAID FOR SPEECH
+        // 4. Loop over each token to compute and distribute profit share
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            address tokenAddr = tokens[i];
+            // a) Read total accumulated profit for this token
+            uint64 totalProfit = profit[tokenAddr];
+
+            // b) Compute user's pro-rata share: profit * userBalance / totalSupply
+            uint256 rawShare = uint256(totalProfit) * userBalance;
+            uint64 share = uint64(rawShare / totalSupply);
+
+            // c) If share > 0, deduct from profit pool and transfer to user
+            if (share > 0) {
+                profit[tokenAddr] = totalProfit - share;
+                // Transfer shares of the profit token to the caller
+                IZRC20(tokenAddr).transfer(msg.sender, share);
+            }
+
+            // d) Record the distributed amount in results
+            amountsObtained[i] = share;
+        }
+    }
+
+    constructor(StandardUtilityToken freeToken) {
+        FREE = freeToken;
         boop++;
     }
 }

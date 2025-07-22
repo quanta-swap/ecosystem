@@ -63,7 +63,7 @@ contract DepositTest is RocketLauncherTestBase {
         assertEq(invit.balanceOf(address(launcher)), amt, "launcher bal");
         assertEq(launcher.deposited(id, AL), amt, "per-user");
 
-        (uint64 invite,,,,,,,,,,) = launcher.rocketState(id);
+        (uint64 invite,,,,,,,,,,,) = launcher.rocketState(id);
         assertEq(invite, amt, "aggregate");
     }
 
@@ -90,7 +90,7 @@ contract DepositTest is RocketLauncherTestBase {
         /* tallies */
         assertEq(launcher.deposited(id, AL), cAmt, "creator tally");
         assertEq(launcher.deposited(id, BO), pAmt, "participant tally");
-        (uint64 invite,,,,,,,,,,) = launcher.rocketState(id);
+        (uint64 invite,,,,,,,,,,,) = launcher.rocketState(id);
         assertEq(invite, total, "aggregate");
     }
 

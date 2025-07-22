@@ -210,6 +210,7 @@ struct RocketState {
     uint64 remainingSweetener;
     bool isFaulted; // anti-marooning flag, toggled if liquidity deployment fails
     address pool;
+    uint64 lpLocation;
     mapping(address => uint256) claimedLP; // LP-equivalent already claimed
 }
 
@@ -645,10 +646,11 @@ contract RocketLauncher is ReentrancyGuard {
                 address(this), // LP minted to the launcher
                 c.liquidityDeploymentData
             )
-        returns (address, uint256 mintedLP) {
+        returns (uint64 location, uint256 mintedLP) {
             lp = mintedLP; // Keep in memory until all checks pass
             utilTok.approve(address(dex), 0); // Revoke approvals
             c.invitingToken.approve(address(dex), 0);
+            s.lpLocation = location;
         } catch {
             utilTok.approve(address(dex), 0); // Revoke approvals
             c.invitingToken.approve(address(dex), 0);
@@ -1009,6 +1011,7 @@ contract RocketLauncher is ReentrancyGuard {
         (uint64 gotInvite, uint64 gotUtility) = dex.withdrawLiquidity(
             address(c.invitingToken),
             address(offeringToken[id]),
+            rocketState[id].lpLocation,
             lp,
             msg.sender,
             minI,

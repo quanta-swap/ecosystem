@@ -212,7 +212,7 @@ contract DEXMock is IDEX {
         uint256 amountB,
         address /*to*/,
         bytes calldata /*extra*/
-    ) external override returns (address _location, uint256 liquidity) {
+    ) external override returns (uint64 _location, uint256 liquidity) {
         require(amountA > 0 && amountB > 0, "zero amounts");
 
         // Pull the two legs from the caller (launcher)
@@ -254,6 +254,7 @@ contract DEXMock is IDEX {
     function withdrawLiquidity(
         address tokenA,
         address tokenB,
+        uint64 /* location */,
         uint256 lp,
         address to,
         uint64 minA,

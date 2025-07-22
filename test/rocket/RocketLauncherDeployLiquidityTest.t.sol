@@ -87,7 +87,7 @@ contract RocketLauncherDeployLiquidityTest is RocketLauncherTestBase {
         /* event & state sanity */
         bytes32 sig = keccak256("LiquidityDeployed(uint256,uint256)");
         bool seen;
-        (,uint256 lpState,,,,,,,,,) = launcher.rocketState(id);
+        (,uint256 lpState,,,,,,,,,,) = launcher.rocketState(id);
 
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].topics[0] == sig) {
@@ -98,7 +98,7 @@ contract RocketLauncherDeployLiquidityTest is RocketLauncherTestBase {
                 break;
             }
         }
-        (,,,,,,,,,bool isFaulted,) = launcher.rocketState(id);
+        (,,,,,,,,,bool isFaulted,,) = launcher.rocketState(id);
         assertTrue(seen, "LiquidityDeployed not emitted");
         assertFalse(isFaulted, "should NOT be faulted");
     }
@@ -163,9 +163,9 @@ contract RocketLauncherDeployLiquidityTest is RocketLauncherTestBase {
         emit RocketLauncher.Faulted(id);
         badL.deployLiquidity(id);
 
-        (,,,,,,,,,bool isFaulted,) = badL.rocketState(id);
+        (,,,,,,,,,bool isFaulted,,) = badL.rocketState(id);
         assertTrue(isFaulted, "fault flag");
-        (,uint256 lpState,,,,,,,,,) = launcher.rocketState(id);
+        (,uint256 lpState,,,,,,,,,,) = launcher.rocketState(id);
         assertEq(lpState, 0, "no LP recorded");
     }
 
@@ -193,9 +193,9 @@ contract RocketLauncherDeployLiquidityTest is RocketLauncherTestBase {
         emit RocketLauncher.Faulted(id);
         launcher.deployLiquidity(id);
 
-        (,,,,,,,,,bool isFaulted,) = launcher.rocketState(id);
+        (,,,,,,,,,bool isFaulted,,) = launcher.rocketState(id);
         assertTrue(isFaulted, "fault flag not set");
-        (,uint256 lpState,,,,,,,,,) = launcher.rocketState(id);
+        (,uint256 lpState,,,,,,,,,,) = launcher.rocketState(id);
         assertEq(lpState, 0, "LP should remain zero");
 
         /* subsequent attempts revert with RocketFaulted */
