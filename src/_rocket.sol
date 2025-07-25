@@ -2,8 +2,6 @@
 pragma solidity ^0.8.24;
 
 import "./IZRC20.sol";
-// TODO! Fix locatable liquidity
-// TODO! Add a more structured approach to view functions
 
 /*─────────────────── minimal ReentrancyGuard ───────────────────*/
 abstract contract ReentrancyGuard {
@@ -236,18 +234,50 @@ struct Raise {
     RaiseState state;
 }
 
-contract IPO is ReentrancyGuard {
+event UnderwriterMessage(
+    address indexed,
+    address indexed,
+    uint256 amount,
+    bytes
+);
+event Underwritten(address indexed, address indexed, uint64 indexed);
+event Contributed(address indexed, address indexed, uint64 amount, bytes);
+event Helped(
+    address indexed,
+    address indexed,
+    bool exploded,
+    bool launched,
+    bytes
+);
+event Attended(
+    address indexed caller,
+    address indexed offered,
+    uint64 id,
+    bool refunded,
+    bool vested,
+    uint64 amountOffered,
+    uint64 amountInvited,
+    bytes message
+);
+
+contract Protocol is ReentrancyGuard {
     uint64 private boop;
-    mapping(address /* sender */ => mapping(address /* deployed */ => uint64 /* invited */)) contributed;
-    mapping(address /* sender */ => mapping(address /* deployed */ => uint64 /* invited */)) liquidated;
-    mapping(uint64 => Raise) private raises;
-    mapping(address => Account) private reserves;
+    mapping(address /* sender */ => mapping(address /* deployed */ => uint64 /* invited */))
+        public contributed;
+    mapping(address /* sender */ => mapping(address /* deployed */ => uint64 /* invited */))
+        public liquidated;
+    mapping(uint64 => Raise) public raises;
+    mapping(address => Account) public reserves;
 
     mapping(address => address) public underwriters;
 
-    function create(
-        RaiseConfig calldata config
+    // Brother, just go talk to the Foundation!
+    // info@theqrl.org
+    function UNDERWRITE(
+        RaiseConfig calldata config,
+        bytes calldata message
     ) external payable nonReentrant returns (uint64 id) {
+        // Gentlefolk, it's not the money that matters.
         require(msg.value >= 1337e18, "Must be elite");
         _validateConfig(config);
         (address deployed, uint64 obtained) = _deployToken(
@@ -301,6 +331,8 @@ contract IPO is ReentrancyGuard {
             "unsupported mover"
         );
         underwriters[deployed] = msg.sender;
+        emit UnderwriterMessage(msg.sender, deployed, msg.value, message);
+        emit Underwritten(msg.sender, deployed, boop);
         return boop;
     }
 
@@ -341,7 +373,11 @@ contract IPO is ReentrancyGuard {
         obtained = uint64(IZRC20(deployed).balanceOf(address(this)));
     }
 
-    function deposit(uint64 id, uint64 amount) external nonReentrant {
+    function contribute(
+        uint64 id,
+        uint64 amount,
+        bytes calldata message
+    ) external nonReentrant {
         require(amount > 0, "zero amount");
         Raise storage raise = raises[id];
         require(
@@ -367,9 +403,15 @@ contract IPO is ReentrancyGuard {
             .liquiditySupply
             .schedule
             .start;
+        emit Contributed(
+            msg.sender,
+            address(raise.state.offered),
+            amount,
+            message
+        );
     }
 
-    function launch(uint64 id) external nonReentrant {
+    function help(uint64 id, bytes calldata message) external nonReentrant {
         Raise storage raise = raises[id];
         require(raise.config.creator != address(0), "raise does not exist");
         require(block.timestamp >= raise.config.strikeTime, "not time yet");
@@ -454,18 +496,33 @@ contract IPO is ReentrancyGuard {
         raise.state.liquiditySupply.fixated = true;
         raise.state.invitedSupply.fixated = true;
         raise.state.offeredSupply.fixated = true;
+
+        emit Helped(
+            msg.sender,
+            address(raise.state.offered),
+            raise.state.exploded,
+            raise.state.invitedSupply.value >= raise.config.guards.minRaise,
+            message
+        );
     }
 
     function attend(
         uint64 id,
         uint64 minInviteOut,
         uint64 minOfferedOut,
-        address to
+        address to,
+        bytes calldata message
     ) external nonReentrant {
         Raise storage raise = raises[id];
         require(raise.config.creator != address(0), "raise does not exist");
         require(raise.state.launched, "not launched");
 
+        uint64 amountOffered = 0;
+        uint64 amountInvited = 0;
+        bool refunded = false;
+        bool vested = false;
+
+        // Underwriter refund path on failure
         if (
             (raise.state.exploded ||
                 raise.state.invitedSupply.total <
@@ -476,8 +533,10 @@ contract IPO is ReentrancyGuard {
                 value: reserves[address(raise.state.offered)].value
             }("");
             require(success, "quanta refund failed");
+            refunded = true;
         }
 
+        // Creator claim logic
         if (msg.sender == raise.config.creator) {
             if (
                 raise.state.exploded ||
@@ -490,6 +549,8 @@ contract IPO is ReentrancyGuard {
                     ),
                     "failed credit"
                 );
+                amountOffered = uint64(raise.state.offeredSupply.value);
+                refunded = true;
             } else if (
                 block.timestamp >= raise.state.offeredSupply.schedule.start
             ) {
@@ -502,12 +563,15 @@ contract IPO is ReentrancyGuard {
                         raise.state.offered.transfer(msg.sender, credit),
                         "failed credit"
                     );
+                    amountOffered = credit;
+                    vested = true;
                 }
                 raise.state.offeredSupply.value -= credit;
                 raise.state.offeredSupply.schedule.start = uint64(
                     block.timestamp
                 );
                 raise.state.offeredSupply.schedule.length -= span;
+
                 if (raise.state.invitedSupply.value > 0) {
                     require(
                         raise.config.invitedTok.transfer(
@@ -516,22 +580,27 @@ contract IPO is ReentrancyGuard {
                         ),
                         "failed credit"
                     );
+                    amountInvited = uint64(raise.state.invitedSupply.value);
                     raise.state.invitedSupply.value = 0;
                 }
+
                 liquidated[msg.sender][address(raise.state.offered)] = uint64(
                     block.timestamp
                 );
             }
         }
 
+        // Participant refund or LP exit
         if (
             raise.state.exploded ||
             raise.state.invitedSupply.total < raise.config.guards.minRaise
         ) {
-            raise.config.invitedTok.transfer(
-                msg.sender,
-                contributed[msg.sender][address(raise.state.offered)]
-            );
+            uint64 refund = contributed[msg.sender][
+                address(raise.state.offered)
+            ];
+            raise.config.invitedTok.transfer(msg.sender, refund);
+            amountInvited = refund;
+            refunded = true;
         } else {
             if (address(raise.config.dex) == address(0)) {
                 uint64 credit = (uint64(raise.state.offeredSupply.total) *
@@ -542,6 +611,8 @@ contract IPO is ReentrancyGuard {
                         raise.state.offered.transfer(msg.sender, credit),
                         "failed credit"
                     );
+                    amountOffered = credit;
+                    vested = true;
                     raise.state.offeredSupply.value -= credit;
                 }
             } else {
@@ -563,20 +634,38 @@ contract IPO is ReentrancyGuard {
                     minInviteOut,
                     minOfferedOut
                 );
+                vested = true;
             }
         }
+
+        emit Attended(
+            msg.sender,
+            address(raise.state.offered),
+            id,
+            refunded,
+            vested,
+            amountOffered,
+            amountInvited,
+            message
+        );
     }
 
     function theme() external pure returns (string memory) {
-        return "https://www.youtube.com/watch?v=yN3lUM-r6bk";
+        return "https://www.youtube.com/watch?v=BS0T8Cd4UhA";
     }
 
-    event Confession(address, bytes message);
+    event Confession(
+        address indexed,
+        address indexed,
+        bool indexed want,
+        bytes message
+    );
 
     function confess(
         address offered,
         uint64 amount,
         address to,
+        bool want,
         bytes calldata message
     ) external nonReentrant returns (uint256 credit) {
         require(message.length > 0, "requires intent");
@@ -587,9 +676,10 @@ contract IPO is ReentrancyGuard {
             IZRC20(offered).transferFrom(msg.sender, address(1), amount),
             "failed burn"
         );
-        (bool success, ) = to.call{value: credit}("");
-        require(success, "quanta refund failed");
-        emit Confession(msg.sender, message);
+        if (want) {
+            (bool success, ) = to.call{value: credit}("");
+            require(success, "quanta refund failed");
+        }
+        emit Confession(msg.sender, offered, want, message);
     }
-    
 }
