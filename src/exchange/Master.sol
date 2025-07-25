@@ -1,10 +1,15 @@
 // SPDX‑License‑Identifier: MIT
 pragma solidity ^0.8.24;
 
+/**
+ * Clarity is the most valuable resource in the world
+ * and it costs nothing to produce.
+ */
+
 /*──────────────────────────────────
 │  External interfaces & helpers   │
 └──────────────────────────────────*/
-import "../_launch.sol"; // pulls in IDEX, IZRC20, custom errors
+import "../_rocket.sol"; // pulls in IDEX, IZRC20, custom errors
 import "../IZRC20.sol";
 import {StandardUtilityToken} from "../_utility.sol";
 
@@ -325,7 +330,6 @@ library EssentialHelpers {
 
 // REMEMBER: Best execution is a !LEGAL! requirement in many jurisdictions.
 contract PQSE is ReentrancyGuard {
-    using IZRC20Helper for address;
 
     address public immutable owner;
 
@@ -350,8 +354,8 @@ contract PQSE is ReentrancyGuard {
     function halt(bool enabled) external {
         require(enabled != isHalted, "halt: no change");
 
-        uint64 userBal = FREE.balanceOf(msg.sender);
-        uint64 total = FREE.totalSupply();
+        uint64 userBal = uint64(FREE.balanceOf(msg.sender));
+        uint64 total = uint64(FREE.totalSupply());
 
         // 3/4 = 0.75 = 3× total / 4
         require(
@@ -436,7 +440,7 @@ contract PQSE is ReentrancyGuard {
     StandardUtilityToken public FREE; // fee discount token
 
     uint32 public constant MAX_FEE = 6442450; // 0.30%
-    uint32 public constant PRO_FEE = 2**32-1; // 100%
+    uint32 public constant PRO_FEE = 0; // 0%
     uint32 public constant MIN_TIF = 10 minutes;
     uint32 public constant MIN_LIQ = 1_000;
     uint32 public constant MAX_TIP = 64424509; // 3%
@@ -475,9 +479,6 @@ contract PQSE is ReentrancyGuard {
         // Basic sanity: zero address = outright reject
         if (token == address(0)) return false;
 
-        // 1. 64‑bit supply guarantee
-        if (!token.isIZRC20()) return false;
-
         // 2 + 3. Permission checks
         IZRC20 t = IZRC20(token);
         if (!t.checkSupportsMover(address(this))) return false;
@@ -504,7 +505,7 @@ contract PQSE is ReentrancyGuard {
         }
 
         // EXTREMELY IMPORTANT!
-        if (!IZRC20(reserve).checkSupportsOwner(address(0))) return false;
+        if (!IZRC20(reserve).checkSupportsOwner(address(1))) return false;
 
         return _isSupported(reserve) && _isSupported(secured);
     }
@@ -1821,7 +1822,7 @@ contract PQSE is ReentrancyGuard {
         // For now the LP position is an internal ID; if/when an ERC‑20
         // wrapper is introduced, mint to `to` here.  A direct transfer of
         // “ownership” is sufficient at this stage.
-        if (to == address(0)) revert ZeroAddress(to);
+        require(to != address(0), "zero to");
         pool.owners[loc] = to; // simple mapping already exists
 
         /*─────────────────── 8. hook / ext‑integration (future‑proof) ───*/
@@ -1873,7 +1874,7 @@ contract PQSE is ReentrancyGuard {
         uint64 minB
     ) external nonReentrant returns (uint64 amountA, uint64 amountB) {
         /*──────────────── 0. sanity checks ─────────────────────────────*/
-        if (to == address(0)) revert ZeroAddress(to);
+        require(to != address(0), "zero to");
         require(liquidity != 0, "zero burn");
 
         /*──────────────── 1. pool lookup & ownership gating ────────────*/
@@ -2054,59 +2055,131 @@ contract PQSE is ReentrancyGuard {
     mapping(address /* free owner */ => mapping(address /* reserve */ => uint128 /* total base */))
         public bases;
 
-    event Speech(address, address[], bytes words, bool want);
+    struct Epoch {
+        uint64 number; // context dependent number
+        // updated each time there is a claim on a reserve cache
+    }
 
-    /**
-     * @notice Withdraw protocol profits proportionally to FREE token holdings.
-     * @dev For each `token` in `tokens`, compute `share = profit[token] * userBalance / totalSupply`.
-     *      Transfers `share` to the caller and deducts it from `profit[token]`.
-     *      Rounds down; any remainder stays in the contract.
-     * @param tokens Array of token addresses to claim profits for.
-     * @return amountsObtained Array of profit amounts transferred to the caller, matching `tokens` order.
-     */
+    /*
+    REMEMBER: THERE IS NO FIGHT CLUB. NOBODY TALKS ABOUT FIGHT CLUB!
+
+    Unclaimed rewards from an epoch are donated to participants in the next
+    epoch pro-rata based on their share of the claim for the old epoch.
+    */
+
+    /* ─── 1. new bookkeeping ─────────────────────────────────────────── */
+
+    struct DonationPool {
+        uint64 epoch; // epoch that this pool belongs to (N)
+        uint64 amount; // unclaimed profit donated from epoch N‑1
+        uint64 totalClaims; // sum of *all* claims paid during epoch N
+    }
+
+    struct ClaimMark {
+        uint64 epoch; // epoch of the last claim that touched `amount`
+        uint64 amount; // cumulative amount the user has claimed *in that epoch*
+    }
+
+    mapping(address /* reserve */ => DonationPool) internal _pool; // reserve‑token → pool data
+    mapping(address /* reserve */ => mapping(address => ClaimMark))
+        internal _claims; // reserve‑token → user → mark
+    uint64 internal constant _FIRST_EPOCH = 1;
+
+    /* ─── 2. helper that starts the *next* epoch if needed ───────────── */
+
+    function _rollToNextEpoch(address token) private {
+        DonationPool storage dp = _pool[token];
+        uint64 currentProfit = uint64(profit[token]); // 64‑bit safe
+        uint64 leftover = currentProfit -
+            dp.amount - // profit already earmarked ↴
+            dp.totalClaims; // …and already distributed
+
+        if (leftover == 0) return; // still the same epoch – nothing to roll
+
+        // any unclaimed remainder from the *current* epoch becomes
+        // the donation pot for the *next* one
+        dp.epoch += 1;
+        dp.amount = leftover;
+        dp.totalClaims = 0;
+
+        // base profit now only contains the new epoch’s pool
+        profit[token] = leftover;
+    }
+
+    event Speech(address indexed sender, address[] tokens, bytes speech, bool want);
+
+    /* ─── 3. speak() rewritten ───────────────────────────────────────── */
+
     function speak(
         address[] calldata tokens,
         bytes calldata speech,
         bool want
-    ) external nonReentrant returns (uint64[] memory amountsObtained) {
-        require(speech.length > 0, "speech: required");
+    ) external nonReentrant returns (uint64[] memory out) {
+        require(speech.length != 0, "speech: required");
+        uint64 totalFREE = uint64(FREE.totalSupply());
+        require(totalFREE != 0, "FREE: no supply");
 
-        uint64 total = FREE.totalSupply();
-        require(total > 0, "FREE: no supply");
+        uint64 balFREE = uint64(FREE.balanceOf(msg.sender));
+        require(balFREE != 0, "FREE: no balance");
 
-        uint64 userBal = FREE.balanceOf(msg.sender);
-        require(userBal > 0, "FREE: no balance");
+        emit Speech(msg.sender, tokens, speech, want); // log before transfers
 
-        // Speak before payment, because we are paying holder for speech.
-        emit Speech(msg.sender, tokens, speech, want);
+        out = new uint64[](tokens.length);
 
-        // So true bestie, let's give you some money for that speech.
-        amountsObtained = new uint64[](tokens.length);
-        for (uint256 i = 0; i < tokens.length && want; ++i) {
-            address token = tokens[i];
+        /* ─ loop over "reserve" tokens that the caller wants to cash‑out ─ */
+        for (uint i; i < tokens.length && want; ++i) {
+            address tk = tokens[i];
 
-            uint128 prev = bases[msg.sender][token];
-            uint64 nowProfit = uint64(profit[token]);
+            // 1. roll the epoch forward *iff* there is fresh profit
+            _rollToNextEpoch(tk);
 
-            if (nowProfit <= prev) {
-                amountsObtained[i] = 0;
+            DonationPool storage dp = _pool[tk];
+            if (dp.epoch == 0) {
+                // first ever claim for this token
+                dp.epoch = _FIRST_EPOCH;
+            }
+
+            /* 2. MAIN PROFIT SHARE (exactly the same maths as before) */
+            uint128 prevBase = bases[msg.sender][tk];
+            uint64 nowBase = uint64(profit[tk]);
+
+            if (nowBase <= prevBase) continue; // nothing new
+            uint128 delta = nowBase - prevBase;
+            uint64 share = uint64((uint256(delta) * balFREE) / totalFREE);
+            if (share == 0) {
+                // still update the base
+                bases[msg.sender][tk] = nowBase;
                 continue;
             }
 
-            uint128 delta = nowProfit - prev;
-            uint256 raw = uint256(delta) * userBal;
-            uint64 share = uint64(raw / total);
+            // effects
+            profit[tk] = nowBase - share;
+            bases[msg.sender][tk] = profit[tk];
 
-            if (share > 0) {
-                profit[token] = nowProfit - share;
-                bases[msg.sender][token] = profit[token];
-                IZRC20(token).transfer(msg.sender, share);
-                amountsObtained[i] = share;
-            } else {
-                // still record that they've updated their base
-                bases[msg.sender][token] = nowProfit;
-                amountsObtained[i] = 0;
+            // 3. DONATION SHARE  (only if caller is participating in *this* epoch)
+            ClaimMark storage cm = _claims[tk][msg.sender];
+            if (cm.epoch != dp.epoch) {
+                cm.epoch = dp.epoch;
+                cm.amount = 0; // reset on new epoch
             }
+
+            cm.amount += share; // record user’s slice
+            dp.totalClaims += share; // bump denominator
+
+            uint64 donationCut = 0;
+            if (dp.amount != 0 && dp.totalClaims != 0) {
+                donationCut = uint64(
+                    (uint256(dp.amount) * cm.amount) / dp.totalClaims
+                );
+                if (donationCut != 0) {
+                    dp.amount -= donationCut; // burn from pool
+                    share += donationCut; // add to user pay‑out
+                }
+            }
+
+            // 4. pay everything out
+            IZRC20(tk).transfer(msg.sender, share);
+            out[i] = share;
         }
     }
 

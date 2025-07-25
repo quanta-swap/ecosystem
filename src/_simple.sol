@@ -324,7 +324,7 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     }
 
     /// @notice Current total supply (64-bit domain).
-    function totalSupply() external view override returns (uint64) {
+    function totalSupply() external view override returns (uint256) {
         return _tot;
     }
 
@@ -333,7 +333,7 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
      * @param  a Account address.
      * @return Current balance in 64-bit units.
      */
-    function balanceOf(address a) external view override returns (uint64) {
+    function balanceOf(address a) external view override returns (uint256) {
         return _accounts[a].balance;
     }
 
@@ -346,7 +346,7 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     function allowance(
         address o,
         address s
-    ) external view override returns (uint64) {
+    ) external view override returns (uint256) {
         return _allow[o][s];
     }
 
@@ -359,9 +359,9 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
      * @param  v New allowance (use `type(uint64).max` for unlimited).
      * @return Always true on success.
      */
-    function approve(address s, uint64 v) external override returns (bool) {
-        _allow[msg.sender][s] = v;
-        emit Approval(msg.sender, s, v);
+    function approve(address s, uint256 v) external override returns (bool) {
+        _allow[msg.sender][s] = uint64(v);
+        emit Approval(msg.sender, s, uint64(v));
         return true;
     }
 
@@ -395,10 +395,10 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
      */
     function transfer(
         address to,
-        uint64 v
+        uint256 v
     ) external override nonReentrant returns (bool) {
         _assertUnlocked(msg.sender);
-        _xfer(msg.sender, to, v);
+        _xfer(msg.sender, to, uint64(v));
         return true;
     }
 
@@ -435,11 +435,11 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     function transferFrom(
         address f,
         address t,
-        uint64 v
+        uint256 v
     ) external override nonReentrant returns (bool) {
         _assertUnlocked(f);
-        _spendAllowance(f, v);
-        _xfer(f, t, v);
+        _spendAllowance(f, uint64(v));
+        _xfer(f, t, uint64(v));
         return true;
     }
 
@@ -471,7 +471,7 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
      */
     function transferBatch(
         address[] calldata to,
-        uint64[] calldata v
+        uint256[] calldata v
     ) external nonReentrant returns (bool) {
         // 1. Array-length parity check
         if (to.length != v.length) revert LengthMismatch(to.length, v.length);
@@ -505,7 +505,7 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         // 6. Credit recipients
         for (uint256 i; i < len; ) {
             address dst = to[i];
-            uint64 amt = v[i];
+            uint64 amt = uint64(v[i]);
             if (dst == address(0)) revert ZeroAddress();
 
             unchecked {
@@ -548,7 +548,7 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
     function transferFromBatch(
         address from,
         address[] calldata to,
-        uint64[] calldata v
+        uint256[] calldata v
     ) external nonReentrant returns (bool) {
         /* 1. Array-length parity check */
         if (to.length != v.length) revert LengthMismatch(to.length, v.length);
@@ -585,7 +585,7 @@ contract WrappedQRL is IZRC20, ReentrancyGuard {
         /* 7. Credit recipients */
         for (uint256 i; i < len; ) {
             address dst = to[i];
-            uint64 amt = v[i];
+            uint64 amt = uint64(v[i]);
             if (dst == address(0)) revert ZeroAddress();
 
             unchecked {

@@ -5,7 +5,7 @@ pragma solidity ^0.8.24;
 │                           IZRC-20 interface (64-bit)                   │
 \*═══════════════════════════════════════════════════════════════════════*/
 import {IZRC20} from "./IZRC20.sol";
-import {IUTD} from "./_launch.sol";
+import {IUTD} from "./_rocket.sol";
 
 /*══════════════════════════════ Custom errors ═════════════════════════*/
 /// Zero address supplied where non-zero required.
@@ -29,8 +29,7 @@ error UnauthorizedLocker(address holder, address caller);
 /// lockTime must be > 0.
 error LockTimeZero();
 
-/// Theme is already reserved.
-error Imposter(string theme);
+error UnitTooLarge();
 
 /*──────── events ────────*/
 event LockerSet(address indexed holder, address indexed locker, bool approved);
@@ -114,7 +113,7 @@ contract StandardUtilityToken is IZRC20 {
         string memory theme_
     ) {
         if (lockTime_ == 0) revert LockTimeZero();
-
+        if (10 ** decs > type(uint64).max) revert UnitTooLarge();
         authority = tx.origin;
 
         _name = name_;
@@ -192,7 +191,7 @@ contract StandardUtilityToken is IZRC20 {
     /**
      * @notice Fixed total token supply.
      */
-    function totalSupply() external view override returns (uint64) {
+    function totalSupply() external view override returns (uint256) {
         return _tot;
     }
 
@@ -207,7 +206,7 @@ contract StandardUtilityToken is IZRC20 {
      */
     function balanceOf(
         address account
-    ) external view override returns (uint64 balance) {
+    ) external view override returns (uint256 balance) {
         return _acct[account].balance;
     }
 
@@ -223,11 +222,11 @@ contract StandardUtilityToken is IZRC20 {
         Account storage acc = _acct[holder];
 
         // Re‐compute the epoch that governs this lock
-        uint64 epoch = uint64(block.timestamp / lockTime);
+        uint64 epoch_ = uint64(block.timestamp / lockTime);
 
         // If the saved window is from a past epoch, the lock
         // has expired (treated as 0); otherwise return acc.locked
-        return (epoch == acc.window) ? acc.locked : 0;
+        return (epoch_ == acc.window) ? acc.locked : 0;
     }
 
     /**
@@ -239,7 +238,7 @@ contract StandardUtilityToken is IZRC20 {
     function allowance(
         address owner,
         address spender
-    ) external view override returns (uint64 rem) {
+    ) external view override returns (uint256 rem) {
         return _allow[owner][spender];
     }
 
@@ -281,11 +280,11 @@ contract StandardUtilityToken is IZRC20 {
      */
     function approve(
         address spender,
-        uint64 value
+        uint256 value
     ) external override returns (bool ok) {
         if (spender == address(0)) revert ZeroAddress(spender);
-        _allow[msg.sender][spender] = value;
-        emit Approval(msg.sender, spender, value);
+        _allow[msg.sender][spender] = uint64(value);
+        emit Approval(msg.sender, spender, uint64(value));
         return true;
     }
 
@@ -302,9 +301,9 @@ contract StandardUtilityToken is IZRC20 {
      */
     function transfer(
         address to,
-        uint64 value
+        uint256 value
     ) external override returns (bool ok) {
-        _xfer(msg.sender, to, value);
+        _xfer(msg.sender, to, uint64(value));
         return true;
     }
 
@@ -322,10 +321,10 @@ contract StandardUtilityToken is IZRC20 {
     function transferFrom(
         address from,
         address to,
-        uint64 value
+        uint256 value
     ) external override returns (bool) {
-        _spendAllowance(from, value);
-        _xfer(from, to, value);
+        _spendAllowance(from, uint64(value));
+        _xfer(from, to, uint64(value));
         return true;
     }
 
@@ -344,7 +343,7 @@ contract StandardUtilityToken is IZRC20 {
      */
     function transferBatch(
         address[] calldata to,
-        uint64[] calldata v
+        uint256[] calldata v
     ) external override returns (bool) {
         uint256 len = to.length;
         if (len != v.length) revert LengthMismatch(len, v.length);
@@ -361,8 +360,8 @@ contract StandardUtilityToken is IZRC20 {
         _debited(msg.sender, uint64(sum));
 
         for (uint256 i; i < len; ) {
-            _credited(to[i], v[i]);
-            emit Transfer(msg.sender, to[i], v[i]);
+            _credited(to[i], uint64(v[i]));
+            emit Transfer(msg.sender, to[i], uint64(v[i]));
             unchecked {
                 ++i;
             }
@@ -386,7 +385,7 @@ contract StandardUtilityToken is IZRC20 {
     function transferFromBatch(
         address from,
         address[] calldata to,
-        uint64[] calldata v
+        uint256[] calldata v
     ) external override returns (bool) {
         uint256 len = to.length;
         if (len != v.length) revert LengthMismatch(len, v.length);
@@ -405,8 +404,8 @@ contract StandardUtilityToken is IZRC20 {
         _debited(from, spend);
 
         for (uint256 i; i < len; ) {
-            _credited(to[i], v[i]);
-            emit Transfer(from, to[i], v[i]);
+            _credited(to[i], uint64(v[i]));
+            emit Transfer(from, to[i], uint64(v[i]));
             unchecked {
                 ++i;
             }
@@ -418,8 +417,8 @@ contract StandardUtilityToken is IZRC20 {
     function _currentUnlocked(
         Account storage acc
     ) private view returns (uint64) {
-        uint64 epoch = uint64(block.timestamp / lockTime);
-        return (epoch != acc.window) ? acc.balance : acc.balance - acc.locked;
+        uint64 epoch_ = uint64(block.timestamp / lockTime);
+        return (epoch_ != acc.window) ? acc.balance : acc.balance - acc.locked;
     }
 
     function _debited(address from, uint64 amt) private {
@@ -504,7 +503,6 @@ contract UtilityTokenDeployer is IUTD {
     ) external returns (address addr) {
         if (root == address(0)) revert ZeroAddress(root);
         (uint32 lockTime_, string memory theme_) = abi.decode(extra, (uint32, string));
-        require(lockTime_ > 0, LockTimeZero());
         StandardUtilityToken token = new StandardUtilityToken(
             name_,
             symbol_,

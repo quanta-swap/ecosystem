@@ -297,8 +297,8 @@ contract StandardUtilityTokenTest is Test {
     function testBalanceOfReflectsTransfer() public {
         uint64 sendAmt = 3 * uint64(ONE_TOKEN);
 
-        uint64 balAL = SUT.balanceOf(AL);
-        uint64 balBO = SUT.balanceOf(BO);
+        uint64 balAL = uint64(SUT.balanceOf(AL));
+        uint64 balBO = uint64(SUT.balanceOf(BO));
 
         vm.prank(AL);
         SUT.transfer(BO, sendAmt);
@@ -439,7 +439,7 @@ contract StandardUtilityTokenTest is Test {
     function testTransferInsufficientUnlockedRevert() public {
         /* ── 1.  Give Alice a predictable 10 000-token balance ───────────── */
         uint64 targetBal = 10_000 * 1e9; // 10 000 UTK (9-dec)
-        uint64 curBal = SUT.balanceOf(AL);
+        uint64 curBal = uint64(SUT.balanceOf(AL));
         if (curBal > targetBal) {
             vm.prank(AL);
             SUT.transfer(address(this), curBal - targetBal); // drain surplus
@@ -619,7 +619,7 @@ contract StandardUtilityTokenTest is Test {
     /// Happy‑path batch transfer: balances, totals, and events.
     function testTransferBatchHappyPath() public {
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = BO;
         rcpt[1] = CA;
         amt[0] = 2_000 * uint64(ONE_TOKEN);
@@ -642,7 +642,7 @@ contract StandardUtilityTokenTest is Test {
     /// Mismatched array lengths must revert with `LengthMismatch`.
     function testTransferBatchLengthMismatchRevert() public {
         address[] memory rcpt = new address[](1);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = BO;
         amt[0] = 1;
         amt[1] = 1;
@@ -655,7 +655,7 @@ contract StandardUtilityTokenTest is Test {
     /// Aggregate sum > uint64.max triggers `SumOverflow` before any state change.
     function testTransferBatchSumOverflowRevert() public {
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = BO;
         rcpt[1] = CA;
         amt[0] = type(uint64).max;
@@ -672,7 +672,7 @@ contract StandardUtilityTokenTest is Test {
     /// Any zero‑address recipient should revert with `ZeroAddress`.
     function testTransferBatchZeroAddressRevert() public {
         address[] memory rcpt = new address[](1);
-        uint64[] memory amt = new uint64[](1);
+        uint256[] memory amt = new uint256[](1);
         rcpt[0] = address(0);
         amt[0] = 1;
 
@@ -695,7 +695,7 @@ contract StandardUtilityTokenTest is Test {
         SUT.lock(AL, lockAmt);
 
         address[] memory rcpt = new address[](1);
-        uint64[] memory amt = new uint64[](1);
+        uint256[] memory amt = new uint256[](1);
         rcpt[0] = CA;
         amt[0] = 6_000 * uint64(ONE_TOKEN); // > unlocked (~1k)
 
@@ -714,7 +714,7 @@ contract StandardUtilityTokenTest is Test {
     /// Verify that exactly N Transfer events (one per leg) are emitted.
     function testTransferBatchEventCount() public {
         address[] memory rcpt = new address[](3);
-        uint64[] memory amt = new uint64[](3);
+        uint256[] memory amt = new uint256[](3);
         rcpt[0] = BO;
         amt[0] = 1_000 * uint64(ONE_TOKEN);
         rcpt[1] = CA;
@@ -736,12 +736,12 @@ contract StandardUtilityTokenTest is Test {
     function testTransferFromBatchHappyPath() public {
         // Prepare recipients & amounts
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = BO;
         rcpt[1] = CA;
         amt[0] = 2_000 * uint64(ONE_TOKEN);
         amt[1] = 3_000 * uint64(ONE_TOKEN);
-        uint64 spend = amt[0] + amt[1];
+        uint64 spend = uint64(amt[0] + amt[1]);
 
         // AL approves BO
         vm.prank(AL);
@@ -768,7 +768,7 @@ contract StandardUtilityTokenTest is Test {
     /// Length mismatch should revert with `LengthMismatch`.
     function testTransferFromBatchLengthMismatchRevert() public {
         address[] memory rcpt = new address[](1);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = CA;
         amt[0] = 1;
         amt[1] = 1;
@@ -781,7 +781,7 @@ contract StandardUtilityTokenTest is Test {
     /// Sum overflow should revert with `SumOverflow`.
     function testTransferFromBatchSumOverflowRevert() public {
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = BO;
         rcpt[1] = CA;
         amt[0] = type(uint64).max;
@@ -803,7 +803,7 @@ contract StandardUtilityTokenTest is Test {
 
         // ── 2. Build calldata with a single zero-address recipient
         address[] memory rcpt = new address[](1);
-        uint64[] memory amt = new uint64[](1);
+        uint256[] memory amt = new uint256[](1);
         rcpt[0] = address(0);
         amt[0] = 1 * uint64(ONE_TOKEN);
 
@@ -818,7 +818,7 @@ contract StandardUtilityTokenTest is Test {
     /// Insufficient allowance triggers revert.
     function testTransferFromBatchInsufficientAllowanceRevert() public {
         address[] memory rcpt = new address[](1);
-        uint64[] memory amt = new uint64[](1);
+        uint256[] memory amt = new uint256[](1);
         rcpt[0] = CA;
         amt[0] = 2_000 * uint64(ONE_TOKEN);
 
@@ -841,7 +841,7 @@ contract StandardUtilityTokenTest is Test {
         SUT.approve(BO, 10_000 * uint64(ONE_TOKEN));
 
         address[] memory rcpt = new address[](1);
-        uint64[] memory amt = new uint64[](1);
+        uint256[] memory amt = new uint256[](1);
         rcpt[0] = CA;
         amt[0] = 6_000 * uint64(ONE_TOKEN); // > unlocked
 
@@ -857,7 +857,7 @@ contract StandardUtilityTokenTest is Test {
         SUT.approve(BO, type(uint64).max);
 
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = BO;
         amt[0] = 1_000 * uint64(ONE_TOKEN);
         rcpt[1] = CA;
@@ -876,14 +876,14 @@ contract StandardUtilityTokenTest is Test {
     /// Verify Transfer event count equals array length.
     function testTransferFromBatchEventCountMatchesLength() public {
         address[] memory rcpt = new address[](3);
-        uint64[] memory amt = new uint64[](3);
+        uint256[] memory amt = new uint256[](3);
         rcpt[0] = BO;
         amt[0] = 500 * uint64(ONE_TOKEN);
         rcpt[1] = CA;
         amt[1] = 500 * uint64(ONE_TOKEN);
         rcpt[2] = BO;
         amt[2] = 500 * uint64(ONE_TOKEN);
-        uint64 spend = amt[0] + amt[1] + amt[2];
+        uint64 spend = uint64(amt[0] + amt[1] + amt[2]);
 
         vm.prank(AL);
         SUT.approve(BO, spend);

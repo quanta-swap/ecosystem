@@ -370,7 +370,7 @@ contract WrappedQRLTest is Test {
         w.deposit{value: 4 * ONE_QRL_WEI}(); // AL = 4
 
         address[] memory rcpt = new address[](3);
-        uint64[] memory amt = new uint64[](3);
+        uint256[] memory amt = new uint256[](3);
         rcpt[0] = BO;
         rcpt[1] = CA;
         rcpt[2] = BO;
@@ -396,7 +396,7 @@ contract WrappedQRLTest is Test {
         uint256 N_AMT = 2;
 
         address[] memory rcpt = new address[](N_TO);
-        uint64[] memory amt = new uint64[](N_AMT); // deliberate mismatch
+        uint256[] memory amt = new uint256[](N_AMT); // deliberate mismatch
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -416,7 +416,7 @@ contract WrappedQRLTest is Test {
     function testTransferBatchSumOverflowRevert() public {
         uint256 N = 2;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         amt[0] = type(uint64).max;
         amt[1] = 1; // pushes sum over the cap
@@ -441,7 +441,7 @@ contract WrappedQRLTest is Test {
 
         uint256 N = 1;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         rcpt[0] = BO;
         amt[0] = 2 * ONE_WQRL; // need 2
@@ -468,7 +468,7 @@ contract WrappedQRLTest is Test {
 
         uint256 N = 1;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         rcpt[0] = address(0); // invalid recipient
         amt[0] = ONE_WQRL;
@@ -503,7 +503,7 @@ contract WrappedQRLTest is Test {
         w.approve(BO, 5 * ONE_WQRL);
 
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = CA;
         rcpt[1] = CA;
         amt[0] = 2 * ONE_WQRL;
@@ -530,7 +530,7 @@ contract WrappedQRLTest is Test {
         /* 2. Build calldata using the requested array-allocation style. */
         uint256 N = 3;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         rcpt[0] = BO;
         rcpt[1] = CA;
@@ -549,7 +549,7 @@ contract WrappedQRLTest is Test {
         assertEq(logs.length, N, "unexpected # events");
 
         /* 4. Verify each event’s topics and data payload. */
-        bytes32 TRANSFER_SIG = keccak256("Transfer(address,address,uint64)");
+        bytes32 TRANSFER_SIG = keccak256("Transfer(address,address,uint256)");
 
         for (uint256 i; i < N; ++i) {
             Vm.Log memory log = logs[i];
@@ -579,7 +579,7 @@ contract WrappedQRLTest is Test {
 
         uint256 N = 0;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         vm.recordLogs();
         vm.prank(AL);
@@ -612,7 +612,7 @@ contract WrappedQRLTest is Test {
     /// @notice Mint cap (2^64-1) is enforced.
     function testCapEnforced() public {
         // Fill supply to the cap exactly.
-        uint64 room = type(uint64).max - w.totalSupply();
+        uint64 room = type(uint64).max - uint64(w.totalSupply());
         vm.deal(AL, uint256(room) * SCALE);
         vm.prank(AL);
         w.deposit{value: uint256(room) * SCALE}(); // succeeds
@@ -669,14 +669,14 @@ contract WrappedQRLTest is Test {
     // 4. batch length / overflow guards
     function testTransferBatchLenMismatch() public {
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](3);
+        uint256[] memory amt = new uint256[](3);
         vm.expectRevert();
         w.transferBatch(rcpt, amt);
     }
 
     function testTransferFromBatchLenMismatch() public {
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](3);
+        uint256[] memory amt = new uint256[](3);
         vm.expectRevert();
         w.transferFromBatch(AL, rcpt, amt);
     }
@@ -691,7 +691,7 @@ contract WrappedQRLTest is Test {
         uint256 N_AMT = 2;
 
         address[] memory rcpt = new address[](N_TO);
-        uint64[] memory amt = new uint64[](N_AMT); // mismatched length
+        uint256[] memory amt = new uint256[](N_AMT); // mismatched length
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -711,7 +711,7 @@ contract WrappedQRLTest is Test {
     function testTransferFromBatchSumOverflowRevert() public {
         uint256 N = 2;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         rcpt[0] = BO;
         rcpt[1] = BO;
@@ -741,7 +741,7 @@ contract WrappedQRLTest is Test {
 
         uint256 N = 1;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         rcpt[0] = CA;
         amt[0] = 2 * ONE_WQRL; // need 2
@@ -770,7 +770,7 @@ contract WrappedQRLTest is Test {
 
         uint256 N = 1;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         rcpt[0] = CA;
         amt[0] = 2 * ONE_WQRL; // need 2 > balance 1
@@ -799,7 +799,7 @@ contract WrappedQRLTest is Test {
 
         uint256 N = 2;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
 
         rcpt[0] = address(0); // invalid recipient
         rcpt[1] = CA;
@@ -927,7 +927,7 @@ contract WrappedQRLTest is Test {
     // 1. transferBatch with **empty arrays** → loop body never runs
     function testTransferBatchEmptyLists() public {
         address[] memory rcpt = new address[](0);
-        uint64[] memory amt = new uint64[](0);
+        uint256[] memory amt = new uint256[](0);
 
         bool ok = w.transferBatch(rcpt, amt); // no-op, must succeed
         assertTrue(ok);
@@ -939,7 +939,7 @@ contract WrappedQRLTest is Test {
     // 2. transferFromBatch with empty arrays – hits the same zero-iteration branch
     function testTransferFromBatchEmptyLists() public {
         address[] memory rcpt = new address[](0);
-        uint64[] memory amt = new uint64[](0);
+        uint256[] memory amt = new uint256[](0);
 
         // No allowance needed; should simply return true
         bool ok = w.transferFromBatch(AL, rcpt, amt);
@@ -951,7 +951,7 @@ contract WrappedQRLTest is Test {
         vm.prank(AL);
         w.deposit{value: ONE_QRL_WEI}(); // AL gets 1 WQRL
 
-        uint64 balBefore = w.balanceOf(AL);
+        uint64 balBefore = uint64(w.balanceOf(AL));
         vm.prank(AL);
         bool ok = w.transfer(BO, 0); // zero-value transfer
         assertTrue(ok);
@@ -975,7 +975,7 @@ contract WrappedQRLTest is Test {
         assertEq(w.allowance(AL, BO), 0, "allow zero");
 
         // (b) zero-value self-transfer exercises _xfer val==0 branch
-        uint64 balCA = w.balanceOf(CA);
+        uint64 balCA = uint64(w.balanceOf(CA));
         vm.prank(CA);
         w.transfer(BO, 0); // should do nothing
         assertEq(w.balanceOf(CA), balCA, "no change");
@@ -1130,7 +1130,7 @@ contract WrappedQRLTest is Test {
         w.approve(BO, type(uint64).max); // infinite
 
         address[] memory rcpt = new address[](2);
-        uint64[] memory amt = new uint64[](2);
+        uint256[] memory amt = new uint256[](2);
         rcpt[0] = CA;
         rcpt[1] = CA;
         amt[0] = ONE_WQRL;
@@ -1217,7 +1217,7 @@ contract WrappedQRLTest is Test {
         vm.prank(AL);
         w.deposit{value: ONE_QRL_WEI}(); // AL = 1 WQ
 
-        uint64 before = w.balanceOf(AL);
+        uint64 before = uint64(w.balanceOf(AL));
         vm.prank(AL);
         w.transfer(AL, ONE_WQRL); // self-send
 
@@ -1248,7 +1248,7 @@ contract WrappedQRLTest is Test {
         /* 3. Prepare a minimal batch (arrays allocated via new address[](N)). */
         uint256 N = 1;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
         rcpt[0] = BO;
         amt[0] = ONE_WQRL;
 
@@ -1380,7 +1380,7 @@ contract WrappedQRLTest is Test {
         /* 3. Prepare a one-leg batch using the required allocation style. */
         uint256 N = 1;
         address[] memory rcpt = new address[](N);
-        uint64[] memory amt = new uint64[](N);
+        uint256[] memory amt = new uint256[](N);
         rcpt[0] = CA;
         amt[0] = ONE_WQRL;
 
@@ -1560,7 +1560,7 @@ contract WrappedQRLTest is Test {
      */
     function testCapExceededRevertByOneToken() public {
         /* 1. Fill the cap. */
-        uint64 room = type(uint64).max - w.totalSupply();
+        uint64 room = type(uint64).max - uint64(w.totalSupply());
         vm.deal(AL, uint256(room) * SCALE);
         vm.prank(AL);
         w.deposit{value: uint256(room) * SCALE}(); // succeeds
@@ -1592,7 +1592,7 @@ contract WrappedQRLTest is Test {
     function testCapExceededRevertLargeOvershoot() public {
         /* 1. Compute an oversize mint: current supply = 10 WQRL. */
         uint64 mintAmt = type(uint64).max; // 2⁶⁴-1 tokens
-        uint64 curSupply = w.totalSupply(); // 10
+        uint64 curSupply = uint64(w.totalSupply()); // 10
         require(curSupply < mintAmt, "setup failed");
 
         /* 2. Fund Alice and attempt the deposit that overshoots the cap. */
@@ -1628,7 +1628,7 @@ contract WrappedQRLTest is Test {
      */
     function testCapExceededTotalSupplyRevert() public {
         /* 1. Fill the supply to MAX_BAL − 5. */
-        uint64 current = w.totalSupply(); // constructor minted 10
+        uint64 current = uint64(w.totalSupply()); // constructor minted 10
         uint64 room = type(uint64).max - current; // head-room to the cap
         uint64 leave = 5; // tokens we *won't* fill
         uint64 mint1 = room - leave; // bring supply to MAX_BAL-5
